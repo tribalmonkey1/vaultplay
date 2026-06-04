@@ -346,11 +346,46 @@ def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Op
     if not reports:
         return None
 
-    # Sort newest-first by timestamp so [:max_reports] gives the most recent reports.
-    # The mirror returns oldest-first; without this sort we'd read 2019-era reports
-    # for games with many submissions and recommend ancient Proton versions.
+    # Log the actual field names on the first report so we can diagnose
+    # any future field-name mismatches without guessing.
+    if reports:
+        log.debug("ProtonDB report fields for app_id=%d: %s",
+                  steam_app_id, list(reports[0].keys()))
+
+    # Sort newest-first. The mirror API returns reports in oldest-first order.
+    # The timestamp field has been observed under several names depending on
+    # mirror version — try all known candidates. If none found, values all
+    # default to 0 and sort is a no-op (which would leave oldest-first = wrong),
+    # so we try every plausible name before giving up.
+    def _get_ts(report: dict) -> int:
+        for field in ("timestamp", "date", "created_at", "time", "ts",
+                      "writtenDate", "written_date", "submitted_at"):
+            v = report.get(field)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    # Detect which timestamp field is actually present and log it once
+    ts_field_found = None
+    if reports:
+        for field in ("timestamp", "date", "created_at", "time", "ts",
+                      "writtenDate", "written_date", "submitted_at"):
+            if reports[0].get(field) is not None:
+                ts_field_found = field
+                break
+    if ts_field_found:
+        log.debug("ProtonDB: using timestamp field %r for app_id=%d",
+                  ts_field_found, steam_app_id)
+    else:
+        log.warning("ProtonDB: no known timestamp field found for app_id=%d "
+                    "(fields: %s) — sort may be unreliable",
+                    steam_app_id, list(reports[0].keys()) if reports else [])
+
     try:
-        reports = sorted(reports, key=lambda r: r.get("timestamp", 0), reverse=True)
+        reports = sorted(reports, key=_get_ts, reverse=True)
     except Exception:
         pass  # if sort fails, proceed with whatever order we got
 
@@ -362,6 +397,7 @@ def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Op
             or report.get("protonVersion")
             or report.get("wine")
             or report.get("wineVersion")
+            or report.get("version")
             or ""
         )
         if not ver_raw:
@@ -377,8 +413,9 @@ def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Op
 
     best = max(counts, key=lambda k: counts[k])
     sorted_counts = dict(sorted(counts.items(), key=lambda x: -x[1]))
-    log.info("ProtonDB version counts for app_id=%d (top %d recent reports): %s → best: %s",
-             steam_app_id, max_reports, sorted_counts, best)
+    log.info("ProtonDB version counts for app_id=%d (top %d recent reports, ts_field=%r): "
+             "%s → best: %s",
+             steam_app_id, max_reports, ts_field_found, sorted_counts, best)
     return best
 
 
