@@ -141,7 +141,7 @@ class SectionBox(QFrame):
         return self._inner
 
 
-# ── Worker ────────────────────────────────────────────────────────────────────
+# ── Workers ────────────────────────────────────────────────────────────────────
 
 class InstallWorker(QThread):
     progress = pyqtSignal(str, int, str)
@@ -160,6 +160,29 @@ class InstallWorker(QThread):
         self.finished.emit(result)
 
 
+class ProtonLookupWorker(QThread):
+    """
+    Fetches the ProtonDB community version recommendation off the UI thread
+    so the install dialog opens instantly instead of blocking on a network call.
+    Emits (rec_value, rec_reason) when done.
+    """
+    result_ready = pyqtSignal(str, str)   # rec_value, rec_reason
+
+    def __init__(self, steam_app_id: int, installed: list):
+        super().__init__()
+        self.steam_app_id = steam_app_id
+        self.installed    = installed   # list of (label, value) tuples
+
+    def run(self):
+        try:
+            rec_val, rec_reason = protondb_mod.recommended_proton_for_game(
+                self.steam_app_id, self.installed)
+            self.result_ready.emit(rec_val or "", rec_reason or "")
+        except Exception as e:
+            log.debug("ProtonLookupWorker failed: %s", e)
+            self.result_ready.emit("", "")
+
+
 # ── Dialog ────────────────────────────────────────────────────────────────────
 
 class InstallDialog(QDialog):
@@ -167,9 +190,10 @@ class InstallDialog(QDialog):
 
     def __init__(self, game, parent=None):
         super().__init__(parent)
-        self.game    = game
-        self._worker = None
-        self._install_tag = game["install_tag"] or "portable"
+        self.game           = game
+        self._worker        = None
+        self._proton_worker = None   # ProtonLookupWorker — keeps ref alive
+        self._install_tag   = game["install_tag"] or "portable"
 
         title_str = game["title"] or game["display_name"] or game["folder_name"]
 
@@ -321,22 +345,33 @@ class InstallDialog(QDialog):
                 "Lutris, or from GitHub (GloriousEggroll/proton-ge-custom).")
             self.proton_combo.addItem("No versions found", "")
         else:
-            # Determine which version to recommend
-            sgdb_id = game.get("sgdb_id")
-            rec_val = self._recommended_proton
+            # Determine which version to pre-select.
+            # Priority: stored recommendation → live ProtonDB lookup → user default → first.
+            # IMPORTANT: ProtonDB needs the *Steam App ID*, not the SGDB ID.
+            steam_app_id = game.get("steam_app_id")
+            rec_val      = self._recommended_proton
             rec_label_suffix = ""
 
-            if sgdb_id and not rec_val:
-                # Try live lookup
-                try:
-                    rec_val, rec_reason = protondb_mod.recommended_proton_for_game(
-                        sgdb_id, self._installed_versions)
-                    rec_label_suffix = f" ✦ Recommended"
-                    proton_note.setText(f"ProtonDB: {rec_reason}")
-                    proton_note.setStyleSheet(
-                        "color: #4ade80; background: transparent; border: none;")
-                except Exception:
-                    pass
+            if steam_app_id and not rec_val:
+                # Kick off a background lookup — the combo will update when it finishes.
+                # We pre-select the user default in the meantime so the dialog is usable
+                # immediately without blocking on a network call.
+                proton_note.setText("Fetching ProtonDB recommendation…")
+                proton_note.setStyleSheet(
+                    f"color: {COLORS['text_muted']}; background: transparent; border: none;")
+                self._proton_note   = proton_note        # keep ref for the callback
+                self._proton_rec_val = None
+                self._rec_label_suffix_pending = " ✦ Recommended"
+                self._proton_worker = ProtonLookupWorker(steam_app_id, self._installed_versions)
+                self._proton_worker.result_ready.connect(self._on_proton_lookup_done)
+                self._proton_worker.start()
+            elif rec_val:
+                # We already have a stored recommendation — show it
+                rec_label_suffix = " ✦ Recommended"
+                rec_reason_str = protondb_mod.proton_version_label(rec_val)
+                proton_note.setText(f"Stored recommendation: {rec_reason_str}")
+                proton_note.setStyleSheet(
+                    "color: #4ade80; background: transparent; border: none;")
 
             default_val = rec_val or db.get_setting("default_proton_version", "")
             if not default_val and self._installed_versions:
@@ -363,23 +398,22 @@ class InstallDialog(QDialog):
         # ── Redistributables (detected via Steam API) ─────────────────────────
         # Fetch redists in background - start with baseline while loading
         self._auto_redists = AUTO_DETECT_REDISTS[:]
-        self._redist_source = "Loading…"
+        self._redist_source = "baseline"
 
-        sgdb_id     = game.get("sgdb_id")
-        game_title2 = game.get("title") or game.get("display_name") or ""
-        auto_detect = db.get_setting("auto_detect_redists", "true") == "true"
+        # IMPORTANT: steamdb.py needs the *Steam App ID*, not the SGDB ID.
+        steam_app_id_for_redist = game.get("steam_app_id")
+        game_title2             = game.get("title") or game.get("display_name") or ""
+        auto_detect             = db.get_setting("auto_detect_redists", "true") == "true"
 
-        if auto_detect and sgdb_id:
+        if auto_detect and steam_app_id_for_redist:
             try:
                 import steamdb as steamdb_mod
                 result = steamdb_mod.get_redists_for_install(
-                    sgdb_id, game_title2, auto_detect=True)
+                    steam_app_id_for_redist, game_title2, auto_detect=True)
                 self._auto_redists  = result["auto"]
                 self._redist_source = result["source"]
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "SteamDB redist detection failed: %s", e)
+            except Exception as _e:
+                log.warning("SteamDB redist detection failed: %s", _e)
 
         n_auto = len(self._auto_redists)
         redist_box = SectionBox(
@@ -497,6 +531,44 @@ class InstallDialog(QDialog):
         is_portable = (tag == "portable")
         self.gamepath_box.setVisible(is_portable)
         self.launcher_box.setVisible(is_portable)
+
+    def _on_proton_lookup_done(self, rec_val: str, rec_reason: str):
+        """
+        Called on the UI thread when the background ProtonDB lookup finishes.
+        Updates the Proton combo to highlight and pre-select the recommendation.
+        """
+        note = getattr(self, "_proton_note", None)
+        if not note:
+            return
+
+        if not rec_val:
+            # No recommendation found — fall back to user default
+            note.setText(rec_reason or "No ProtonDB recommendation available")
+            note.setStyleSheet(
+                f"color: {COLORS['text_muted']}; background: transparent; border: none;")
+            return
+
+        # Update the note label
+        note.setText(f"ProtonDB: {rec_reason}")
+        note.setStyleSheet("color: #4ade80; background: transparent; border: none;")
+
+        # Find the matching item in the combo and update its display text + colour
+        for i in range(self.proton_combo.count()):
+            if self.proton_combo.itemData(i) == rec_val:
+                current_text = self.proton_combo.itemText(i)
+                if " ✦ Recommended" not in current_text:
+                    self.proton_combo.setItemText(i, f"{current_text} ✦ Recommended")
+                self.proton_combo.setItemData(
+                    i, QColor("#e8c76a"), Qt.ItemDataRole.ForegroundRole)
+                # Only auto-select if user hasn't changed the combo manually
+                # (i.e. if the current selection is still the default first item)
+                if self.proton_combo.currentIndex() <= 0 or \
+                        self.proton_combo.currentData() == rec_val:
+                    self.proton_combo.setCurrentIndex(i)
+                break
+        else:
+            # The recommended version isn't installed; show a note but don't change selection
+            log.debug("ProtonDB recommended '%s' but it is not installed", rec_val)
 
     def _start_install(self):
         self.install_btn.setEnabled(False)

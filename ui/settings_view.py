@@ -1236,15 +1236,25 @@ class SettingsView(QWidget):
 
             def run(self):
                 try:
+                    import time as _time
+
+                    # Clear all existing ProtonDB data first so we always
+                    # fetch fresh — users should never need to do this manually.
+                    db.reset_protondb_data()
+
                     games = db.get_all_games()
                     count = 0
-                    total = sum(1 for g in games if _safe_get(g, "steam_app_id"))
-                    for g in games:
-                        if not _safe_get(g, "steam_app_id"):
-                            continue
-                        protondb_mod.fetch_and_store(g["id"])
-                        count += 1
-                        self.status.emit(f"Fetching… {count}/{total}")
+                    eligible = [g for g in games if _safe_get(g, "steam_app_id")]
+                    total = len(eligible)
+                    self.status.emit(f"Fetching ProtonDB data for {total} games…")
+
+                    for g in eligible:
+                        result = protondb_mod.fetch_and_store(g["id"])
+                        if result:
+                            count += 1
+                        self.status.emit(f"Fetching… {count}/{total} — {_safe_get(g, 'display_name') or ''}")
+                        _time.sleep(0.3)   # be polite to the API
+
                     self.done.emit(count)
                 except Exception as e:
                     import logging
@@ -1254,7 +1264,7 @@ class SettingsView(QWidget):
 
         self.pdb_refresh_btn.setEnabled(False)
         self.pdb_refresh_btn.setText("Fetching…")
-        self.pdb_status_lbl.setText("Starting ProtonDB refresh…")
+        self.pdb_status_lbl.setText("Clearing old data and fetching fresh ProtonDB data…")
 
         self._pdb_worker = _Worker()
         self._pdb_worker.status.connect(self.pdb_status_lbl.setText)

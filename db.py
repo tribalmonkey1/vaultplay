@@ -226,6 +226,22 @@ def update_protondb(game_id: int, tier: str, recommended_proton: str,
         """, (game_id, tier, recommended_proton, total_reports))
 
 
+def reset_protondb_data():
+    """
+    Clear all stored ProtonDB data so the next refresh fetches everything fresh.
+    Called automatically by 'Refresh ProtonDB Data' before re-fetching.
+    Users should never need to do this manually via SQLite.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE metadata
+            SET protondb_tier       = NULL,
+                recommended_proton  = NULL,
+                protondb_reports    = 0,
+                protondb_fetched_at = NULL
+        """)
+
+
 def get_games_missing_protondb() -> list:
     """Return games that have a steam_app_id but no ProtonDB data yet."""
     with get_connection() as conn:
