@@ -439,7 +439,8 @@ def get_all_games() -> list:
             SELECT g.*, g.install_tag, m.title, m.description, m.developer, m.publisher,
                    m.ip_holder, m.release_date, m.genres, m.cover_url,
                    m.hero_url, m.logo_url, m.screenshots, m.sgdb_id, m.igdb_id,
-                   m.steam_app_id,
+                   m.steam_app_id, m.protondb_tier, m.protondb_reports,
+                   m.recommended_proton,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    (i.id IS NOT NULL) AS is_installed
             FROM games g
@@ -480,7 +481,8 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
             SELECT g.*, g.install_tag, m.title, m.description, m.developer, m.publisher,
                    m.ip_holder, m.release_date, m.genres, m.cover_url,
                    m.hero_url, m.logo_url, m.screenshots, m.sgdb_id, m.igdb_id,
-                   m.steam_app_id,
+                   m.steam_app_id, m.protondb_tier, m.protondb_reports,
+                   m.recommended_proton,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    (i.id IS NOT NULL) AS is_installed
             FROM games g

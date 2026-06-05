@@ -1,10 +1,11 @@
 """
-protondb.py — ProtonDB + installed Proton version detection for VaultPlay
+protondb.py — ProtonDB integration + installed Proton version detection for VaultPlay
 
 - Scans system for actually-installed Proton/Wine versions
   (Steam official, GE-Proton, Lutris, system Wine)
-- Uses ProtonDB community API to get the most-reported Proton version per game
-- Normalizes version strings for display and matching
+- Uses the official ProtonDB summary API (tier/score/total) to recommend
+  the best installed version for each game
+- Normalizes version strings for display
 """
 
 
@@ -43,11 +44,11 @@ SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
 PROTONDB_SUMMARY_API = "https://www.protondb.com/api/v1/reports/summaries/{app_id}.json"
-# The official ProtonDB API only exposes the summary (tier/score/total) — there is
-# no official public per-report endpoint. The max-p.me community mirror is the only
-# known source for individual report data including Proton version per report.
-# It returns ALL reports in oldest-first insertion order, so we must sort by
-# timestamp descending to get the most recent reports.
+# The official API only exposes tier/score/total — no per-report version data.
+# The mirror provides individual reports. Confirmed response format from live API:
+#   { "id": int, "appId": int, "timestamp": int (unix epoch),
+#     "protonVersion": str, "rating": str, "notes": str, ... }
+# Reports are returned in oldest-first order, so we sort by timestamp descending.
 PROTONDB_REPORTS_API = "https://protondb.max-p.me/games/{app_id}/reports"
 
 TIER_INFO = {
@@ -286,13 +287,70 @@ def fetch_protondb(steam_app_id: int) -> Optional[dict]:
         return None
 
 
+def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Optional[str]:
+    """
+    Fetch the most recent ProtonDB community reports and return the most commonly
+    reported Proton version as a canonical key (e.g. '9.0', 'GE-Proton 10').
+
+    The mirror returns all reports in oldest-first order. We sort by the confirmed
+    'timestamp' field (unix epoch) descending so we read the most recent reports,
+    not years-old ones that reflect ancient Proton versions.
+
+    Returns None if the mirror is unavailable or has no useful data for this game,
+    so the caller can fall back to the tier heuristic.
+    """
+    try:
+        url = PROTONDB_REPORTS_API.format(app_id=steam_app_id)
+        resp = SESSION.get(url, timeout=15)
+        if resp.status_code == 404:
+            log.debug("ProtonDB mirror: no reports for app_id=%d", steam_app_id)
+            return None
+        if resp.status_code != 200:
+            log.debug("ProtonDB mirror returned HTTP %d for app_id=%d",
+                      resp.status_code, steam_app_id)
+            return None
+        reports = resp.json()
+        resp.close()
+    except Exception as e:
+        log.warning("ProtonDB mirror fetch failed for app_id=%d: %s", steam_app_id, e)
+        return None
+
+    if not reports:
+        return None
+
+    # Sort newest-first by confirmed 'timestamp' field (unix epoch int).
+    # Without this, [:max_reports] reads the oldest reports in the dataset.
+    reports = sorted(reports, key=lambda r: r.get("timestamp", 0), reverse=True)
+
+    counts: dict[str, int] = {}
+    for report in reports[:max_reports]:
+        # Confirmed field name from live API response: 'protonVersion' (camelCase)
+        ver_raw = report.get("protonVersion") or report.get("proton_version") or ""
+        if not ver_raw:
+            continue
+        normalized = _parse_major_version(str(ver_raw))
+        if normalized and normalized != "native":
+            counts[normalized] = counts.get(normalized, 0) + 1
+
+    if not counts:
+        log.debug("ProtonDB mirror: %d reports for app_id=%d but none had version data",
+                  min(len(reports), max_reports), steam_app_id)
+        return None
+
+    best = max(counts, key=lambda k: counts[k])
+    log.info("ProtonDB mirror: app_id=%d top %d reports → %s → best: %s",
+             steam_app_id, max_reports,
+             dict(sorted(counts.items(), key=lambda x: -x[1])), best)
+    return best
+
+
 def _parse_major_version(ver_str: str) -> str:
     """
-    Normalize a ProtonDB report version string to a canonical key for matching.
-    'Proton 9.0-4'       -> '9.0'
-    'Proton Experimental'-> 'experimental'
-    'GE-Proton9-27'      -> 'GE-Proton 9'
-    'native'             -> 'native'
+    Normalize a ProtonDB report version string to a canonical key.
+    'Proton 9.0-4'        -> '9.0'
+    'Proton Experimental' -> 'experimental'
+    'GE-Proton10-27'      -> 'GE-Proton 10'
+    'native'              -> 'native'
     """
     if not ver_str:
         return ""
@@ -316,112 +374,13 @@ def _parse_major_version(ver_str: str) -> str:
     return s
 
 
-def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Optional[str]:
-    """
-    Fetch recent ProtonDB reports and find the most commonly reported Proton version.
-
-    The max-p.me mirror returns ALL reports in oldest-first insertion order.
-    We sort by timestamp descending so we always analyse the most recent reports,
-    not reports from 2019-2021 that list ancient Proton versions like 4.x/5.x.
-
-    Returns a canonical version key like '9.0', 'GE-Proton 9', or 'experimental'.
-    Returns None if the mirror is unavailable or reports have no version data.
-    """
-    try:
-        url = PROTONDB_REPORTS_API.format(app_id=steam_app_id)
-        resp = SESSION.get(url, timeout=15)
-        if resp.status_code == 404:
-            log.debug("ProtonDB: no reports for app_id=%d (404)", steam_app_id)
-            return None
-        if resp.status_code != 200:
-            log.debug("ProtonDB mirror returned HTTP %d for app_id=%d",
-                      resp.status_code, steam_app_id)
-            return None
-        reports = resp.json()
-        resp.close()
-    except Exception as e:
-        log.warning("ProtonDB reports fetch failed for app_id=%d: %s", steam_app_id, e)
-        return None
-
-    if not reports:
-        return None
-
-    # Log the actual field names on the first report so we can diagnose
-    # any future field-name mismatches without guessing.
-    if reports:
-        log.debug("ProtonDB report fields for app_id=%d: %s",
-                  steam_app_id, list(reports[0].keys()))
-
-    # Sort newest-first. The mirror API returns reports in oldest-first order.
-    # The timestamp field has been observed under several names depending on
-    # mirror version — try all known candidates. If none found, values all
-    # default to 0 and sort is a no-op (which would leave oldest-first = wrong),
-    # so we try every plausible name before giving up.
-    def _get_ts(report: dict) -> int:
-        for field in ("timestamp", "date", "created_at", "time", "ts",
-                      "writtenDate", "written_date", "submitted_at"):
-            v = report.get(field)
-            if v is not None:
-                try:
-                    return int(v)
-                except (TypeError, ValueError):
-                    pass
-        return 0
-
-    # Detect which timestamp field is actually present and log it once
-    ts_field_found = None
-    if reports:
-        for field in ("timestamp", "date", "created_at", "time", "ts",
-                      "writtenDate", "written_date", "submitted_at"):
-            if reports[0].get(field) is not None:
-                ts_field_found = field
-                break
-    if ts_field_found:
-        log.debug("ProtonDB: using timestamp field %r for app_id=%d",
-                  ts_field_found, steam_app_id)
-    else:
-        log.warning("ProtonDB: no known timestamp field found for app_id=%d "
-                    "(fields: %s) — sort may be unreliable",
-                    steam_app_id, list(reports[0].keys()) if reports else [])
-
-    try:
-        reports = sorted(reports, key=_get_ts, reverse=True)
-    except Exception:
-        pass  # if sort fails, proceed with whatever order we got
-
-    counts: dict[str, int] = {}
-    for report in reports[:max_reports]:
-        # The mirror API uses "proton_version"; guard against alternate field names
-        ver_raw = (
-            report.get("proton_version")
-            or report.get("protonVersion")
-            or report.get("wine")
-            or report.get("wineVersion")
-            or report.get("version")
-            or ""
-        )
-        if not ver_raw:
-            continue
-        normalized = _parse_major_version(str(ver_raw))
-        if normalized and normalized != "native":
-            counts[normalized] = counts.get(normalized, 0) + 1
-
-    if not counts:
-        log.info("ProtonDB: %d recent reports fetched for app_id=%d "
-                 "but none had version data", min(len(reports), max_reports), steam_app_id)
-        return None
-
-    best = max(counts, key=lambda k: counts[k])
-    sorted_counts = dict(sorted(counts.items(), key=lambda x: -x[1]))
-    log.info("ProtonDB version counts for app_id=%d (top %d recent reports, ts_field=%r): "
-             "%s → best: %s",
-             steam_app_id, max_reports, ts_field_found, sorted_counts, best)
-    return best
-
-
 def match_to_installed(recommended_version: str,
                         installed: list[tuple[str, str]]) -> Optional[str]:
-    """Match a canonical recommended version key to an installed version."""
+    """
+    Match a canonical version key (e.g. '9.0', 'GE-Proton 10') to the closest
+    installed version value. For numbered versions, picks the newest minor version
+    of the matching major. Returns None if nothing matches.
+    """
     if not recommended_version or not installed:
         return None
 
@@ -436,6 +395,7 @@ def match_to_installed(recommended_version: str,
                 return value
         return None
 
+    # GE-Proton N — pick highest installed minor of that major
     m = re.match(r"ge-proton\s*(\d+)", rec)
     if m:
         major = m.group(1)
@@ -446,11 +406,11 @@ def match_to_installed(recommended_version: str,
             if mm:
                 minor = int(mm.group(1))
                 if minor > best_minor:
-                    best_minor = minor
-                    best_val = value
+                    best_minor, best_val = minor, value
         if best_val:
             return best_val
 
+    # Stable Proton N.M — exact match first, then major-only
     m = re.match(r"(\d+)\.(\d+)", rec)
     if m:
         major, minor = m.group(1), m.group(2)
@@ -463,6 +423,7 @@ def match_to_installed(recommended_version: str,
             if "ge" not in lbl and re.search(r"\b" + major + r"\b", lbl):
                 return value
 
+    # Major-only integer (e.g. rec = "9")
     m = re.match(r"^(\d+)$", rec)
     if m:
         major = m.group(1)
@@ -471,6 +432,7 @@ def match_to_installed(recommended_version: str,
             if "ge" not in lbl and re.search(r"\b" + major + r"\b", lbl):
                 return value
 
+    # Substring fallback
     for label, value in installed:
         if rec in label.lower():
             return value
@@ -483,27 +445,30 @@ def recommended_proton_for_game(steam_app_id: int,
     """
     Get the recommended Proton version for a game.
 
-    Strategy (in priority order):
-      1. ProtonDB community reports  → most-reported version among recent reports,
-                                       matched to installed versions
-      2. Tier heuristic              → picks a sensible installed version by tier
+    Priority:
+      1. ProtonDB mirror  — most-reported version from recent community reports,
+                            matched to an installed version
+      2. Tier heuristic  — uses official ProtonDB tier (platinum/gold/silver/etc.)
+                            to pick a sensible installed version
       3. User default setting
       4. First installed version
     """
+    # ── 1. Community reports (mirror) ────────────────────────────────────────
     rec_ver = get_most_recommended_version(steam_app_id)
     if rec_ver:
         matched = match_to_installed(rec_ver, installed)
-        label = f"Recommended by ProtonDB community ({rec_ver})"
         if matched:
-            return matched, label
-        return None, f"ProtonDB recommends {rec_ver} (not installed)"
+            return matched, f"Recommended by ProtonDB community ({rec_ver})"
+        # Mirror had data but the recommended version isn't installed —
+        # fall through to tier heuristic rather than returning "not installed"
+        log.info("ProtonDB mirror recommends %s for app_id=%d but it is not installed "
+                 "— falling back to tier heuristic", rec_ver, steam_app_id)
 
+    # ── 2. Tier heuristic (official summary API) ─────────────────────────────
     summary = fetch_protondb(steam_app_id)
     if summary:
         tier = summary.get("tier", "pending")
 
-        # Separate installed versions into groups for tier-based selection.
-        # installed is already sorted newest-first within each group.
         stable_proton = [
             (lbl, val) for lbl, val in installed
             if "proton" in lbl.lower()
@@ -521,30 +486,26 @@ def recommended_proton_for_game(steam_app_id: int,
         ]
 
         if tier in ("platinum", "gold"):
-            # Well-supported game — prefer newest stable Proton, then GE.
-            # Never recommend Experimental for a game that already runs well.
             if stable_proton:
                 return stable_proton[0][1], f"Tier: {tier} — recommended stable Proton"
             if ge_proton:
                 return ge_proton[0][1], f"Tier: {tier} — recommended GE-Proton"
         elif tier in ("silver", "pending"):
-            # GE-Proton tends to fix the remaining compatibility issues
             if ge_proton:
                 return ge_proton[0][1], f"Tier: {tier} — recommended GE-Proton"
             if stable_proton:
                 return stable_proton[0][1], f"Tier: {tier} — recommended stable Proton"
         elif tier == "bronze":
-            # Try GE first for best chance of working
             if ge_proton:
                 return ge_proton[0][1], f"Tier: {tier} — recommended GE-Proton"
             if experimental:
                 return experimental[0][1], f"Tier: {tier} — try Experimental"
-        # borked / unknown — Experimental as last resort only
         if experimental:
             return experimental[0][1], f"Tier: {tier} — try Experimental"
         if installed:
             return installed[0][1], f"Tier: {tier} — using newest installed version"
 
+    # ── 3. User default / first installed ────────────────────────────────────
     try:
         saved_default = db.get_setting("default_proton_version", "")
         if saved_default:
@@ -588,13 +549,11 @@ def proton_version_label(value: str) -> str:
 
 def fetch_and_store(game_id: int) -> Optional[dict]:
     """
-    Fetch ProtonDB tier summary + community version recommendation and store in DB.
+    Fetch ProtonDB tier summary and store version recommendation in DB.
 
     Flow:
-      1. fetch_protondb()              → tier, score, total_reports  (summary API)
-      2. recommended_proton_for_game() → calls get_most_recommended_version()
-                                         internally (reports mirror), then matches
-                                         to installed versions
+      1. fetch_protondb()              → tier, score, total_reports (official summary API)
+      2. recommended_proton_for_game() → tier heuristic → best installed version
       3. Store both in metadata row
     """
     try:
@@ -612,7 +571,6 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
             log.debug("No Steam App ID for game %d — skipping ProtonDB", game_id)
             return None
 
-        # Step 1: tier summary
         data = fetch_protondb(steam_app_id)
         if not data:
             log.debug("ProtonDB: no summary for steam_app_id=%d (game %d)", steam_app_id, game_id)
@@ -621,9 +579,6 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
         tier      = data["tier"]
         installed = get_versions_for_ui()
 
-        # Step 2: version recommendation — recommended_proton_for_game() already
-        # calls get_most_recommended_version() internally, so do NOT call it
-        # separately here (that was causing two redundant report fetches per game).
         matched_value, rec_reason = recommended_proton_for_game(steam_app_id, installed)
         rec_value = matched_value or (installed[0][1] if installed else "")
 
