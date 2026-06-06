@@ -99,35 +99,14 @@ class ProtonDBWorker(QThread):
         import time as _time
         import db as _db
 
-        # Ensure the local index is built before trying to apply recommendations.
-        # On first run the index won't exist yet — download the latest dump.
-        # On subsequent runs, only download if a newer dump is available.
-        meta = protondb_mod.get_index_meta()
-        if not meta:
-            self.progress.emit("No ProtonDB index found — downloading data dump…")
-            latest = protondb_mod.get_latest_dump_filename()
-            if latest:
-                protondb_mod.build_index_from_dump(
-                    latest,
-                    progress_cb=lambda stage, pct, msg: self.progress.emit(
-                        f"{stage}: {msg}"))
-            else:
-                self.progress.emit("Could not reach GitHub — using tier heuristic only")
-        else:
-            needs_upd, _, latest = protondb_mod.needs_update()
-            if needs_upd and latest:
-                self.progress.emit(f"New ProtonDB dump available ({latest}) — updating…")
-                protondb_mod.build_index_from_dump(
-                    latest,
-                    progress_cb=lambda stage, pct, msg: self.progress.emit(
-                        f"{stage}: {msg}"))
-
-        # Apply recommendations to all games missing ProtonDB data
+        # Fetch live ProtonDB data for all games missing it.
+        # No GitHub dump, no tier heuristic — fetch_and_store() hits the live
+        # reports endpoint for each game with a steam_app_id.
         games = _db.get_games_missing_protondb()
         count = 0
         for i, game in enumerate(games):
             self.progress.emit(
-                f"Applying ProtonDB data… {i+1}/{len(games)} — "
+                f"Fetching ProtonDB data… {i+1}/{len(games)} — "
                 f"{game['display_name'] or ''}")
             result = protondb_mod.fetch_and_store(game["id"])
             if result:

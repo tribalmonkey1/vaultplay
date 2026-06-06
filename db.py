@@ -105,6 +105,8 @@ def init_db():
                 protondb_reports     INTEGER DEFAULT 0,
                 recommended_proton   TEXT,
                 protondb_fetched_at  TEXT,
+                protondb_internal_id INTEGER,   -- cached hash for reports URL
+                protondb_version_counts TEXT,   -- JSON: {"GE-Proton 9.4": 31, ...}
                 fetched_at           TEXT DEFAULT (datetime('now'))
             );
 
@@ -191,11 +193,13 @@ def _migrate_db():
         # metadata table migrations
         meta_cols = {row[1] for row in conn.execute("PRAGMA table_info(metadata)").fetchall()}
         for col, sql in [
-            ("protondb_tier",       "ALTER TABLE metadata ADD COLUMN protondb_tier TEXT"),
-            ("protondb_reports",    "ALTER TABLE metadata ADD COLUMN protondb_reports INTEGER DEFAULT 0"),
-            ("recommended_proton",  "ALTER TABLE metadata ADD COLUMN recommended_proton TEXT"),
-            ("protondb_fetched_at", "ALTER TABLE metadata ADD COLUMN protondb_fetched_at TEXT"),
-            ("steam_app_id",        "ALTER TABLE metadata ADD COLUMN steam_app_id INTEGER"),
+            ("protondb_tier",           "ALTER TABLE metadata ADD COLUMN protondb_tier TEXT"),
+            ("protondb_reports",        "ALTER TABLE metadata ADD COLUMN protondb_reports INTEGER DEFAULT 0"),
+            ("recommended_proton",      "ALTER TABLE metadata ADD COLUMN recommended_proton TEXT"),
+            ("protondb_fetched_at",     "ALTER TABLE metadata ADD COLUMN protondb_fetched_at TEXT"),
+            ("steam_app_id",            "ALTER TABLE metadata ADD COLUMN steam_app_id INTEGER"),
+            ("protondb_internal_id",    "ALTER TABLE metadata ADD COLUMN protondb_internal_id INTEGER"),
+            ("protondb_version_counts", "ALTER TABLE metadata ADD COLUMN protondb_version_counts TEXT"),
         ]:
             if col not in meta_cols:
                 conn.execute(sql)
@@ -211,34 +215,49 @@ def _migrate_db():
 
 
 def update_protondb(game_id: int, tier: str, recommended_proton: str,
-                    total_reports: int = 0):
-    """Store ProtonDB compatibility data for a game."""
+                    total_reports: int = 0, internal_id: int = None,
+                    version_counts: dict = None):
+    """
+    Store ProtonDB compatibility data for a game.
+    version_counts: dict mapping canonical version key -> report count,
+                    e.g. {"GE-Proton 9.4": 31, "experimental": 12}
+    internal_id:    cached hash used to build the reports URL; safe to cache
+                    indefinitely (old hashes remain valid even as counts change).
+    """
+    counts_json = json.dumps(version_counts) if version_counts else None
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO metadata (game_id, protondb_tier, recommended_proton,
-                                  protondb_reports, protondb_fetched_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
+                                  protondb_reports, protondb_fetched_at,
+                                  protondb_internal_id, protondb_version_counts)
+            VALUES (?, ?, ?, ?, datetime('now'), ?, ?)
             ON CONFLICT(game_id) DO UPDATE SET
-                protondb_tier       = excluded.protondb_tier,
-                recommended_proton  = excluded.recommended_proton,
-                protondb_reports    = excluded.protondb_reports,
-                protondb_fetched_at = datetime('now')
-        """, (game_id, tier, recommended_proton, total_reports))
+                protondb_tier           = excluded.protondb_tier,
+                recommended_proton      = excluded.recommended_proton,
+                protondb_reports        = excluded.protondb_reports,
+                protondb_fetched_at     = datetime('now'),
+                protondb_internal_id    = COALESCE(excluded.protondb_internal_id,
+                                                   metadata.protondb_internal_id),
+                protondb_version_counts = excluded.protondb_version_counts
+        """, (game_id, tier, recommended_proton, total_reports,
+              internal_id, counts_json))
 
 
 def reset_protondb_data():
     """
     Clear all stored ProtonDB data so the next refresh fetches everything fresh.
     Called automatically by 'Refresh ProtonDB Data' before re-fetching.
-    Users should never need to do this manually via SQLite.
+    Note: protondb_internal_id is intentionally preserved — old hashes remain
+    valid and save a counts.json fetch for games we've already resolved.
     """
     with get_connection() as conn:
         conn.execute("""
             UPDATE metadata
-            SET protondb_tier       = NULL,
-                recommended_proton  = NULL,
-                protondb_reports    = 0,
-                protondb_fetched_at = NULL
+            SET protondb_tier           = NULL,
+                recommended_proton      = NULL,
+                protondb_reports        = 0,
+                protondb_version_counts = NULL,
+                protondb_fetched_at     = NULL
         """)
 
 
@@ -246,7 +265,8 @@ def get_games_missing_protondb() -> list:
     """Return games that have a steam_app_id but no ProtonDB data yet."""
     with get_connection() as conn:
         return conn.execute("""
-            SELECT g.*, m.sgdb_id, m.steam_app_id, m.protondb_tier
+            SELECT g.*, m.sgdb_id, m.steam_app_id, m.protondb_tier,
+                   m.protondb_internal_id
             FROM games g
             LEFT JOIN metadata m ON m.game_id = g.id
             WHERE m.steam_app_id IS NOT NULL
@@ -440,7 +460,7 @@ def get_all_games() -> list:
                    m.ip_holder, m.release_date, m.genres, m.cover_url,
                    m.hero_url, m.logo_url, m.screenshots, m.sgdb_id, m.igdb_id,
                    m.steam_app_id, m.protondb_tier, m.protondb_reports,
-                   m.recommended_proton,
+                   m.recommended_proton, m.protondb_version_counts,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    (i.id IS NOT NULL) AS is_installed
             FROM games g
@@ -482,7 +502,7 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
                    m.ip_holder, m.release_date, m.genres, m.cover_url,
                    m.hero_url, m.logo_url, m.screenshots, m.sgdb_id, m.igdb_id,
                    m.steam_app_id, m.protondb_tier, m.protondb_reports,
-                   m.recommended_proton,
+                   m.recommended_proton, m.protondb_version_counts,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    (i.id IS NOT NULL) AS is_installed
             FROM games g

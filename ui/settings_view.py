@@ -519,6 +519,9 @@ class SettingsView(QWidget):
                     db.get_setting("last_scan_result", "Never scanned")
                 )
 
+        # Refresh ProtonDB status label
+        self._refresh_pdb_status_label()
+
     def _show_page(self, idx: int):
         self._current_page = idx
         self._pages_stack.setCurrentIndex(idx)
@@ -1150,33 +1153,44 @@ class SettingsView(QWidget):
         layout.addSpacing(24)
         layout.addWidget(SectionHeader("ProtonDB"))
 
+        protondb_explain = QLabel(
+            "ProtonDB data is fetched live from protondb.com for each game that has a "
+            "Steam App ID. Per-game community report counts are stored locally and shown "
+            "in the install dialog so you can see which Proton version the community "
+            "recommends and make your own choice. No API key required."
+        )
+        protondb_explain.setFont(QFont("DM Sans", 11))
+        protondb_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 8px;")
+        protondb_explain.setWordWrap(True)
+        layout.addWidget(protondb_explain)
+
         protondb_toggle = SettingsToggle(
             db.get_setting("protondb_auto_fetch", "true") == "true")
         protondb_toggle.changed.connect(
             lambda v: self._save("protondb_auto_fetch", "true" if v else "false"))
         self._make_setting_row(layout, "protondb_auto_fetch",
                                "Auto-fetch ProtonDB Compatibility",
-                               "Fetch compatibility tier and version recommendation "
-                               "after metadata is retrieved. No API key required.",
+                               "Fetch tier and per-version report counts after metadata "
+                               "is retrieved. Runs in the background. No API key required.",
                                protondb_toggle)
 
-        # Index status row
-        index_status_row = SettingsRow(
-            "Data Source",
-            "Community reports index built from the official ProtonDB monthly data dump.")
-        self.pdb_index_status_lbl = QLabel("")
-        self.pdb_index_status_lbl.setFont(QFont("DM Mono", 9))
-        self.pdb_index_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
-        self._refresh_pdb_index_status()
-        index_status_row.add_control(self.pdb_index_status_lbl)
-        layout.addWidget(index_status_row)
+        # Last fetched status
+        pdb_status_row = SettingsRow(
+            "Last Fetched",
+            "When ProtonDB data was last refreshed for your library.")
+        self.pdb_last_fetched_lbl = QLabel("")
+        self.pdb_last_fetched_lbl.setFont(QFont("DM Mono", 9))
+        self.pdb_last_fetched_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._refresh_pdb_status_label()
+        pdb_status_row.add_control(self.pdb_last_fetched_lbl)
+        layout.addWidget(pdb_status_row)
 
         refresh_pdb_row = SettingsRow(
-            "Update ProtonDB Data",
-            "Downloads the latest monthly data dump from GitHub and rebuilds the "
-            "local index (~65 MB download, done once per month). Then re-computes "
-            "version recommendations for all games.")
-        self.pdb_refresh_btn = ActionButton("Check for Update")
+            "Refresh ProtonDB Data",
+            "Re-fetches tier and per-version report counts for all games with a "
+            "Steam App ID. Clears existing ProtonDB data first so everything is "
+            "pulled fresh from protondb.com.")
+        self.pdb_refresh_btn = ActionButton("Refresh Now")
         self.pdb_refresh_btn.clicked.connect(self._refresh_all_protondb)
         refresh_pdb_row.add_control(self.pdb_refresh_btn)
         layout.addWidget(refresh_pdb_row)
@@ -1239,23 +1253,34 @@ class SettingsView(QWidget):
                 self.default_wine_combo.setCurrentIndex(idx)
         self.default_wine_combo.blockSignals(False)
 
-    def _refresh_pdb_index_status(self):
-        """Update the index status label with info about the current local index."""
-        if not hasattr(self, "pdb_index_status_lbl"):
+    def _refresh_pdb_status_label(self):
+        """Update the last-fetched label from DB."""
+        if not hasattr(self, "pdb_last_fetched_lbl"):
             return
-        import protondb as protondb_mod
-        meta = protondb_mod.get_index_meta()
-        if meta:
-            fname   = meta.get("dump_filename", "unknown")
-            total   = meta.get("total_reports", 0)
-            indexed = meta.get("indexed_at", "")[:10]
-            self.pdb_index_status_lbl.setText(
-                f"{fname}  ·  {total:,} reports  ·  indexed {indexed}")
-            self.pdb_index_status_lbl.setStyleSheet("color: #4ade80;")
-        else:
-            self.pdb_index_status_lbl.setText(
-                "No index built yet — click 'Check for Update' to download")
-            self.pdb_index_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        try:
+            # Find most recent protondb_fetched_at across all metadata rows
+            with db.get_connection() as conn:
+                row = conn.execute(
+                    "SELECT MAX(protondb_fetched_at) AS last_at, "
+                    "COUNT(CASE WHEN protondb_tier IS NOT NULL THEN 1 END) AS with_data, "
+                    "COUNT(CASE WHEN steam_app_id IS NOT NULL THEN 1 END) AS eligible "
+                    "FROM metadata"
+                ).fetchone()
+            if row and row["last_at"]:
+                last_at = row["last_at"][:16].replace("T", " ")
+                with_data = row["with_data"] or 0
+                eligible  = row["eligible"] or 0
+                self.pdb_last_fetched_lbl.setText(
+                    f"{last_at}  ·  {with_data}/{eligible} games have data")
+                self.pdb_last_fetched_lbl.setStyleSheet("color: #4ade80;")
+            else:
+                self.pdb_last_fetched_lbl.setText("Never fetched")
+                self.pdb_last_fetched_lbl.setStyleSheet(
+                    f"color: {COLORS['text_muted']};")
+        except Exception:
+            self.pdb_last_fetched_lbl.setText("—")
+            self.pdb_last_fetched_lbl.setStyleSheet(
+                f"color: {COLORS['text_muted']};")
 
     def _refresh_all_protondb(self):
         import protondb as protondb_mod
@@ -1263,62 +1288,44 @@ class SettingsView(QWidget):
 
         class _Worker(QThread):
             status = _Signal(str)
-            done   = _Signal(bool, int)   # (index_was_updated, games_updated)
+            done   = _Signal(int)   # games_updated count
 
             def run(self):
                 try:
                     import time as _time
 
-                    # ── Step 1: check for a newer dump ────────────────────────
-                    self.status.emit("Checking for updated ProtonDB data dump…")
-                    needs_upd, current, latest = protondb_mod.needs_update()
-
-                    if not latest:
-                        self.status.emit("Could not reach GitHub — re-applying existing index…")
-                        index_updated = False
-                    elif not needs_upd:
-                        self.status.emit(
-                            f"Already up to date ({current}) — re-applying index…")
-                        index_updated = False
-                    else:
-                        self.status.emit(
-                            f"New dump available: {latest} — downloading…")
-                        ok = protondb_mod.build_index_from_dump(
-                            latest,
-                            progress_cb=lambda stage, pct, msg: self.status.emit(
-                                f"{stage}: {msg}"))
-                        if not ok:
-                            self.status.emit("✗ Download failed — re-applying existing index")
-                            index_updated = False
-                        else:
-                            index_updated = True
-                            self.status.emit("Index built — updating game recommendations…")
-
-                    # ── Step 2: recompute recommendations for all games ────────
+                    # Clear existing ProtonDB data so everything is fetched fresh.
+                    # protondb_internal_id is intentionally preserved — old hashes
+                    # remain valid and save a counts.json fetch per game.
                     db.reset_protondb_data()
+
                     games    = db.get_all_games()
                     eligible = [g for g in games if _safe_get(g, "steam_app_id")]
                     total    = len(eligible)
                     count    = 0
+
+                    self.status.emit(
+                        f"Fetching ProtonDB data for {total} games…")
 
                     for g in eligible:
                         result = protondb_mod.fetch_and_store(g["id"])
                         if result:
                             count += 1
                         self.status.emit(
-                            f"Updating games… {count}/{total} — "
+                            f"Fetching… {count}/{total} — "
                             f"{_safe_get(g, 'display_name') or ''}")
-                        _time.sleep(0.05)   # just enough to keep UI responsive
+                        _time.sleep(0.05)
 
-                    self.done.emit(index_updated, count)
+                    self.done.emit(count)
                 except Exception as e:
                     import logging
-                    logging.getLogger(__name__).error("ProtonDB refresh failed: %s", e)
+                    logging.getLogger(__name__).error(
+                        "ProtonDB refresh failed: %s", e)
                     self.status.emit(f"✗ Error: {e}")
-                    self.done.emit(False, 0)
+                    self.done.emit(0)
 
         self.pdb_refresh_btn.setEnabled(False)
-        self.pdb_refresh_btn.setText("Updating…")
+        self.pdb_refresh_btn.setText("Refreshing…")
         self.pdb_status_lbl.setText("Starting…")
         self.pdb_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
 
@@ -1327,18 +1334,13 @@ class SettingsView(QWidget):
         self._pdb_worker.done.connect(self._on_pdb_refresh_done)
         self._pdb_worker.start()
 
-    def _on_pdb_refresh_done(self, index_updated: bool, count: int):
-        import protondb as protondb_mod
-        if index_updated:
-            self.pdb_status_lbl.setText(
-                f"✓ Index updated — {count} game recommendations refreshed")
-        else:
-            self.pdb_status_lbl.setText(
-                f"✓ Done — {count} game recommendations refreshed")
+    def _on_pdb_refresh_done(self, count: int):
+        self.pdb_status_lbl.setText(
+            f"✓ Done — {count} game(s) updated")
         self.pdb_status_lbl.setStyleSheet("color: #4ade80;")
-        self.pdb_refresh_btn.setText("Check for Update")
+        self.pdb_refresh_btn.setText("Refresh Now")
         self.pdb_refresh_btn.setEnabled(True)
-        self._refresh_pdb_index_status()
+        self._refresh_pdb_status_label()
 
     # ── Appearance    # ── Appearance ────────────────────────────────────────────────────────────
 
