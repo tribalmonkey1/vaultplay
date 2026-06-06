@@ -1307,8 +1307,15 @@ class SettingsView(QWidget):
                     self.status.emit(
                         f"Fetching ProtonDB data for {total} games…")
 
+                    # Fetch counts.json once for the whole batch
+                    counts = protondb_mod.fetch_counts()
+                    if not counts:
+                        self.status.emit(
+                            "⚠ Could not fetch ProtonDB counts.json — "
+                            "will use cached hashes only")
+
                     for g in eligible:
-                        result = protondb_mod.fetch_and_store(g["id"])
+                        result = protondb_mod.fetch_and_store(g["id"], counts=counts)
                         if result:
                             count += 1
                         self.status.emit(

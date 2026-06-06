@@ -88,8 +88,8 @@ SESSION.mount("http://", _adapter)
 
 _BASE              = "https://www.protondb.com"
 SUMMARY_URL        = _BASE + "/api/v1/reports/summaries/{app_id}.json"
-COUNTS_URL         = _BASE + "/api/v1/reports/counts/{app_id}.json"
 REPORTS_URL        = _BASE + "/data/reports/all-devices/app/{internal_id}.json"
+COUNTS_URL         = _BASE + "/data/counts.json"   # global file, not per-game
 
 # GE-Proton GitHub releases API
 GE_RELEASES_API    = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
@@ -122,30 +122,57 @@ TIER_INFO = {
 }
 
 # ── Internal hash computation ─────────────────────────────────────────────────
+# Fully reverse-engineered from the ProtonDB React bundle (modules 99273 + 83301).
+# Documented in Notion: "ProtonDB Internal ID — Reverse Engineering Notes".
+#
+# counts.json is a GLOBAL file — one fetch per refresh cycle, fields:
+#   {"reports": <total_reports_int>, "timestamp": <unix_ts_int>, ...}
+# Use the same reports/timestamp to compute hashes for ALL games in a batch.
+#
+# Verified against:
+#   AoE:DE      steam_app_id=1017900  → internal_id=1190953666
+#   GTA V       steam_app_id=271590   → internal_id=371272058
+
+def _vp(s: str) -> int:
+    """
+    JS-equivalent hash: Math.abs(str.concat('m').split('').reduce(...))
+    Replicates the `zk` function from ProtonDB module 99273.
+    """
+    h = 0
+    for c in (str(s) + 'm'):
+        h = ((h << 5) - h + ord(c)) | 0
+        h = h & 0xFFFFFFFF
+        if h >= 0x80000000:
+            h -= 0x100000000
+    return abs(h)
+
+
+def _R(e: int, t: int, n: int) -> str:
+    """
+    R(steamAppId, reports, timestamp) → '{reports}p{steamAppId * (reports % timestamp)}'
+    e = steamAppId (the multiplier), t = reports (the prefix), n = timestamp (the modulus).
+    """
+    t, n = int(t), int(n)
+    return str(t) + 'p' + str(e * (t % n))
+
 
 def _compute_hash(app_id: int, reports: int, timestamp: int) -> int:
     """
-    Replicate the ProtonDB frontend hash used to build the reports JSON path.
-    Derived by reverse-engineering the ProtonDB React bundle.
+    Compute the ProtonDB internal app ID used to build the reports JSON URL.
 
-    The hash is purely a function of (app_id, reports_count, timestamp) as
-    returned by the counts endpoint. Old hashes remain valid even after
-    counts.json changes, so we cache the computed value in the DB.
+    Formula (from module 83301, function jM, calling zk from module 99273):
+      s = 'p' + R(app_id, reports, timestamp) + '*vRT' + R(1, app_id, timestamp) + 'undefined'
+      internal_id = _vp(s)
+
+    The 'undefined' suffix is critical — it's JS undefined stringified in the concat.
+    Old hashes remain valid even as counts.json changes, so we cache in DB.
     """
-    # Murmur2-inspired mixing used by the ProtonDB frontend
-    seed = app_id
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    seed = (seed * 0x45d9f3b) & 0xFFFFFFFF
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    seed = (seed ^ reports) & 0xFFFFFFFF
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    seed = (seed * 0x45d9f3b) & 0xFFFFFFFF
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    seed = (seed ^ timestamp) & 0xFFFFFFFF
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    seed = (seed * 0x45d9f3b) & 0xFFFFFFFF
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    return seed
+    s = ('p'
+         + _R(app_id, reports, timestamp)
+         + '*vRT'
+         + _R(1, app_id, timestamp)
+         + 'undefined')
+    return _vp(s)
 
 
 # ── Version normalization ─────────────────────────────────────────────────────
@@ -237,26 +264,32 @@ def fetch_summary(steam_app_id: int) -> Optional[dict]:
         return None
 
 
-def fetch_counts(steam_app_id: int) -> Optional[dict]:
+def fetch_counts() -> Optional[dict]:
     """
-    Fetch the counts object for a game.
-    Returns dict with 'reports' (int) and 'timestamp' (int), or None.
+    Fetch the global counts.json file from ProtonDB.
+    Returns dict with 'reports' (int) and 'timestamp' (int), or None on failure.
+
+    This is a GLOBAL file — one fetch gives you the salt values used to compute
+    internal hashes for ALL games. Call once per refresh cycle, not per game.
+    URL: https://www.protondb.com/data/counts.json
+    Response: {"reports": 430668, "timestamp": 1780603361, ...}
     """
-    url = COUNTS_URL.format(app_id=steam_app_id)
+    url = "https://www.protondb.com/data/counts.json"
     try:
         resp = SESSION.get(url, timeout=10)
-        if resp.status_code == 404:
-            log.debug("ProtonDB: no counts for app_id=%d (404)", steam_app_id)
-            return None
         resp.raise_for_status()
         data = resp.json()
         resp.close()
-        reports   = int(data.get("reports",   data.get("total", 0)))
-        timestamp = int(data.get("timestamp", data.get("date",  0)))
+        reports   = int(data.get("reports",   0))
+        timestamp = int(data.get("timestamp", 0))
+        if not reports or not timestamp:
+            log.warning("[PROTONDB ERROR] counts.json missing expected fields: %s", data)
+            return None
+        log.debug("ProtonDB: counts.json → reports=%d, timestamp=%d",
+                  reports, timestamp)
         return {"reports": reports, "timestamp": timestamp}
     except Exception as e:
-        log.warning("[PROTONDB ERROR] Counts fetch failed for app_id=%d — %s: %s",
-                    steam_app_id, url, e)
+        log.warning("[PROTONDB ERROR] counts.json fetch failed — %s: %s", url, e)
         return None
 
 
@@ -794,13 +827,19 @@ def get_steam_install_url(canonical_key: str) -> tuple[str, bool]:
 
 # ── Main fetch-and-store ──────────────────────────────────────────────────────
 
-def fetch_and_store(game_id: int) -> Optional[dict]:
+def fetch_and_store(game_id: int,
+                    counts: Optional[dict] = None) -> Optional[dict]:
     """
     Fetch ProtonDB data for a single game and write results to DB.
 
+    counts: pre-fetched global counts dict {"reports": int, "timestamp": int}.
+            If None, fetch_and_store will fetch counts.json itself (slower —
+            prefer passing counts in from a batch loop via fetch_and_store_batch).
+
     Steps:
       1. Summary API → tier, total_reports
-      2. Use cached internal_id if available, else fetch counts → compute hash
+      2. Use cached internal_id if available, else use provided counts (or fetch
+         counts.json) → compute hash
       3. Reports endpoint → per-version counts → plurality winner
       4. Store all of: tier, recommended_proton, protondb_reports,
          protondb_internal_id, protondb_version_counts
@@ -824,7 +863,7 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
 
         # ── Step 1: Summary (tier + total) ────────────────────────────────────
         summary = fetch_summary(steam_app_id)
-        tier         = summary["tier"]          if summary else "pending"
+        tier          = summary["tier"]          if summary else "pending"
         total_reports = summary["total_reports"] if summary else 0
 
         # ── Step 2: Get or compute internal hash ──────────────────────────────
@@ -836,15 +875,19 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
         internal_id = cached_id
 
         if not internal_id:
-            counts = fetch_counts(steam_app_id)
-            if counts:
+            # Use provided counts or fetch globally
+            c = counts
+            if not c:
+                c = fetch_counts()
+            if c:
                 internal_id = _compute_hash(steam_app_id,
-                                            counts["reports"], counts["timestamp"])
+                                            c["reports"], c["timestamp"])
                 log.debug("ProtonDB: computed hash %d for app_id=%d",
                           internal_id, steam_app_id)
             else:
-                log.warning("[PROTONDB ERROR] Could not fetch counts for app_id=%d "
-                            "(game %d) — no hash available, skipping reports fetch",
+                log.warning("[PROTONDB ERROR] No counts available for app_id=%d "
+                            "(game %d) — skipping reports fetch. "
+                            "If this persists, the ProtonDB endpoint may have changed.",
                             steam_app_id, game_id)
 
         # ── Step 3: Fetch reports → count versions ────────────────────────────
@@ -870,10 +913,10 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
             else:
                 log.warning("[PROTONDB ERROR] Reports fetch returned no data for "
                             "game %d (app_id=%d, hash=%d). "
-                            "The install dialog will show a data unavailable warning.",
+                            "The install dialog will show a data unavailable warning. "
+                            "If this keeps happening, the ProtonDB endpoint may have changed.",
                             game_id, steam_app_id, internal_id)
-                # If a cached hash 404'd and a fresh one was tried, wipe the cached
-                # hash so next refresh recomputes from scratch
+                # Wipe cached hash so next refresh recomputes from scratch
                 internal_id = None
 
         # ── Step 4: Store ─────────────────────────────────────────────────────
@@ -897,6 +940,27 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
         log.error("[PROTONDB ERROR] fetch_and_store failed for game %d: %s",
                   game_id, e, exc_info=True)
         return None
+
+
+def fetch_and_store_batch(game_ids: list) -> int:
+    """
+    Fetch ProtonDB data for multiple games efficiently.
+    Fetches counts.json ONCE and reuses it for all hash computations.
+    Returns the number of games successfully updated.
+    """
+    counts = fetch_counts()
+    if not counts:
+        log.warning("[PROTONDB ERROR] Could not fetch counts.json — "
+                    "batch will use cached hashes only. "
+                    "Games without a cached hash will be skipped.")
+
+    updated = 0
+    for game_id in game_ids:
+        result = fetch_and_store(game_id, counts=counts)
+        if result:
+            updated += 1
+        time.sleep(0.05)
+    return updated
 
 
 # ── Convenience: load stored version counts for UI ───────────────────────────

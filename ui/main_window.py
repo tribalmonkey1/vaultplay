@@ -99,16 +99,31 @@ class ProtonDBWorker(QThread):
         import time as _time
         import db as _db
 
-        # Fetch live ProtonDB data for all games missing it.
-        # No GitHub dump, no tier heuristic — fetch_and_store() hits the live
-        # reports endpoint for each game with a steam_app_id.
+        # Fetch counts.json once, then process all games in a batch.
+        # counts.json is a global file — one fetch gives the salt values
+        # used to compute internal hashes for all games.
         games = _db.get_games_missing_protondb()
+        if not games:
+            self.finished.emit(0)
+            return
+
+        game_ids = [g["id"] for g in games]
+        self.progress.emit(
+            f"Fetching ProtonDB data for {len(game_ids)} games…")
+
+        # Fetch counts once for the whole batch
+        counts = protondb_mod.fetch_counts()
+        if not counts:
+            self.progress.emit(
+                "⚠ Could not fetch ProtonDB counts.json — "
+                "will use cached hashes only")
+
         count = 0
         for i, game in enumerate(games):
             self.progress.emit(
-                f"Fetching ProtonDB data… {i+1}/{len(games)} — "
+                f"Fetching ProtonDB data… {i+1}/{len(game_ids)} — "
                 f"{game['display_name'] or ''}")
-            result = protondb_mod.fetch_and_store(game["id"])
+            result = protondb_mod.fetch_and_store(game["id"], counts=counts)
             if result:
                 count += 1
             _time.sleep(0.05)
