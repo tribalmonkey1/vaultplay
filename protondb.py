@@ -1,11 +1,17 @@
 """
 protondb.py — ProtonDB integration + installed Proton version detection for VaultPlay
 
-- Scans system for actually-installed Proton/Wine versions
-  (Steam official, GE-Proton, Lutris, system Wine)
-- Uses the official ProtonDB summary API (tier/score/total) to recommend
-  the best installed version for each game
-- Normalizes version strings for display
+Data source for version recommendations:
+  - Monthly data dumps from github.com/bdefore/protondb-data (complete, reliable,
+    offline after first download, updated ~monthly)
+  - Downloaded once, parsed into a compact per-game index stored at
+    ~/.config/vaultplay/protondb_index.json
+  - "Refresh ProtonDB Data" checks for a newer monthly dump and re-indexes if found
+
+Tier/score data:
+  - Official ProtonDB summary API (protondb.com) — tier, score, total reports
+  - Used as fallback when index has no data for a game, and always fetched for
+    the tier badge display
 """
 
 
@@ -24,9 +30,14 @@ if _parent not in _sys.path:
     _sys.path.insert(0, _parent)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import gzip
+import hashlib
+import io
+import json
 import os
 import re
 import logging
+import tarfile
 import time
 import requests
 import requests.adapters
@@ -39,17 +50,19 @@ log = logging.getLogger(__name__)
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = "VaultPlay/1.0"
-_adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=1)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=4, max_retries=1)
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
-PROTONDB_SUMMARY_API = "https://www.protondb.com/api/v1/reports/summaries/{app_id}.json"
-# The official API only exposes tier/score/total — no per-report version data.
-# The mirror provides individual reports. Confirmed response format from live API:
-#   { "id": int, "appId": int, "timestamp": int (unix epoch),
-#     "protonVersion": str, "rating": str, "notes": str, ... }
-# Reports are returned in oldest-first order, so we sort by timestamp descending.
-PROTONDB_REPORTS_API = "https://protondb.max-p.me/games/{app_id}/reports"
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+PROTONDB_SUMMARY_API  = "https://www.protondb.com/api/v1/reports/summaries/{app_id}.json"
+PROTONDB_DUMP_API     = "https://api.github.com/repos/bdefore/protondb-data/contents/reports"
+PROTONDB_DUMP_BASE    = "https://github.com/bdefore/protondb-data/raw/master/reports/{filename}"
+
+# How many recent reports per game to keep in the index.
+# Newer reports are weighted higher; we only count the most recent MAX_REPORTS_PER_GAME.
+MAX_REPORTS_PER_GAME  = 50
 
 TIER_INFO = {
     "platinum": ("Platinum", "#b4c7dc"),
@@ -59,6 +72,270 @@ TIER_INFO = {
     "borked":   ("Borked",   "#f87171"),
     "pending":  ("Pending",  "#6b7280"),
 }
+
+
+# ── Index paths ───────────────────────────────────────────────────────────────
+
+def _config_dir() -> Path:
+    env = os.environ.get("VAULTPLAY_CONFIG_DIR")
+    if env:
+        return Path(env)
+    return Path.home() / ".config" / "vaultplay"
+
+
+def _index_path() -> Path:
+    return _config_dir() / "protondb_index.json"
+
+
+def _meta_path() -> Path:
+    """Stores the filename of the dump currently indexed, for update checks."""
+    return _config_dir() / "protondb_index_meta.json"
+
+
+# ── Index management ──────────────────────────────────────────────────────────
+
+# In-memory cache of the loaded index: {str(app_id): [version_str, ...]}
+# Versions are already sorted newest-first and limited to MAX_REPORTS_PER_GAME.
+_index_cache: dict = {}
+_index_loaded: bool = False
+
+
+def _load_index() -> dict:
+    """Load the local index into memory. Returns empty dict if not built yet."""
+    global _index_cache, _index_loaded
+    if _index_loaded:
+        return _index_cache
+    p = _index_path()
+    if p.exists():
+        try:
+            _index_cache = json.loads(p.read_text())
+            _index_loaded = True
+            log.info("ProtonDB index loaded: %d games", len(_index_cache))
+        except Exception as e:
+            log.warning("Failed to load ProtonDB index: %s", e)
+            _index_cache = {}
+    else:
+        log.info("ProtonDB index not yet built — will use tier heuristic until first download")
+    return _index_cache
+
+
+def _invalidate_index_cache():
+    """Force a reload from disk on next access."""
+    global _index_loaded
+    _index_loaded = False
+
+
+def get_index_meta() -> dict:
+    """Return metadata about the current index (which dump file it came from)."""
+    p = _meta_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_index(index: dict, dump_filename: str, total_reports: int):
+    """Write the index and its metadata to disk."""
+    _config_dir().mkdir(parents=True, exist_ok=True)
+    _index_path().write_text(json.dumps(index, separators=(",", ":")))
+    _meta_path().write_text(json.dumps({
+        "dump_filename":  dump_filename,
+        "total_reports":  total_reports,
+        "indexed_at":     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }, indent=2))
+    _invalidate_index_cache()
+    log.info("ProtonDB index saved: %d games from %s", len(index), dump_filename)
+
+
+# ── Dump discovery ────────────────────────────────────────────────────────────
+
+def get_latest_dump_filename() -> Optional[str]:
+    """
+    Query GitHub to find the most recent monthly dump filename.
+    Returns e.g. 'reports_jun1_2026.tar.gz' or None on failure.
+    """
+    try:
+        resp = SESSION.get(PROTONDB_DUMP_API, timeout=15)
+        resp.raise_for_status()
+        files = resp.json()
+        resp.close()
+    except Exception as e:
+        log.warning("Failed to list ProtonDB dump files: %s", e)
+        return None
+
+    # Filter to .tar.gz report files and sort by embedded date
+    def _dump_sort_key(name: str):
+        # e.g. "reports_jun1_2026.tar.gz"
+        months = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                  "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        m = re.search(r"reports_([a-z]+)(\d+)_(\d{4})", name)
+        if m:
+            mon = months.get(m.group(1).lower(), 0)
+            day = int(m.group(2))
+            yr  = int(m.group(3))
+            return (yr, mon, day)
+        return (0, 0, 0)
+
+    dumps = [
+        f["name"] for f in files
+        if isinstance(f, dict) and f.get("name", "").startswith("reports_")
+        and f["name"].endswith(".tar.gz")
+    ]
+    if not dumps:
+        return None
+
+    dumps.sort(key=_dump_sort_key, reverse=True)
+    return dumps[0]
+
+
+def needs_update() -> tuple[bool, str, str]:
+    """
+    Check if a newer dump is available.
+    Returns (needs_update, current_filename, latest_filename).
+    """
+    latest = get_latest_dump_filename()
+    if not latest:
+        return False, "", ""
+    current = get_index_meta().get("dump_filename", "")
+    return (latest != current), current, latest
+
+
+# ── Dump download + index build ───────────────────────────────────────────────
+
+def build_index_from_dump(dump_filename: str,
+                           progress_cb=None) -> bool:
+    """
+    Download a ProtonDB dump, parse it, and build the local index.
+
+    The dump is a .tar.gz containing a single JSON file — a flat array of
+    report objects. Each object has:
+      app.steam.appId    — Steam App ID string
+      responses.protonVersion — version string e.g. "Proton 9.0-4"
+      timestamp          — unix epoch int
+
+    We group by app_id, sort each game's reports newest-first, keep the top
+    MAX_REPORTS_PER_GAME, and store just the normalized version strings.
+
+    progress_cb(stage: str, percent: int, message: str)
+    """
+    def prog(stage, pct, msg):
+        if progress_cb:
+            progress_cb(stage, pct, msg)
+        log.info("[ProtonDB dump] %s %d%% — %s", stage, pct, msg)
+
+    url = PROTONDB_DUMP_BASE.format(filename=dump_filename)
+    prog("Downloading", 0, f"Downloading {dump_filename}…")
+
+    try:
+        resp = SESSION.get(url, timeout=120, stream=True)
+        resp.raise_for_status()
+
+        # Stream into memory (66MB compressed → ~300MB uncompressed)
+        # We stream the download but decompress in one shot
+        total_size = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        chunks = []
+        for chunk in resp.iter_content(chunk_size=65536):
+            chunks.append(chunk)
+            downloaded += len(chunk)
+            if total_size:
+                pct = int(downloaded / total_size * 40)
+                prog("Downloading", pct, f"Downloaded {downloaded // 1024 // 1024} MB…")
+        resp.close()
+        raw = b"".join(chunks)
+        prog("Downloading", 40, "Download complete, parsing…")
+    except Exception as e:
+        log.error("Failed to download dump %s: %s", dump_filename, e)
+        return False
+
+    # Parse tar.gz → extract the JSON file inside
+    prog("Parsing", 42, "Extracting archive…")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+            # Find the JSON member
+            json_member = next(
+                (m for m in tar.getmembers() if m.name.endswith(".json")), None
+            )
+            if not json_member:
+                log.error("No JSON file found in dump %s", dump_filename)
+                return False
+            json_bytes = tar.extractfile(json_member).read()
+        prog("Parsing", 50, "Parsing JSON…")
+    except Exception as e:
+        log.error("Failed to extract dump %s: %s", dump_filename, e)
+        return False
+
+    try:
+        reports = json.loads(json_bytes)
+        prog("Parsing", 65, f"Parsed {len(reports):,} reports, building index…")
+    except Exception as e:
+        log.error("Failed to parse JSON from dump %s: %s", dump_filename, e)
+        return False
+
+    # Build index: {app_id_str: [(timestamp, normalized_version), ...]}
+    # We collect all (timestamp, version) pairs per game first, then sort and trim
+    prog("Indexing", 67, "Grouping by game…")
+    raw_index: dict[str, list] = {}
+    skipped = 0
+    for report in reports:
+        try:
+            app_id = str(report["app"]["steam"]["appId"])
+            ver_raw = report["responses"].get("protonVersion", "")
+            ts = int(report.get("timestamp", 0))
+        except (KeyError, TypeError, ValueError):
+            skipped += 1
+            continue
+
+        if not ver_raw or ver_raw.lower() in ("", "default", "unknown"):
+            continue
+
+        normalized = _parse_major_version(ver_raw)
+        if not normalized or normalized == "native":
+            continue
+
+        if app_id not in raw_index:
+            raw_index[app_id] = []
+        raw_index[app_id].append((ts, normalized))
+
+    prog("Indexing", 85, f"Sorting and trimming {len(raw_index):,} games…")
+
+    # Sort each game newest-first, keep only top MAX_REPORTS_PER_GAME version strings
+    final_index: dict[str, list] = {}
+    for app_id, entries in raw_index.items():
+        entries.sort(key=lambda x: x[0], reverse=True)
+        final_index[app_id] = [v for _, v in entries[:MAX_REPORTS_PER_GAME]]
+
+    prog("Saving", 95, f"Saving index ({len(final_index):,} games)…")
+    _save_index(final_index, dump_filename, len(reports))
+    prog("Done", 100, f"Index built: {len(final_index):,} games, {len(reports):,} reports")
+    return True
+
+
+# ── Version lookup from index ─────────────────────────────────────────────────
+
+def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Optional[str]:
+    """
+    Look up the most commonly reported Proton version for a game from the
+    local index. Returns a canonical key e.g. '9.0', 'GE-Proton 10', or None.
+    """
+    index = _load_index()
+    entries = index.get(str(steam_app_id))
+    if not entries:
+        log.debug("ProtonDB index: no data for app_id=%d", steam_app_id)
+        return None
+
+    # entries is already sorted newest-first; take top max_reports
+    counts: dict[str, int] = {}
+    for ver in entries[:max_reports]:
+        counts[ver] = counts.get(ver, 0) + 1
+
+    best = max(counts, key=lambda k: counts[k])
+    log.info("ProtonDB index: app_id=%d, %d reports → %s → best: %s",
+             steam_app_id, len(entries),
+             dict(sorted(counts.items(), key=lambda x: -x[1])), best)
+    return best
 
 
 # ── Steam library path discovery ──────────────────────────────────────────────
@@ -102,7 +379,6 @@ def _steam_roots() -> list[Path]:
 
 
 def _build_scan_paths() -> list[Path]:
-    """Build full list of directories to scan for Proton/Wine versions."""
     paths = [
         Path.home() / ".local" / "share" / "lutris" / "runners" / "wine",
     ]
@@ -120,27 +396,12 @@ def _build_scan_paths() -> list[Path]:
 # ── Version normalization ──────────────────────────────────────────────────────
 
 def _normalize_version(ver: str) -> str:
-    """
-    Normalize a folder/dir name to a clean display label.
-    'GE-Proton9-27'         -> 'GE-Proton 9.27'
-    'Proton - Experimental' -> 'Proton Experimental'
-    'Proton Experimental'   -> 'Proton Experimental'
-    'Proton 9.0'            -> 'Proton 9.0'
-    'proton-9.0-4'          -> 'Proton 9.0'
-    'wine-ge-8-26-x86_64'   -> 'Wine-GE 8.26'
-    """
     ver = ver.strip()
-
-    # GE-ProtonN-M (e.g. GE-Proton9-27, Lutris-GE-Proton9-3-x86_64)
     m = re.match(r"(?:Lutris-)?GE-Proton(\d+)-(\d+)", ver, re.IGNORECASE)
     if m:
         return f"GE-Proton {m.group(1)}.{m.group(2)}"
-
-    # Proton Experimental (various spellings)
     if re.search(r"proton.{0,4}experimental", ver, re.IGNORECASE):
         return "Proton Experimental"
-
-    # Proton N.M[-suffix]
     m = re.match(r"Proton[\s_-]+(\d+\.\d+)", ver, re.IGNORECASE)
     if m:
         rest = ver[m.end():].strip(" -_")
@@ -148,23 +409,47 @@ def _normalize_version(ver: str) -> str:
             rest = re.sub(r"^[-_\s]+", "", rest)
             return f"Proton {m.group(1)} {rest}".strip()
         return f"Proton {m.group(1)}"
-
-    # wine-ge-N-M-x86_64
     m = re.match(r"wine-ge-(\d+)-(\d+)", ver, re.IGNORECASE)
     if m:
         return f"Wine-GE {m.group(1)}.{m.group(2)}"
-
-    # proton-experimental (Lutris runner naming)
     if re.match(r"proton-experimental", ver, re.IGNORECASE):
         return "Proton Experimental"
-
     return ver
 
 
-# ── Version detection ─────────────────────────────────────────────────────────
+def _parse_major_version(ver_str: str) -> str:
+    """
+    Normalize a ProtonDB report version string to a canonical key for counting.
+    'Proton 9.0-4'        -> '9.0'
+    'Proton Experimental' -> 'experimental'
+    'GE-Proton10-27'      -> 'GE-Proton 10'
+    'native'              -> 'native'
+    """
+    if not ver_str:
+        return ""
+    s = ver_str.strip()
+    if re.search(r"^native$", s, re.IGNORECASE):
+        return "native"
+    if re.search(r"experimental", s, re.IGNORECASE):
+        return "experimental"
+    m = re.match(r"GE-Proton(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"GE-Proton {m.group(1)}"
+    m = re.search(r"[Pp]roton\s*(\d+)\.(\d+)", s)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    m = re.search(r"[Pp]roton\s*(\d+)", s)
+    if m:
+        return m.group(1)
+    m = re.match(r"wine-ge-(\d+)", s, re.IGNORECASE)
+    if m:
+        return f"Wine-GE {m.group(1)}"
+    return s
+
+
+# ── Installed version detection ───────────────────────────────────────────────
 
 def _dir_is_wine_version(path: Path) -> bool:
-    """Return True if this directory looks like a Wine or Proton installation."""
     return (
         (path / "bin" / "wine").exists()
         or (path / "bin" / "wine64").exists()
@@ -177,7 +462,6 @@ def _dir_is_wine_version(path: Path) -> bool:
 
 
 def scan_installed_versions() -> list[dict]:
-    """Scan all known locations for installed Proton/Wine versions."""
     found: dict[str, dict] = {}
     seen_dirs = set()
 
@@ -210,7 +494,6 @@ def scan_installed_versions() -> list[dict]:
 
             if value not in found:
                 found[value] = {"label": label, "value": value, "path": str(entry)}
-                log.debug("Found Proton/Wine: %s at %s", label, entry)
 
     import shutil
     if shutil.which("wine"):
@@ -224,17 +507,27 @@ def scan_installed_versions() -> list[dict]:
             sys_label = "System Wine"
         found["system-wine"] = {"label": sys_label, "value": "system-wine", "path": "wine"}
 
-    result = list(found.values())
-    if not result:
-        log.warning("No Proton/Wine versions found on this system.")
-    log.info("Found %d Proton/Wine version(s): %s",
-             len(result), [r["label"] for r in result])
-    return result
+    return list(found.values())
+
+
+# ── Installed version cache ────────────────────────────────────────────────────
+
+_installed_cache: list[dict] = []
+_installed_cache_ts: float = 0.0
+_CACHE_TTL: float = 120.0
+
+
+def _get_cached_installed() -> list[dict]:
+    global _installed_cache, _installed_cache_ts
+    if not _installed_cache or (time.monotonic() - _installed_cache_ts) > _CACHE_TTL:
+        _installed_cache = scan_installed_versions()
+        _installed_cache_ts = time.monotonic()
+    return _installed_cache
 
 
 def get_versions_for_ui() -> list[tuple[str, str]]:
     """Return (display_label, value) tuples sorted for UI dropdown."""
-    versions = list(_get_cached_installed())  # copy so sort doesn't mutate the cache
+    versions = list(_get_cached_installed())
 
     def sort_key(v):
         label = v["label"].lower()
@@ -265,9 +558,10 @@ def get_version_path(value: str) -> Optional[str]:
     return None
 
 
-# ── ProtonDB API ──────────────────────────────────────────────────────────────
+# ── ProtonDB official summary API ─────────────────────────────────────────────
 
 def fetch_protondb(steam_app_id: int) -> Optional[dict]:
+    """Fetch tier/score/total from the official ProtonDB summary API."""
     try:
         url = PROTONDB_SUMMARY_API.format(app_id=steam_app_id)
         resp = SESSION.get(url, timeout=10)
@@ -287,99 +581,13 @@ def fetch_protondb(steam_app_id: int) -> Optional[dict]:
         return None
 
 
-def get_most_recommended_version(steam_app_id: int, max_reports: int = 30) -> Optional[str]:
-    """
-    Fetch the most recent ProtonDB community reports and return the most commonly
-    reported Proton version as a canonical key (e.g. '9.0', 'GE-Proton 10').
-
-    The mirror returns all reports in oldest-first order. We sort by the confirmed
-    'timestamp' field (unix epoch) descending so we read the most recent reports,
-    not years-old ones that reflect ancient Proton versions.
-
-    Returns None if the mirror is unavailable or has no useful data for this game,
-    so the caller can fall back to the tier heuristic.
-    """
-    try:
-        url = PROTONDB_REPORTS_API.format(app_id=steam_app_id)
-        resp = SESSION.get(url, timeout=15)
-        if resp.status_code == 404:
-            log.debug("ProtonDB mirror: no reports for app_id=%d", steam_app_id)
-            return None
-        if resp.status_code != 200:
-            log.debug("ProtonDB mirror returned HTTP %d for app_id=%d",
-                      resp.status_code, steam_app_id)
-            return None
-        reports = resp.json()
-        resp.close()
-    except Exception as e:
-        log.warning("ProtonDB mirror fetch failed for app_id=%d: %s", steam_app_id, e)
-        return None
-
-    if not reports:
-        return None
-
-    # Sort newest-first by confirmed 'timestamp' field (unix epoch int).
-    # Without this, [:max_reports] reads the oldest reports in the dataset.
-    reports = sorted(reports, key=lambda r: r.get("timestamp", 0), reverse=True)
-
-    counts: dict[str, int] = {}
-    for report in reports[:max_reports]:
-        # Confirmed field name from live API response: 'protonVersion' (camelCase)
-        ver_raw = report.get("protonVersion") or report.get("proton_version") or ""
-        if not ver_raw:
-            continue
-        normalized = _parse_major_version(str(ver_raw))
-        if normalized and normalized != "native":
-            counts[normalized] = counts.get(normalized, 0) + 1
-
-    if not counts:
-        log.debug("ProtonDB mirror: %d reports for app_id=%d but none had version data",
-                  min(len(reports), max_reports), steam_app_id)
-        return None
-
-    best = max(counts, key=lambda k: counts[k])
-    log.info("ProtonDB mirror: app_id=%d top %d reports → %s → best: %s",
-             steam_app_id, max_reports,
-             dict(sorted(counts.items(), key=lambda x: -x[1])), best)
-    return best
-
-
-def _parse_major_version(ver_str: str) -> str:
-    """
-    Normalize a ProtonDB report version string to a canonical key.
-    'Proton 9.0-4'        -> '9.0'
-    'Proton Experimental' -> 'experimental'
-    'GE-Proton10-27'      -> 'GE-Proton 10'
-    'native'              -> 'native'
-    """
-    if not ver_str:
-        return ""
-    s = ver_str.strip()
-    if re.search(r"^native$", s, re.IGNORECASE):
-        return "native"
-    if re.search(r"experimental", s, re.IGNORECASE):
-        return "experimental"
-    m = re.match(r"GE-Proton(\d+)", s, re.IGNORECASE)
-    if m:
-        return f"GE-Proton {m.group(1)}"
-    m = re.search(r"[Pp]roton\s*(\d+)\.(\d+)", s)
-    if m:
-        return f"{m.group(1)}.{m.group(2)}"
-    m = re.search(r"[Pp]roton\s*(\d+)", s)
-    if m:
-        return m.group(1)
-    m = re.match(r"wine-ge-(\d+)", s, re.IGNORECASE)
-    if m:
-        return f"Wine-GE {m.group(1)}"
-    return s
-
+# ── Version matching ──────────────────────────────────────────────────────────
 
 def match_to_installed(recommended_version: str,
                         installed: list[tuple[str, str]]) -> Optional[str]:
     """
-    Match a canonical version key (e.g. '9.0', 'GE-Proton 10') to the closest
-    installed version value. For numbered versions, picks the newest minor version
-    of the matching major. Returns None if nothing matches.
+    Match a canonical version key to the closest installed version.
+    For GE-Proton N, picks the highest installed minor of that major.
     """
     if not recommended_version or not installed:
         return None
@@ -395,7 +603,6 @@ def match_to_installed(recommended_version: str,
                 return value
         return None
 
-    # GE-Proton N — pick highest installed minor of that major
     m = re.match(r"ge-proton\s*(\d+)", rec)
     if m:
         major = m.group(1)
@@ -410,7 +617,6 @@ def match_to_installed(recommended_version: str,
         if best_val:
             return best_val
 
-    # Stable Proton N.M — exact match first, then major-only
     m = re.match(r"(\d+)\.(\d+)", rec)
     if m:
         major, minor = m.group(1), m.group(2)
@@ -423,7 +629,6 @@ def match_to_installed(recommended_version: str,
             if "ge" not in lbl and re.search(r"\b" + major + r"\b", lbl):
                 return value
 
-    # Major-only integer (e.g. rec = "9")
     m = re.match(r"^(\d+)$", rec)
     if m:
         major = m.group(1)
@@ -432,7 +637,6 @@ def match_to_installed(recommended_version: str,
             if "ge" not in lbl and re.search(r"\b" + major + r"\b", lbl):
                 return value
 
-    # Substring fallback
     for label, value in installed:
         if rec in label.lower():
             return value
@@ -440,31 +644,31 @@ def match_to_installed(recommended_version: str,
     return None
 
 
+# ── Recommendation logic ──────────────────────────────────────────────────────
+
 def recommended_proton_for_game(steam_app_id: int,
                                  installed: list[tuple[str, str]]) -> tuple[Optional[str], str]:
     """
     Get the recommended Proton version for a game.
 
     Priority:
-      1. ProtonDB mirror  — most-reported version from recent community reports,
-                            matched to an installed version
-      2. Tier heuristic  — uses official ProtonDB tier (platinum/gold/silver/etc.)
-                            to pick a sensible installed version
+      1. Local index (built from monthly GitHub dump) — most-reported version
+         from community reports, matched to an installed version
+      2. Tier heuristic — official ProtonDB tier drives selection when index
+         has no data for this game
       3. User default setting
       4. First installed version
     """
-    # ── 1. Community reports (mirror) ────────────────────────────────────────
+    # ── 1. Local index ────────────────────────────────────────────────────────
     rec_ver = get_most_recommended_version(steam_app_id)
     if rec_ver:
         matched = match_to_installed(rec_ver, installed)
         if matched:
             return matched, f"Recommended by ProtonDB community ({rec_ver})"
-        # Mirror had data but the recommended version isn't installed —
-        # fall through to tier heuristic rather than returning "not installed"
-        log.info("ProtonDB mirror recommends %s for app_id=%d but it is not installed "
+        log.info("ProtonDB index recommends %s for app_id=%d but it is not installed "
                  "— falling back to tier heuristic", rec_ver, steam_app_id)
 
-    # ── 2. Tier heuristic (official summary API) ─────────────────────────────
+    # ── 2. Tier heuristic ─────────────────────────────────────────────────────
     summary = fetch_protondb(steam_app_id)
     if summary:
         tier = summary.get("tier", "pending")
@@ -505,7 +709,7 @@ def recommended_proton_for_game(steam_app_id: int,
         if installed:
             return installed[0][1], f"Tier: {tier} — using newest installed version"
 
-    # ── 3. User default / first installed ────────────────────────────────────
+    # ── 3. Fallbacks ──────────────────────────────────────────────────────────
     try:
         saved_default = db.get_setting("default_proton_version", "")
         if saved_default:
@@ -520,41 +724,27 @@ def recommended_proton_for_game(steam_app_id: int,
     return None, "No Proton/Wine versions found — install via ProtonUp-Qt or Lutris"
 
 
+# ── Tier display + label helpers ──────────────────────────────────────────────
+
 def tier_display(tier: str) -> tuple[str, str]:
     return TIER_INFO.get((tier or "").lower(), ("Unknown", "#6b7280"))
 
 
-# Module-level cache so proton_version_label() and get_versions_for_ui()
-# don't re-scan the filesystem on every call.
-_installed_cache: list[dict] = []
-_installed_cache_ts: float = 0.0
-_CACHE_TTL: float = 120.0   # seconds
-
-
-def _get_cached_installed() -> list[dict]:
-    global _installed_cache, _installed_cache_ts
-    if not _installed_cache or (time.monotonic() - _installed_cache_ts) > _CACHE_TTL:
-        _installed_cache = scan_installed_versions()
-        _installed_cache_ts = time.monotonic()
-    return _installed_cache
-
-
 def proton_version_label(value: str) -> str:
-    """Return the human-readable label for a stored version value key."""
     for v in _get_cached_installed():
         if v["value"] == value:
             return v["label"]
     return value
 
 
+# ── fetch_and_store ───────────────────────────────────────────────────────────
+
 def fetch_and_store(game_id: int) -> Optional[dict]:
     """
-    Fetch ProtonDB tier summary and store version recommendation in DB.
+    Compute and store the ProtonDB recommendation for a single game.
 
-    Flow:
-      1. fetch_protondb()              → tier, score, total_reports (official summary API)
-      2. recommended_proton_for_game() → tier heuristic → best installed version
-      3. Store both in metadata row
+    Uses the local index for version recommendation and the official summary
+    API for tier/score/total. Called for each game during a ProtonDB refresh.
     """
     try:
         game = db.get_game(game_id)
@@ -573,7 +763,8 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
 
         data = fetch_protondb(steam_app_id)
         if not data:
-            log.debug("ProtonDB: no summary for steam_app_id=%d (game %d)", steam_app_id, game_id)
+            log.debug("ProtonDB: no summary for steam_app_id=%d (game %d)",
+                      steam_app_id, game_id)
             return None
 
         tier      = data["tier"]
@@ -583,10 +774,8 @@ def fetch_and_store(game_id: int) -> Optional[dict]:
         rec_value = matched_value or (installed[0][1] if installed else "")
 
         db.update_protondb(game_id, tier, rec_value, data.get("total_reports", 0))
-        log.info(
-            "ProtonDB: game %d (app %d) — tier=%s  rec=%s  reason=%s",
-            game_id, steam_app_id, tier, rec_value or "none", rec_reason,
-        )
+        log.info("ProtonDB: game %d (app %d) — tier=%s  rec=%s  reason=%s",
+                 game_id, steam_app_id, tier, rec_value or "none", rec_reason)
         return {**data, "recommended_proton": rec_value}
     except Exception as e:
         log.warning("fetch_and_store failed for game %d: %s", game_id, e)

@@ -92,19 +92,47 @@ class MetadataWorker(QThread):
 
 
 class ProtonDBWorker(QThread):
-    progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(int)   # count fetched
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)   # count updated
 
     def run(self):
-        games = __import__("db").get_games_missing_protondb()
+        import time as _time
+        import db as _db
+
+        # Ensure the local index is built before trying to apply recommendations.
+        # On first run the index won't exist yet — download the latest dump.
+        # On subsequent runs, only download if a newer dump is available.
+        meta = protondb_mod.get_index_meta()
+        if not meta:
+            self.progress.emit("No ProtonDB index found — downloading data dump…")
+            latest = protondb_mod.get_latest_dump_filename()
+            if latest:
+                protondb_mod.build_index_from_dump(
+                    latest,
+                    progress_cb=lambda stage, pct, msg: self.progress.emit(
+                        f"{stage}: {msg}"))
+            else:
+                self.progress.emit("Could not reach GitHub — using tier heuristic only")
+        else:
+            needs_upd, _, latest = protondb_mod.needs_update()
+            if needs_upd and latest:
+                self.progress.emit(f"New ProtonDB dump available ({latest}) — updating…")
+                protondb_mod.build_index_from_dump(
+                    latest,
+                    progress_cb=lambda stage, pct, msg: self.progress.emit(
+                        f"{stage}: {msg}"))
+
+        # Apply recommendations to all games missing ProtonDB data
+        games = _db.get_games_missing_protondb()
         count = 0
         for i, game in enumerate(games):
-            if self.progress:
-                self.progress.emit(i + 1, len(games), game["display_name"] or "")
+            self.progress.emit(
+                f"Applying ProtonDB data… {i+1}/{len(games)} — "
+                f"{game['display_name'] or ''}")
             result = protondb_mod.fetch_and_store(game["id"])
             if result:
                 count += 1
-            __import__("time").sleep(0.2)
+            _time.sleep(0.05)
         self.finished.emit(count)
 
 
@@ -601,8 +629,8 @@ class MainWindow(QMainWindow):
         self._proton_worker.finished.connect(self._on_proton_done)
         self._proton_worker.start()
 
-    def _on_proton_progress(self, current: int, total: int, name: str):
-        self.library_view.show_status(f"ProtonDB… {current}/{total} — {name}")
+    def _on_proton_progress(self, message: str):
+        self.library_view.show_status(message)
 
     def _on_proton_done(self, count: int):
         if count:
