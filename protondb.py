@@ -349,12 +349,18 @@ def fetch_reports(internal_id: int, steam_app_id: int,
 
 # ── Version counting ──────────────────────────────────────────────────────────
 
-def count_versions(reports: list, max_reports: int = 200) -> dict:
+def count_versions(reports: list, max_reports: int = 30) -> tuple[dict, int]:
     """
     Walk up to max_reports (newest-first) report objects and count protonVersion
     occurrences after normalizing with _parse_report_version().
 
-    Returns dict: {canonical_version_key: count}, excluding 'native' and empty.
+    We fetch up to 40 reports from the endpoint but only use the 30 most recent
+    for counting, so recommendations reflect current community practice rather
+    than being diluted by old reports from years ago.
+
+    Returns (counts_dict, sample_size) where:
+      counts_dict: {canonical_version_key: count}, excluding 'native' and empty
+      sample_size: number of reports actually counted (≤ max_reports)
     """
     counts: dict[str, int] = {}
     seen = 0
@@ -376,7 +382,7 @@ def count_versions(reports: list, max_reports: int = 200) -> dict:
             continue
         counts[canonical] = counts.get(canonical, 0) + 1
         seen += 1
-    return counts
+    return counts, seen
 
 
 def top_version(counts: dict) -> Optional[str]:
@@ -893,23 +899,24 @@ def fetch_and_store(game_id: int,
         # ── Step 3: Fetch reports → count versions ────────────────────────────
         version_counts: dict = {}
         recommended_proton: Optional[str] = None
+        sample_size: int = 0
 
         if internal_id:
             reports_data = fetch_reports(internal_id, steam_app_id)
             if reports_data:
-                version_counts = count_versions(reports_data)
+                version_counts, sample_size = count_versions(reports_data)
                 top = top_version(version_counts)
                 if top:
                     recommended_proton = top
                     log.info("ProtonDB: game %d (app %d) — tier=%s  top_version=%s  "
-                             "counts=%s",
-                             game_id, steam_app_id, tier, top,
+                             "sample=%d  counts=%s",
+                             game_id, steam_app_id, tier, top, sample_size,
                              dict(sorted(version_counts.items(),
                                          key=lambda x: -x[1])[:5]))
                 else:
                     log.info("ProtonDB: game %d (app %d) — tier=%s  "
-                             "no usable version data in reports",
-                             game_id, steam_app_id, tier)
+                             "no usable version data in %d reports sampled",
+                             game_id, steam_app_id, tier, sample_size)
             else:
                 log.warning("[PROTONDB ERROR] Reports fetch returned no data for "
                             "game %d (app_id=%d, hash=%d). "
@@ -920,6 +927,11 @@ def fetch_and_store(game_id: int,
                 internal_id = None
 
         # ── Step 4: Store ─────────────────────────────────────────────────────
+        # Embed sample_size in the counts dict under a reserved key so the
+        # install dialog can display "12 of 30 most recent reports" accurately.
+        if version_counts and sample_size:
+            version_counts["__sample__"] = sample_size
+
         db.update_protondb(
             game_id=game_id,
             tier=tier,
@@ -968,7 +980,7 @@ def fetch_and_store_batch(game_ids: list) -> int:
 def get_version_counts_for_game(game_id: int) -> dict:
     """
     Load the stored protondb_version_counts JSON for a game from DB.
-    Returns dict {canonical_key: count} or empty dict.
+    Returns dict {canonical_key: count} with __sample__ stripped out.
     """
     try:
         game = db.get_game(game_id)
@@ -976,7 +988,28 @@ def get_version_counts_for_game(game_id: int) -> dict:
             return {}
         raw = game["protondb_version_counts"]
         if raw:
-            return json.loads(raw)
+            data = json.loads(raw)
+            data.pop("__sample__", None)
+            return data
     except (KeyError, IndexError, json.JSONDecodeError, Exception):
         pass
     return {}
+
+
+def get_sample_size_for_game(game_id: int) -> int:
+    """
+    Return the number of reports sampled when building version counts.
+    Stored as __sample__ inside protondb_version_counts JSON.
+    Returns 0 if not available.
+    """
+    try:
+        game = db.get_game(game_id)
+        if not game:
+            return 0
+        raw = game["protondb_version_counts"]
+        if raw:
+            data = json.loads(raw)
+            return int(data.get("__sample__", 0))
+    except (KeyError, IndexError, json.JSONDecodeError, Exception):
+        pass
+    return 0

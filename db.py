@@ -157,7 +157,7 @@ def _init_default_settings():
         "scan_interval_minutes": "30",
         "install_path":          str(Path.home() / "Games"),
         "tmp_path":              str(Path.home() / "Games" / ".tmp"),
-        "wine_prefix_root":      str(Path.home() / ".wine_prefixes"),
+        "wine_prefix_root":      str(Path.home() / ".local" / "share" / "wineprefixes"),
         "auto_cleanup_tmp":      "true",
         "default_install_method":"lutris",
         "default_prefix_mode":   "per_game",
@@ -177,7 +177,9 @@ def _init_default_settings():
         "default_proton_version":  "proton-experimental",
         "protondb_auto_fetch":     "true",
         "first_run_complete":      "false",
-        "app_version":             "0.1.0-dev",
+        "wine_drive_mapping":      "auto",   # 'auto' | 'winetricks_default'
+        "wine_scan_run_media":     "true",   # scan /run/media/<user>/ for drive mapping
+        "wine_scan_mnt":           "false",  # scan /mnt/ for drive mapping
     }
     with get_connection() as conn:
         for key, value in defaults.items():
@@ -462,6 +464,7 @@ def get_all_games() -> list:
                    m.steam_app_id, m.protondb_tier, m.protondb_reports,
                    m.recommended_proton, m.protondb_version_counts,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
+                   i.game_path, i.launcher_type, i.desktop_path, i.script_path,
                    (i.id IS NOT NULL) AS is_installed
             FROM games g
             LEFT JOIN metadata m ON m.game_id = g.id
@@ -504,6 +507,7 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
                    m.steam_app_id, m.protondb_tier, m.protondb_reports,
                    m.recommended_proton, m.protondb_version_counts,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
+                   i.game_path, i.launcher_type, i.desktop_path, i.script_path,
                    (i.id IS NOT NULL) AS is_installed
             FROM games g
             LEFT JOIN metadata m ON m.game_id = g.id
@@ -599,6 +603,18 @@ def record_install(game_id: int, install_path: str, wine_prefix: str,
                 installed_at   = datetime('now')
         """, (game_id, install_path, wine_prefix, install_method, exe_path,
               game_path, launcher_type, desktop_path, script_path))
+
+
+def set_install_tag_override(game_id: int, install_tag: str):
+    """
+    Persist the user's manual install tag choice and lock it against future scans.
+    Sets install_tag_override=1 so scanner.upsert_game() CASE expression preserves it.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE games SET install_tag=?, install_tag_override=1 WHERE id=?",
+            (install_tag, game_id)
+        )
 
 
 def remove_install(game_id: int):

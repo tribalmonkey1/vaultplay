@@ -522,6 +522,10 @@ class SettingsView(QWidget):
         # Refresh ProtonDB status label
         self._refresh_pdb_status_label()
 
+        # Refresh redistributables status
+        self._refresh_steamcmd_status()
+        self._refresh_redist_stats()
+
     def _show_page(self, idx: int):
         self._current_page = idx
         self._pages_stack.setCurrentIndex(idx)
@@ -1200,6 +1204,86 @@ class SettingsView(QWidget):
         self.pdb_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
         layout.addWidget(self.pdb_status_lbl)
 
+        # ── Redistributables ──────────────────────────────────────────────────
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("Redistributables"))
+
+        redist_explain = QLabel(
+            "VaultPlay builds a per-game redistributable list from SteamCMD depot "
+            "data and stores it in redists.json in your config folder. This file "
+            "can be exported and imported to share data with another machine that "
+            "doesn't have SteamCMD installed."
+        )
+        redist_explain.setFont(QFont("DM Sans", 11))
+        redist_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 8px;")
+        redist_explain.setWordWrap(True)
+        layout.addWidget(redist_explain)
+
+        # SteamCMD status
+        steamcmd_row = SettingsRow("SteamCMD", "Required for fetching redistributable data")
+        self.steamcmd_status_lbl = QLabel("")
+        self.steamcmd_status_lbl.setFont(QFont("DM Mono", 9))
+        self._refresh_steamcmd_status()
+        steamcmd_row.add_control(self.steamcmd_status_lbl)
+        layout.addWidget(steamcmd_row)
+
+        # File stats
+        redist_stats_row = SettingsRow("redists.json", "Current redistributable data file")
+        self.redist_stats_lbl = QLabel("")
+        self.redist_stats_lbl.setFont(QFont("DM Mono", 9))
+        self.redist_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._refresh_redist_stats()
+        redist_stats_row.add_control(self.redist_stats_lbl)
+        layout.addWidget(redist_stats_row)
+
+        # Refresh missing
+        refresh_missing_row = SettingsRow(
+            "Fetch Missing Data",
+            "Runs SteamCMD for all PC games not yet in redists.json. "
+            "Skips games already processed.")
+        self.redist_missing_btn = ActionButton("Fetch Missing")
+        self.redist_missing_btn.clicked.connect(self._refresh_redists_missing)
+        refresh_missing_row.add_control(self.redist_missing_btn)
+        layout.addWidget(refresh_missing_row)
+
+        # Refresh all
+        refresh_all_row = SettingsRow(
+            "Refresh All Data",
+            "Re-runs SteamCMD for every PC game with a Steam App ID. "
+            "Overwrites existing entries with fresh data.")
+        self.redist_all_btn = ActionButton("Refresh All")
+        self.redist_all_btn.clicked.connect(self._refresh_redists_all)
+        refresh_all_row.add_control(self.redist_all_btn)
+        layout.addWidget(refresh_all_row)
+
+        self.redist_status_lbl = QLabel("")
+        self.redist_status_lbl.setFont(QFont("DM Mono", 9))
+        self.redist_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        layout.addWidget(self.redist_status_lbl)
+
+        # Export / Import
+        layout.addSpacing(8)
+        export_row = SettingsRow(
+            "Export redists.json",
+            "Save a copy to share with another machine.")
+        export_btn = ActionButton("Export…")
+        export_btn.clicked.connect(self._export_redists)
+        export_row.add_control(export_btn)
+        layout.addWidget(export_row)
+
+        import_row = SettingsRow(
+            "Import redists.json",
+            "Load data from another machine. Imported entries overwrite local ones.")
+        import_btn = ActionButton("Import…")
+        import_btn.clicked.connect(self._import_redists)
+        import_row.add_control(import_btn)
+        layout.addWidget(import_row)
+
+        self.redist_import_lbl = QLabel("")
+        self.redist_import_lbl.setFont(QFont("DM Mono", 9))
+        self.redist_import_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        layout.addWidget(self.redist_import_lbl)
+
         layout.addStretch()
         return scroll
 
@@ -1348,6 +1432,184 @@ class SettingsView(QWidget):
         self.pdb_refresh_btn.setText("Refresh Now")
         self.pdb_refresh_btn.setEnabled(True)
         self._refresh_pdb_status_label()
+
+    # ── Redistributables helpers ──────────────────────────────────────────────
+
+    def _refresh_steamcmd_status(self):
+        if not hasattr(self, "steamcmd_status_lbl"):
+            return
+        import redists as redists_mod
+        if redists_mod.is_steamcmd_available():
+            import shutil
+            path = shutil.which("steamcmd")
+            self.steamcmd_status_lbl.setText("● Detected at " + str(path))
+            self.steamcmd_status_lbl.setStyleSheet("color: #4ade80;")
+        else:
+            self.steamcmd_status_lbl.setText(
+                "○ Not installed  (sudo pacman -S steamcmd)")
+            self.steamcmd_status_lbl.setStyleSheet(
+                f"color: {COLORS['text_muted']};")
+
+    def _refresh_redist_stats(self):
+        if not hasattr(self, "redist_stats_lbl"):
+            return
+        try:
+            import redists as redists_mod
+            stats = redists_mod.get_stats()
+            if not stats["exists"]:
+                self.redist_stats_lbl.setText("No file yet")
+                self.redist_stats_lbl.setStyleSheet(
+                    f"color: {COLORS['text_muted']};")
+            else:
+                size_kb = stats["file_size"] / 1024
+                text = (str(stats["total"]) + " entries  ·  " +
+                        str(stats["with_data"]) + " with data  ·  " +
+                        str(stats["missing"]) + " missing  ·  " +
+                        str(round(size_kb, 1)) + " KB")
+                self.redist_stats_lbl.setText(text)
+                self.redist_stats_lbl.setStyleSheet(
+                    "color: #4ade80;" if stats["missing"] == 0
+                    else f"color: {COLORS['text_muted']};")
+        except Exception as e:
+            self.redist_stats_lbl.setText("Error reading stats")
+            self.redist_stats_lbl.setStyleSheet(
+                f"color: {COLORS['danger']};")
+
+    def _refresh_redists_missing(self):
+        import redists as redists_mod
+        if not redists_mod.is_steamcmd_available():
+            self.redist_status_lbl.setText(
+                "✗ SteamCMD not installed — cannot fetch data")
+            self.redist_status_lbl.setStyleSheet(
+                f"color: {COLORS['danger']};")
+            return
+        stats = redists_mod.get_stats()
+        if stats["missing"] == 0:
+            self.redist_status_lbl.setText(
+                "✓ All games already have data — nothing to fetch")
+            self.redist_status_lbl.setStyleSheet("color: #4ade80;")
+            return
+        est_secs = redists_mod.estimate_refresh_seconds(stats["missing"])
+        est_mins = round(est_secs / 60, 1)
+        self._start_redist_refresh(missing_only=True, estimated_mins=est_mins)
+
+    def _refresh_redists_all(self):
+        import redists as redists_mod
+        if not redists_mod.is_steamcmd_available():
+            self.redist_status_lbl.setText(
+                "✗ SteamCMD not installed — cannot fetch data")
+            self.redist_status_lbl.setStyleSheet(
+                f"color: {COLORS['danger']};")
+            return
+        stats = redists_mod.get_stats()
+        total = stats["total"] + stats["missing"]
+        est_secs = redists_mod.estimate_refresh_seconds(total)
+        est_mins = round(est_secs / 60, 1)
+        self._start_redist_refresh(missing_only=False, estimated_mins=est_mins)
+
+    def _start_redist_refresh(self, missing_only: bool, estimated_mins: float):
+        from PyQt6.QtWidgets import QMessageBox
+        import redists as redists_mod
+
+        action = "fetch missing" if missing_only else "refresh all"
+        reply = QMessageBox.question(
+            self,
+            "Fetch Redistributable Data",
+            "VaultPlay will run SteamCMD to " + action + " redistributable "
+            "data for your library.\n\n"
+            "Estimated time: ~" + str(estimated_mins) + " minutes\n\n"
+            "The app will remain usable while this runs in the background.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok
+        )
+        if reply != QMessageBox.StandardButton.Ok:
+            return
+
+        from PyQt6.QtCore import QThread
+        from PyQt6.QtCore import pyqtSignal as _Signal
+
+        class _Worker(QThread):
+            status = _Signal(str)
+            done   = _Signal(int)
+
+            def __init__(self, missing_only):
+                super().__init__()
+                self._missing_only = missing_only
+
+            def run(self):
+                import redists as _redists
+                fn = _redists.refresh_missing if self._missing_only \
+                     else _redists.refresh_all
+                count = fn(
+                    progress_cb=lambda cur, tot, name:
+                        self.status.emit(
+                            "Fetching… " + str(cur) + "/" + str(tot) +
+                            " — " + name)
+                )
+                self.done.emit(count)
+
+        self.redist_missing_btn.setEnabled(False)
+        self.redist_all_btn.setEnabled(False)
+        self.redist_status_lbl.setText("Starting SteamCMD…")
+        self.redist_status_lbl.setStyleSheet(
+            f"color: {COLORS['text_muted']};")
+
+        self._redist_worker = _Worker(missing_only)
+        self._redist_worker.status.connect(self.redist_status_lbl.setText)
+        self._redist_worker.done.connect(self._on_redist_refresh_done)
+        self._redist_worker.start()
+
+    def _on_redist_refresh_done(self, count: int):
+        self.redist_status_lbl.setText(
+            "✓ Done — " + str(count) + " game(s) processed")
+        self.redist_status_lbl.setStyleSheet("color: #4ade80;")
+        self.redist_missing_btn.setEnabled(True)
+        self.redist_all_btn.setEnabled(True)
+        self._refresh_redist_stats()
+
+    def _export_redists(self):
+        from PyQt6.QtWidgets import QFileDialog
+        import redists as redists_mod
+        if not redists_mod.get_redists_path().exists():
+            self.redist_import_lbl.setText(
+                "✗ No redists.json to export — run a fetch first")
+            self.redist_import_lbl.setStyleSheet(
+                f"color: {COLORS['danger']};")
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export redists.json",
+            str(Path.home() / "redists.json"),
+            "JSON files (*.json)"
+        )
+        if not dest:
+            return
+        ok = redists_mod.export_redists(Path(dest))
+        if ok:
+            self.redist_import_lbl.setText("✓ Exported to " + dest)
+            self.redist_import_lbl.setStyleSheet("color: #4ade80;")
+        else:
+            self.redist_import_lbl.setText("✗ Export failed")
+            self.redist_import_lbl.setStyleSheet(
+                f"color: {COLORS['danger']};")
+
+    def _import_redists(self):
+        from PyQt6.QtWidgets import QFileDialog
+        import redists as redists_mod
+        src, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import redists.json",
+            str(Path.home()),
+            "JSON files (*.json)"
+        )
+        if not src:
+            return
+        added, updated = redists_mod.import_redists(Path(src))
+        self.redist_import_lbl.setText(
+            "✓ Import complete — " + str(added) + " added, " +
+            str(updated) + " updated")
+        self.redist_import_lbl.setStyleSheet("color: #4ade80;")
+        self._refresh_redist_stats()
 
     # ── Appearance    # ── Appearance ────────────────────────────────────────────────────────────
 
@@ -1572,11 +1834,14 @@ class SettingsView(QWidget):
                 self._refresh_category_list()
 
     # ── About / Version ──────────────────────────────────────────────────────
+    # Version is hardcoded here — not stored in the DB.
+    # To bump the version, change this constant only.
+    APP_VERSION = "0.2.0-dev"
 
     def _build_about_page(self) -> QScrollArea:
         scroll, layout = self._scrollable_page("About VaultPlay")
 
-        version = db.get_setting("app_version", "0.1.0-dev")
+        version = self.APP_VERSION
 
         ver_box = QWidget()
         ver_box.setStyleSheet(
@@ -1599,91 +1864,78 @@ class SettingsView(QWidget):
         layout.addWidget(ver_box)
         layout.addSpacing(24)
 
-        layout.addWidget(SectionHeader(f"Changelog — {version}"))
+        layout.addWidget(SectionHeader("What's new in 0.2.0-dev"))
 
         changelog = [
-            ("Proton/Wine Version Detection",
-             "Dynamically scans ~/.local/share/lutris/runners/wine/, "
-             "~/.steam/root/compatibilitytools.d/, and Steam's steamapps/common/ for "
-             "actually-installed versions. No more hardcoded list. Shows only what you "
-             "have installed. Wine section in settings displays all detected versions."),
-            ("ProtonDB Recommendations — Real Report Data",
-             "Now fetches the last 20 community reports per game from the ProtonDB "
-             "community API and finds the most commonly reported Proton version. Version "
-             "strings like '9.0-4' are normalized to '9.0' before counting, so minor "
-             "revisions are grouped. Matched against your installed versions. Falls back "
-             "to tier-based heuristic only if no report data is available."),
-            ("SteamDB Redistributable Detection",
-             "Uses Steam's free public appdetails API (no key required) to fetch per-game "
-             "package and depot data. Known redistrib depots (e.g. 228981, 228988) and "
-             "name patterns (vcredist, directx, xna, physx etc.) are mapped to winetricks "
-             "verbs. Install dialog shows detected verbs pre-checked with source label."),
-            ("Lutris/Steam Removed",
-             "All Lutris and Steam integration removed from install flow and settings. "
-             "Installation is now Wine-only via WINEPREFIX. Settings page renamed from "
-             "'Wine / Lutris' to 'Wine'. Dead code cleaned up."),
-            ("NAS Scanning",
-             "Category-based scanning: each subfolder of Games path becomes a sidebar filter. "
-             "Recursive detection up to 3 levels deep (handles grouped folders like "
-             "/PC/Baldur's Gate/BG3/). update/, dlc/, patch/ folders skipped."),
-            ("Install Tags",
-             "Games auto-tagged as installer, portable, or iso by peeking inside archives. "
-             "Multi-part RAR/7z/ZIP supported. Part 1 inspected first, part 2 if inconclusive. "
-             "Tag overridable in install dialog."),
-            ("Folder Name Cleaning",
-             "Raw folder names cleaned before display and metadata search: strips MULTiN-ElAmigos, "
-             "-(12345) GOG IDs, [GoldBerg]/[EMPRESS] brackets, DODI Repack blocks, version "
-             "strings, release group tags (CODEX, PLAZA, RUNE, etc.). 4 passes for stacked suffixes."),
-            ("Blacklist",
-             "Categories blacklisted in Settings → Categories are skipped during scan, "
-             "hidden from sidebar, and excluded from All Games count and metadata fetch. "
-             "Blacklist flag preserved across rescans via upsert_category_safe()."),
-            ("Setup Wizard",
-             "First-run wizard (shown once on fresh install) collects NAS path with "
-             "live validation, SteamGridDB API key, and default install path. "
-             "Fixed layout — larger dialog, readable fonts, proper spacing."),
-            ("API Key Validation",
-             "Each API key (SGDB, IGDB) has its own Apply button that saves and "
-             "immediately tests the key with a live HTTP request. Shows ✓ valid or "
-             "✗ error inline."),
-            ("NAS Path Apply Button",
-             "NAS path now requires explicit Apply click. Tests connection immediately "
-             "on apply, updates sidebar connection status right away (no waiting for scan). "
-             "Shows 'Scan Now?' prompt after apply."),
-            ("Manual Metadata Fetch",
-             "Settings → Scan & Cache has a 'Fetch Missing Metadata' button with "
-             "explanation of when/how metadata is fetched. Shows progress and completion status."),
-            ("About / Version Page",
-             "New Settings section showing version, pre-release status, and full changelog."),
+            # ── Major features ────────────────────────────────────────────────
+            ("ProtonDB Compatibility — Live Community Data",
+             "Each game's install dialog now shows which Proton version the community "
+             "actually uses, pulled live from ProtonDB reports. The top-voted version "
+             "is pre-selected. Counts are shown next to each version (e.g. 'Proton 9.0 "
+             "· 12 of 30 most recent reports') so you can make your own judgement."),
+            ("Proton Version Download — Install Without Leaving VaultPlay",
+             "If the recommended Proton version isn't installed, it now appears in the "
+             "dropdown marked '(not installed)'. Selecting it shows a Download button. "
+             "GE-Proton versions download and install directly in-app with a progress "
+             "bar. Official Steam Proton versions open Steam's install dialog with one "
+             "click. Begin Install stays locked until the selected version is ready."),
+            ("Redistributable Auto-Detection",
+             "The install dialog auto-detects required redistributables for games that "
+             "have a Steam App ID, using Steam's public API. Known depot IDs and package "
+             "name patterns are mapped to winetricks verbs and pre-checked for you. "
+             "Baseline redists (vcrun2019, vcrun2022, d3dcompiler_47) are always included."),
+            ("NAS Category Scanning",
+             "Each subfolder inside your Games path becomes a category filter in the "
+             "sidebar (PC, PS4, Switch, etc.). Recursive detection up to 3 levels deep "
+             "handles nested folder structures. Categories can be renamed or blacklisted "
+             "in Settings → Categories to hide them from the library entirely."),
+            ("Install Type Auto-Detection",
+             "Games are automatically tagged as Installer, Portable, or ISO by peeking "
+             "inside archives. Multi-part RAR, 7z, and ZIP are all supported. The detected "
+             "type can be overridden in the install dialog."),
             ("ISO Support",
-             "ISOs mounted via udisksctl (falls back to fuseiso, no sudo needed). "
-             "Installer found inside mount, run via Wine, ISO unmounted and cleaned up."),
-            ("Multi-path Install List",
-             "Settings → Paths shows editable list of game install paths with ↑ Up, "
-             "↓ Down, ✕ Remove buttons. First path is starred as default. Used as "
-             "dropdown in install dialog for portable games."),
-            ("Stability — File Descriptors",
-             "FD limit raised to 65536 at startup in main.py and metadata.py. "
-             "Image loader thread pool capped at 4. HTTP adapter pool_maxsize=2. "
-             "Metadata fetch sleeps 0.4s between games. Fixes crashes on 600+ game libraries."),
-            ("Stability — SQLite Threading",
-             "check_same_thread=False, timeout=30, busy_timeout=30000 on all connections. "
-             "WAL journal mode. DB path computed from env vars set at startup so every "
-             "thread in every context uses the same absolute path."),
-            ("Stability — AppImage Module Imports",
-             "All local modules now have a sys.path guard injected at the top that reads "
-             "$APPDIR env var (set by AppImage runtime) to locate the app source directory. "
-             "Eliminates ModuleNotFoundError for db, scanner, steamdb, protondb etc."),
-            ("Debug Timing",
-             "Startup prints system diagnostics (platform, Python, SQLite, FD limits, "
-             "paths). Phase markers logged with elapsed time. Worker threads log duration. "
-             "All output goes to stdout AND ~/.config/vaultplay/vaultplay.log."),
-            ("DB Migration",
-             "Automatic column migrations on launch — existing databases gain new columns "
-             "without data loss. install_tag, category, protondb columns added safely."),
-            ("Clear Database",
-             "Settings → Scan & Cache has a 'Clear Entire Database' button with "
-             "confirmation dialog. Wipes all data and reinitializes from scratch."),
+             "ISO games are mounted via udisksctl (falls back to fuseiso — no sudo "
+             "needed), the installer is run through Wine, then the ISO is unmounted and "
+             "cleaned up automatically."),
+            ("Multi-Path Install Locations",
+             "Settings → Paths lets you add multiple game install destinations (different "
+             "drives, partitions, etc.). The first is starred as default. Each install "
+             "lets you pick from the list."),
+            ("Game Name Cleaning",
+             "Raw NAS folder names are cleaned for display and metadata search — strips "
+             "scene group tags (CODEX, PLAZA, ElAmigos, EMPRESS, etc.), GOG IDs, version "
+             "strings, MULTiN suffixes, and repack labels across multiple passes."),
+            ("First-Run Setup Wizard",
+             "Fresh installs show a one-time wizard to configure your NAS path, "
+             "SteamGridDB API key, and default install location before the first scan."),
+            # ── Minor improvements ────────────────────────────────────────────
+            ("ProtonDB Refresh",
+             "Settings → Wine → Refresh Now re-fetches compatibility data for all games. "
+             "Previously fetched hashes are reused where valid to save network calls."),
+            ("API Key Validation",
+             "SteamGridDB and IGDB keys each have an Apply button that tests the key "
+             "live and shows a ✓ / ✗ result inline."),
+            ("NAS Connection Testing",
+             "NAS path Apply button tests the connection immediately and shows a 'Scan "
+             "Now' prompt. Sidebar connection status updates without waiting for a scan."),
+            ("Category Blacklist",
+             "Blacklisted categories are skipped entirely during scanning and hidden from "
+             "the sidebar and All Games count. The blacklist flag survives rescans."),
+            # ── Bug fixes & stability ──────────────────────────────────────────
+            ("Stability — Large Libraries",
+             "File descriptor limit raised to 65536 at startup. Image loader thread pool "
+             "capped at 4. Metadata fetch rate-limited to 0.4s per game. Fixes crashes "
+             "on libraries with 600+ games."),
+            ("Stability — SQLite",
+             "WAL journal mode, 30s timeout, 30s busy timeout on all connections. DB path "
+             "computed from environment variables set at startup so every thread uses the "
+             "same absolute path regardless of working directory."),
+            ("Stability — AppImage",
+             "All modules have a sys.path guard that reads $APPDIR at import time. "
+             "Eliminates ModuleNotFoundError when running as an AppImage."),
+            ("Automatic DB Migration",
+             "New columns are added to existing databases on launch without data loss. "
+             "No manual database actions needed when updating."),
         ]
 
         for title, desc in changelog:

@@ -30,11 +30,14 @@ if _parent not in _sys.path:
 
 import json
 import logging
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QGridLayout, QSizePolicy
+    QScrollArea, QFrame, QGridLayout, QSizePolicy, QMessageBox
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QRunnable, QThreadPool, pyqtSlot, QObject, QTimer
@@ -353,8 +356,59 @@ class GameDetailView(QWidget):
         self.launch_btn = QPushButton("▶  Launch Game")
         self.launch_btn.setFont(QFont("Rajdhani", 13, QFont.Weight.Bold))
         self.launch_btn.setStyleSheet(accent_button_style())
+        self.launch_btn.clicked.connect(self._on_launch_clicked)
         self.launch_btn.hide()
         install_card_layout.addWidget(self.launch_btn)
+
+        # Shown when game is installed but exe_path is empty/missing
+        self.exe_missing_label = QLabel(
+            "⚠ Launch exe not detected — open the game folder to run manually."
+        )
+        self.exe_missing_label.setFont(QFont("DM Sans", 10))
+        self.exe_missing_label.setStyleSheet(
+            f"color: {COLORS['accent']}; background: transparent;")
+        self.exe_missing_label.setWordWrap(True)
+        self.exe_missing_label.hide()
+        install_card_layout.addWidget(self.exe_missing_label)
+
+        self.open_folder_btn = QPushButton("📁  Open Game Folder")
+        self.open_folder_btn.setFont(QFont("DM Sans", 11))
+        self.open_folder_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                color: {COLORS['text_muted']};
+                padding: 8px 14px;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['text']};
+                background: {COLORS['surface3']};
+            }}
+        """)
+        self.open_folder_btn.clicked.connect(self._on_open_folder)
+        self.open_folder_btn.hide()
+        install_card_layout.addWidget(self.open_folder_btn)
+
+        self.uninstall_btn = QPushButton("✕  Uninstall")
+        self.uninstall_btn.setFont(QFont("DM Sans", 11))
+        self.uninstall_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: 1px solid rgba(248,113,113,0.3);
+                border-radius: 8px;
+                color: {COLORS['danger']};
+                padding: 7px 14px;
+            }}
+            QPushButton:hover {{
+                background: rgba(248,113,113,0.08);
+                border-color: {COLORS['danger']};
+                color: #fca5a5;
+            }}
+        """)
+        self.uninstall_btn.clicked.connect(self._on_uninstall_clicked)
+        self.uninstall_btn.hide()
+        install_card_layout.addWidget(self.uninstall_btn)
 
         self.right_layout.addWidget(self.install_card)
 
@@ -545,9 +599,25 @@ class GameDetailView(QWidget):
             self.tag_info_label.setText("")
 
         # Install / launch button state
+        self.exe_missing_label.hide()
+        self.open_folder_btn.hide()
+        self.uninstall_btn.hide()
+
         if game["is_installed"]:
             self.install_btn.hide()
-            self.launch_btn.show()
+            exe = (game["exe_path"] or "").strip()
+            if exe and Path(exe).exists():
+                self.launch_btn.show()
+                self.exe_missing_label.hide()
+                self.open_folder_btn.hide()
+            else:
+                # Installed but exe path missing or stale
+                self.launch_btn.hide()
+                self.exe_missing_label.show()
+                install_path = (game["install_path"] or "").strip()
+                if install_path:
+                    self.open_folder_btn.show()
+            self.uninstall_btn.show()
         else:
             self.install_btn.show()
             self.launch_btn.hide()
@@ -623,6 +693,183 @@ class GameDetailView(QWidget):
         dlg = InstallDialog(game_dict, parent=self)
         dlg.install_finished.connect(self._on_install_finished)
         dlg.exec()
+
+    def _on_launch_clicked(self):
+        """Launch the installed game via Wine with its saved prefix."""
+        if not self._game_id:
+            return
+        game = db.get_game(self._game_id)
+        if not game:
+            return
+
+        exe_path    = (game["exe_path"]    or "").strip()
+        wine_prefix = (game["wine_prefix"] or "").strip()
+
+        if not exe_path or not Path(exe_path).exists():
+            QMessageBox.warning(
+                self, "Launch Error",
+                f"Game executable not found:\n{exe_path or '(not set)'}\n\n"
+                "Try reinstalling the game, or open the game folder and "
+                "run the .exe manually."
+            )
+            return
+
+        env = {**os.environ}
+        if wine_prefix:
+            env["WINEPREFIX"] = wine_prefix
+
+        # Use the saved launcher script if one exists (preserves user env tweaks)
+        script_path = (game["script_path"] or "").strip()
+        if script_path and Path(script_path).exists():
+            try:
+                subprocess.Popen([script_path], env=env)
+                log.info("Launched via script: %s", script_path)
+            except Exception as e:
+                QMessageBox.warning(self, "Launch Error",
+                                    f"Could not start launcher script:\n{e}")
+            return
+
+        # Direct wine launch
+        try:
+            subprocess.Popen(["wine", exe_path], env=env)
+            log.info("Launched: WINEPREFIX=%s wine %s", wine_prefix, exe_path)
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self, "Launch Error",
+                "wine not found. Make sure Wine is installed and on your PATH."
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Launch Error",
+                                f"Could not start game:\n{e}")
+
+    def _on_open_folder(self):
+        """Open the game's install folder in the file manager."""
+        if not self._game_id:
+            return
+        game = db.get_game(self._game_id)
+        if not game:
+            return
+        install_path = (game["install_path"] or "").strip()
+        if not install_path or not Path(install_path).exists():
+            QMessageBox.information(
+                self, "Open Folder",
+                "Install folder not found. The game may have been moved or deleted."
+            )
+            return
+        try:
+            subprocess.Popen(["xdg-open", install_path])
+        except Exception as e:
+            QMessageBox.warning(self, "Open Folder",
+                                f"Could not open folder:\n{e}")
+
+    def _on_uninstall_clicked(self):
+        """
+        Three-step uninstall:
+          1. Remove the DB record + desktop/script files (always)
+          2. Ask: delete game files?
+          3. Ask: delete Wine prefix?
+        """
+        if not self._game_id:
+            return
+        game = db.get_game(self._game_id)
+        if not game:
+            return
+
+        title        = game["title"] or game["display_name"] or game["folder_name"]
+        install_path = (game["install_path"] or "").strip()
+        wine_prefix  = (game["wine_prefix"]  or "").strip()
+        desktop_path = (game["desktop_path"] or "").strip()
+        script_path  = (game["script_path"]  or "").strip()
+
+        # ── Step 1: confirm and remove DB record ──────────────────────────────
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Uninstall Game")
+        confirm.setText(f"Uninstall <b>{title}</b>?")
+        confirm.setInformativeText(
+            "This will remove the VaultPlay install record, "
+            "desktop shortcut, and launcher script.\n\n"
+            "You will be asked separately about game files and the Wine prefix."
+        )
+        confirm.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        confirm.setStyleSheet(
+            f"QMessageBox {{ background: {COLORS['surface']}; "
+            f"color: {COLORS['text']}; }}")
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        # Remove desktop shortcut and launcher script
+        for p in [desktop_path, script_path]:
+            if p and Path(p).exists():
+                try:
+                    Path(p).unlink()
+                    log.info("Deleted: %s", p)
+                except Exception as e:
+                    log.warning("Could not delete %s: %s", p, e)
+
+        # Remove install record from DB
+        try:
+            db.remove_install(self._game_id)
+            log.info("Uninstalled game %d (%s) — DB record removed", self._game_id, title)
+        except Exception as e:
+            log.error("remove_install failed: %s", e)
+
+        # ── Step 2: delete game files? ────────────────────────────────────────
+        if install_path and Path(install_path).exists():
+            files_msg = QMessageBox(self)
+            files_msg.setWindowTitle("Delete Game Files?")
+            files_msg.setText(f"Delete game files for <b>{title}</b>?")
+            files_msg.setInformativeText(
+                f"This will permanently delete:\n{install_path}\n\n"
+                "This cannot be undone."
+            )
+            yes_btn    = files_msg.addButton("Delete Game Files",
+                                              QMessageBox.ButtonRole.DestructiveRole)
+            keep_btn   = files_msg.addButton("Keep Files",
+                                              QMessageBox.ButtonRole.AcceptRole)
+            files_msg.setDefaultButton(keep_btn)
+            files_msg.setStyleSheet(
+                f"QMessageBox {{ background: {COLORS['surface']}; "
+                f"color: {COLORS['text']}; }}")
+            files_msg.exec()
+            if files_msg.clickedButton() == yes_btn:
+                try:
+                    shutil.rmtree(install_path)
+                    log.info("Deleted game files: %s", install_path)
+                except Exception as e:
+                    QMessageBox.warning(self, "Delete Failed",
+                                        f"Could not delete game files:\n{e}")
+
+        # ── Step 3: delete Wine prefix? ───────────────────────────────────────
+        if wine_prefix and Path(wine_prefix).exists():
+            prefix_msg = QMessageBox(self)
+            prefix_msg.setWindowTitle("Delete Wine Prefix?")
+            prefix_msg.setText(f"Delete the Wine prefix for <b>{title}</b>?")
+            prefix_msg.setInformativeText(
+                f"This will permanently delete:\n{wine_prefix}\n\n"
+                "Only do this if no other games share this prefix."
+            )
+            yes_btn2   = prefix_msg.addButton("Delete Prefix",
+                                               QMessageBox.ButtonRole.DestructiveRole)
+            keep_btn2  = prefix_msg.addButton("Keep Prefix",
+                                               QMessageBox.ButtonRole.AcceptRole)
+            prefix_msg.setDefaultButton(keep_btn2)
+            prefix_msg.setStyleSheet(
+                f"QMessageBox {{ background: {COLORS['surface']}; "
+                f"color: {COLORS['text']}; }}")
+            prefix_msg.exec()
+            if prefix_msg.clickedButton() == yes_btn2:
+                try:
+                    shutil.rmtree(wine_prefix)
+                    log.info("Deleted Wine prefix: %s", wine_prefix)
+                except Exception as e:
+                    QMessageBox.warning(self, "Delete Failed",
+                                        f"Could not delete Wine prefix:\n{e}")
+
+        # Reload and notify library
+        self.load_game(self._game_id)
+        self.install_finished.emit(self._game_id)
 
     def _on_install_finished(self, game_id: int):
         self.load_game(game_id)

@@ -138,6 +138,8 @@ cp "${SCRIPT_DIR}/scanner.py"   "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/metadata.py"  "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/installer.py" "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/protondb.py"  "${APPDIR}/usr/bin/"
+cp "${SCRIPT_DIR}/steamdb.py"   "${APPDIR}/usr/bin/"
+cp "${SCRIPT_DIR}/redists.py"   "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/ui/"*.py      "${APPDIR}/usr/bin/ui/"
 cp "${SCRIPT_DIR}/assets/"*     "${APPDIR}/usr/bin/assets/" 2>/dev/null || true
 success "App source files copied."

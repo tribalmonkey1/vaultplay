@@ -36,13 +36,14 @@ if _parent not in _sys.path:
 
 import json
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QCheckBox, QComboBox, QWidget, QProgressBar,
-    QScrollArea, QLineEdit
+    QScrollArea, QLineEdit, QMessageBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor
@@ -51,18 +52,24 @@ import db
 import installer as install_mod
 import protondb as protondb_mod
 import scanner
+import steamdb as steamdb_mod
 from ui.style import COLORS, accent_button_style
 
 log = logging.getLogger(__name__)
 
 COMMON_REDISTS = install_mod.COMMON_REDISTS
-AUTO_DETECT_REDISTS = ["vcrun2019", "vcrun2022", "d3dx11", "d3dcompiler_47"]
 
 TAG_LABELS = {
     "installer": "Installer  (.exe setup)",
     "portable":  "Portable   (copy + .desktop)",
     "iso":       "ISO        (mount + setup)",
 }
+
+
+class NoScrollComboBox(QComboBox):
+    """QComboBox that ignores scroll wheel events to prevent accidental changes."""
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 # ── Toggle group ──────────────────────────────────────────────────────────────
@@ -80,9 +87,10 @@ class ToggleGroup(QWidget):
         for label, value in options:
             btn = QPushButton(label)
             btn.setFont(QFont("DM Sans", 11))
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda _, v=value: self._select(v))
             self._buttons[value] = btn
-            layout.addWidget(btn)
+            layout.addWidget(btn, 1)
         self._update_styles()
 
     def _select(self, value):
@@ -235,7 +243,8 @@ class InstallDialog(QDialog):
 
         self.setWindowTitle(f"Install — {title_str}")
         self.setModal(True)
-        self.setFixedWidth(560)
+        self.setMinimumWidth(600)
+        self.setFixedWidth(640)
         self.setStyleSheet(f"QDialog {{ background: {COLORS['surface']}; }}")
 
         root = QVBoxLayout(self)
@@ -325,7 +334,7 @@ class InstallDialog(QDialog):
 
         # ── Game path (portables only) ────────────────────────────────────────
         self.gamepath_box = SectionBox("Game Install Path")
-        self.gamepath_combo = QComboBox()
+        self.gamepath_combo = NoScrollComboBox()
         self.gamepath_combo.setFont(QFont("DM Sans", 11))
         self._populate_game_paths()
         self.gamepath_box.add(self.gamepath_combo)
@@ -360,7 +369,7 @@ class InstallDialog(QDialog):
 
         self.proton_box = SectionBox(pdb_hdr)
 
-        self.proton_combo = QComboBox()
+        self.proton_combo = NoScrollComboBox()
         self.proton_combo.setFont(QFont("DM Sans", 11))
 
         # Status note below the combo
@@ -375,7 +384,10 @@ class InstallDialog(QDialog):
         self.body_layout.addWidget(self.proton_box)
 
         # ── Redistributables ─────────────────────────────────────────────────
-        self._auto_redists  = AUTO_DETECT_REDISTS[:]
+        # Detection priority: redists.json → appinfo.vdf → pc_requirements
+        # text → engine hints → baseline. See steamdb.py for full details.
+
+        self._auto_redists  = steamdb_mod.BASELINE_REDISTS[:]
         self._redist_source = "baseline"
 
         steam_app_id = game.get("steam_app_id")
@@ -384,13 +396,17 @@ class InstallDialog(QDialog):
 
         if auto_detect and steam_app_id:
             try:
-                import steamdb as steamdb_mod
                 result = steamdb_mod.get_redists_for_install(
                     steam_app_id, game_title2, auto_detect=True)
                 self._auto_redists  = result["auto"]
                 self._redist_source = result["source"]
             except Exception as _e:
                 log.warning("SteamDB redist detection failed: %s", _e)
+                self._auto_redists  = steamdb_mod.BASELINE_REDISTS[:]
+                self._redist_source = "baseline (detection error)"
+        elif not steam_app_id:
+            self._auto_redists  = steamdb_mod.BASELINE_REDISTS[:]
+            self._redist_source = "baseline (no Steam ID — metadata may need fetching)"
 
         n_auto = len(self._auto_redists)
         redist_box = SectionBox(
@@ -590,28 +606,34 @@ class InstallDialog(QDialog):
             or (protondb_mod.top_version(self._version_counts) if self._version_counts else "")
         )
 
+        # Extract sample size from __sample__ key (stored by fetch_and_store)
+        self._sample_size = int(self._version_counts.pop("__sample__", 0))
+
         # Items: (display_label, value_key, canonical_key, is_installed, count)
         items: list[tuple[str, str, str, bool, int]] = []
 
         # 1. All installed versions
         for label, value in self._installed_versions:
-            # Find matching canonical key in counts by trying to match
             matched_canonical = self._find_canonical_for_value(value)
             count = self._version_counts.get(matched_canonical, 0) if matched_canonical else 0
             items.append((label, value, matched_canonical or "", True, count))
 
-        # 2. Uninstalled versions that have report counts (count > 0 only)
+        # Sort installed items: versions with counts descending first,
+        # then zero-count versions in their original detected order
+        items.sort(key=lambda x: (-x[4], self._installed_versions.index((x[0], x[1]))
+                                   if (x[0], x[1]) in self._installed_versions else 999))
+
+        # 2. Uninstalled versions that have report counts (count > 0 only),
+        #    sorted by count descending
         for canonical, count in sorted(self._version_counts.items(),
                                         key=lambda x: -x[1]):
             if count == 0:
                 continue
-            # Check if this canonical maps to any installed version
             matched_val = protondb_mod.match_to_installed(
                 canonical, self._installed_versions)
             if matched_val:
                 continue  # already in installed list
-            # Uninstalled — add it
-            display_label = canonical  # raw canonical as label (e.g. "GE-Proton 9", "9.0")
+            display_label = canonical
             value_key = _canonical_to_value_key(canonical)
             items.append((display_label, value_key, canonical, False, count))
 
@@ -620,7 +642,6 @@ class InstallDialog(QDialog):
         top_idx      = -1
 
         for i, (label, value, canonical, is_installed, count) in enumerate(items):
-            # Build display text
             count_str = f"  ·  {count} reports" if count else ""
             if not is_installed:
                 display = f"{label}{count_str}  (not installed)"
@@ -633,13 +654,11 @@ class InstallDialog(QDialog):
 
             self.proton_combo.addItem(display, value)
 
-            # Colour the top-voted installed item gold
             if is_installed and canonical == top_canonical:
                 self.proton_combo.setItemData(
                     i, QColor("#e8c76a"), Qt.ItemDataRole.ForegroundRole)
                 top_idx = i
 
-            # Colour uninstalled items muted
             if not is_installed:
                 self.proton_combo.setItemData(
                     i, QColor(COLORS["text_muted"]), Qt.ItemDataRole.ForegroundRole)
@@ -692,27 +711,35 @@ class InstallDialog(QDialog):
 
         count = self._version_counts.get(self._selected_canonical, 0)
         total = self.game.get("protondb_reports", 0) or 0
+        sample = getattr(self, "_sample_size", 0)
 
         if not self._selected_is_installed:
-            # Uninstalled selection
             label = protondb_mod.proton_version_label(value) or self._selected_canonical
-            count_str = f" ({count} of {total} reports)" if count else ""
+            count_str = f" ({count} of {sample} most recent reports)" if count and sample else ""
             self._set_proton_note(
                 f"{label}{count_str} — not installed",
                 "warning")
         elif self._selected_canonical and count:
             top = protondb_mod.top_version(self._version_counts)
             if self._selected_canonical == top:
-                count_str = f"{count} of {total} reports"
+                if sample:
+                    count_str = f"{count} of {sample} most recent reports"
+                else:
+                    count_str = f"{count} reports"
                 self._set_proton_note(
                     f"Most reported by the community  ·  {count_str}",
                     "good")
             else:
                 top_count = self._version_counts.get(top, 0) if top else 0
-                self._set_proton_note(
-                    f"{count} of {total} reports  ·  "
-                    f"top choice has {top_count} reports",
-                    "muted")
+                if sample:
+                    self._set_proton_note(
+                        f"{count} of {sample} most recent reports  ·  "
+                        f"top choice has {top_count} reports",
+                        "muted")
+                else:
+                    self._set_proton_note(
+                        f"{count} reports  ·  top choice has {top_count} reports",
+                        "muted")
         else:
             self._set_proton_note("", "muted")
 
@@ -935,22 +962,60 @@ class InstallDialog(QDialog):
                 "danger")
             return
 
+        # If the user overrode the install type, persist it so future scans
+        # don't overwrite the choice (install_tag_override=1 in the games table).
+        original_tag = self.game.get("install_tag") or "portable"
+        if self._install_tag != original_tag:
+            try:
+                db.set_install_tag_override(self.game["id"], self._install_tag)
+            except Exception as _e:
+                log.warning("Could not persist install_tag override: %s", _e)
+
+        # Check if this prefix already has some redists installed
+        prefix_name = self.prefix_edit.text().strip() or \
+                      install_mod.make_prefix_name(self.game.get("folder_name", ""))
+        prefix_path = install_mod._wine_prefix_root() / prefix_name
+        selected_redists = [v for v, cb in self._redist_checks.items() if cb.isChecked()]
+        force_redists = False
+
+        if selected_redists and prefix_path.exists():
+            already = install_mod.get_installed_redists(prefix_path)
+            overlap = [v for v in selected_redists if v in already]
+            if overlap:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Redistributables Already Installed")
+                msg.setText("Some redistributables are already installed in this prefix.")
+                msg.setInformativeText(
+                    f"Already installed: {', '.join(overlap)}\n\n"
+                    "Skip them (faster) or reinstall everything?"
+                )
+                skip_btn      = msg.addButton("Skip Already Installed",
+                                              QMessageBox.ButtonRole.AcceptRole)
+                reinstall_btn = msg.addButton("Reinstall All",
+                                              QMessageBox.ButtonRole.ResetRole)
+                msg.setDefaultButton(skip_btn)
+                msg.setStyleSheet(
+                    f"QMessageBox {{ background: {COLORS['surface']}; "
+                    f"color: {COLORS['text']}; }}")
+                msg.exec()
+                force_redists = (msg.clickedButton() == reinstall_btn)
+
         self.install_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
         self.check_installed_btn.hide()
+        self.proton_combo.setEnabled(False)
+        self.tag_toggle.setEnabled(False)
         self.progress_panel.show()
         self.adjustSize()
 
         options = {
-            "wine_prefix_name": self.prefix_edit.text().strip() or
-                                 install_mod.make_prefix_name(
-                                     self.game.get("folder_name", "")),
+            "wine_prefix_name": prefix_name,
             "game_path":        self.gamepath_combo.currentData()
                                  if self._install_tag == "portable" else "",
             "launcher_type":    self.launcher_toggle.value
                                  if self._install_tag == "portable" else "direct",
-            "redists":          [v for v, cb in self._redist_checks.items()
-                                  if cb.isChecked()],
+            "redists":          selected_redists,
+            "force_redists":    force_redists,
             "cleanup_tmp":      self.cleanup_check.isChecked(),
             "proton_version":   self.proton_combo.currentData(),
             "install_tag":      self._install_tag,
@@ -967,24 +1032,64 @@ class InstallDialog(QDialog):
         self.progress_msg.setText(message)
 
     def _on_finished(self, result):
-        if result["success"]:
+        self.cancel_btn.setEnabled(True)
+
+        if result.get("success"):
             self.stage_label.setText("✓ Installation complete!")
             self.stage_label.setStyleSheet(
                 f"color: {COLORS['installed']}; font-weight: 600;")
             self.progress_bar.setValue(100)
             self.progress_msg.setText(result.get("exe_path") or "Done.")
             self.cancel_btn.setText("Close")
-            self.cancel_btn.setEnabled(True)
             self.install_finished.emit(self.game["id"])
+            return
+
+        # ── Failure / cancellation ─────────────────────────────────────────────
+        cancelled = result.get("cancelled", False)
+        error_msg = result.get("error", "Unknown error")
+        tmp_path  = result.get("tmp_path", "")
+
+        if cancelled:
+            self.stage_label.setText("⚠ Installation cancelled")
+            self.stage_label.setStyleSheet(
+                f"color: {COLORS['accent']}; font-weight: 600;")
         else:
             self.stage_label.setText("✗ Installation failed")
             self.stage_label.setStyleSheet(
                 f"color: {COLORS['danger']}; font-weight: 600;")
-            self.progress_msg.setText(result.get("error", "Unknown error"))
-            self.cancel_btn.setText("Close")
-            self.cancel_btn.setEnabled(True)
-            self.install_btn.setEnabled(True)
-            self.install_btn.setText("Retry")
+
+        self.progress_msg.setText(error_msg)
+        self.cancel_btn.setText("Close")
+        self.install_btn.setEnabled(True)
+        self.install_btn.setText("Retry")
+
+        # Offer to clean up the temp/extracted files if they exist
+        if tmp_path and Path(tmp_path).exists():
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Extracted Files")
+            if cancelled:
+                msg.setText("The install was cancelled.")
+            else:
+                msg.setText("The installation failed.")
+            msg.setInformativeText(
+                f"Extracted files are still in:\n{tmp_path}\n\n"
+                "Keep them to skip re-extraction on your next attempt, "
+                "or delete them to free disk space."
+            )
+            keep_btn   = msg.addButton("Keep Files", QMessageBox.ButtonRole.AcceptRole)
+            delete_btn = msg.addButton("Delete Files", QMessageBox.ButtonRole.DestructiveRole)
+            msg.setDefaultButton(keep_btn)
+            msg.setStyleSheet(
+                f"QMessageBox {{ background: {COLORS['surface']}; "
+                f"color: {COLORS['text']}; }}")
+            msg.exec()
+            if msg.clickedButton() == delete_btn:
+                try:
+                    shutil.rmtree(tmp_path)
+                    self.progress_msg.setText(
+                        error_msg + "\n(Extracted files deleted.)")
+                except Exception as e:
+                    log.warning("Could not delete tmp: %s", e)
 
     # ── Misc helpers ──────────────────────────────────────────────────────────
 
