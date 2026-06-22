@@ -66,6 +66,43 @@ TAG_LABELS = {
 }
 
 
+class SettingsToggle(QWidget):
+    """Pill-shaped on/off toggle — matches the style used in settings_view.py."""
+    changed = pyqtSignal(bool)
+
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(44, 24)
+        self._checked = checked
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QBrush, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track = QColor(COLORS["accent"]) if self._checked else QColor("#3a3f52")
+        p.setBrush(QBrush(track))
+        p.setPen(QPen(QColor("#555a70"), 1))
+        p.drawRoundedRect(0, 0, 44, 24, 12, 12)
+        knob = QColor("#ffffff") if self._checked else QColor("#aaaaaa")
+        p.setBrush(QBrush(knob))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(23 if self._checked else 3, 3, 18, 18)
+        p.end()
+
+    def mousePressEvent(self, event):
+        self._checked = not self._checked
+        self.update()
+        self.changed.emit(self._checked)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, val: bool):
+        self._checked = val
+        self.update()
+
+
 class NoScrollComboBox(QComboBox):
     """QComboBox that ignores scroll wheel events to prevent accidental changes."""
     def wheelEvent(self, event):
@@ -340,25 +377,6 @@ class InstallDialog(QDialog):
         self.gamepath_box.add(self.gamepath_combo)
         self.body_layout.addWidget(self.gamepath_box)
 
-        # ── Launcher type (portables only) ────────────────────────────────────
-        self.launcher_box = SectionBox("Launcher Type")
-        self.launcher_toggle = ToggleGroup(
-            [("Direct (.desktop → wine)", "direct"),
-             ("Script wrapper (.sh + .desktop)", "script")],
-            default="direct"
-        )
-        self.launcher_box.add(self.launcher_toggle)
-
-        launcher_note = QLabel(
-            "Script wrapper is easier to tweak later "
-            "(env vars, DXVK flags, etc.)")
-        launcher_note.setFont(QFont("DM Sans", 10))
-        launcher_note.setStyleSheet(
-            f"color: {COLORS['text_muted']}; background: transparent; border: none;")
-        launcher_note.setWordWrap(True)
-        self.launcher_box.add(launcher_note)
-        self.body_layout.addWidget(self.launcher_box)
-
         # ── Proton / Wine version ─────────────────────────────────────────────
         tier    = game.get("protondb_tier", "") or ""
         reports = game.get("protondb_reports", 0) or 0
@@ -442,8 +460,10 @@ class InstallDialog(QDialog):
         cleanup_box = SectionBox()
         cl_row = QHBoxLayout()
         cl_row.setContentsMargins(0, 0, 0, 0)
+        cl_row.setSpacing(12)
         cl_inner = QVBoxLayout()
         cl_inner.setSpacing(2)
+        cl_inner.setContentsMargins(0, 0, 0, 0)
         cl_t = QLabel("Clean up extracted files after install")
         cl_t.setFont(QFont("DM Sans", 12, QFont.Weight.Medium))
         cl_t.setStyleSheet(f"color: {COLORS['text']}; background: transparent; border: none;")
@@ -452,12 +472,11 @@ class InstallDialog(QDialog):
         cl_s.setStyleSheet(f"color: {COLORS['text_muted']}; background: transparent; border: none;")
         cl_inner.addWidget(cl_t)
         cl_inner.addWidget(cl_s)
-        self.cleanup_check = QCheckBox()
-        self.cleanup_check.setChecked(
-            db.get_setting("auto_cleanup_tmp", "true") == "true")
+        self.cleanup_check = SettingsToggle(
+            checked=db.get_setting("auto_cleanup_tmp", "true") == "true")
         cl_row.addLayout(cl_inner)
         cl_row.addStretch()
-        cl_row.addWidget(self.cleanup_check)
+        cl_row.addWidget(self.cleanup_check, 0, Qt.AlignmentFlag.AlignVCenter)
         cleanup_box.inner_layout().addLayout(cl_row)
         self.body_layout.addWidget(cleanup_box)
 
@@ -1012,8 +1031,6 @@ class InstallDialog(QDialog):
             "wine_prefix_name": prefix_name,
             "game_path":        self.gamepath_combo.currentData()
                                  if self._install_tag == "portable" else "",
-            "launcher_type":    self.launcher_toggle.value
-                                 if self._install_tag == "portable" else "direct",
             "redists":          selected_redists,
             "force_redists":    force_redists,
             "cleanup_tmp":      self.cleanup_check.isChecked(),
@@ -1102,4 +1119,3 @@ class InstallDialog(QDialog):
         self._install_tag = tag
         is_portable = (tag == "portable")
         self.gamepath_box.setVisible(is_portable)
-        self.launcher_box.setVisible(is_portable)

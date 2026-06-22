@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
     QLabel, QPushButton, QLineEdit, QFrame, QSizePolicy
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRunnable, QThreadPool, pyqtSlot, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRunnable, QThreadPool, pyqtSlot, QObject, QEvent
 from PyQt6.QtGui import QPixmap, QFont
 
 import db
@@ -172,6 +172,52 @@ class GameTile(QFrame):
             self.clicked.emit(self.game_id)
 
 
+# ── Trickle viewport event filter ────────────────────────────────────────────
+
+class TrickleViewportFilter(QObject):
+    """
+    Installed on QScrollArea.viewport() during trickle rendering.
+
+    The shift-jitter during trickle is caused by QScrollArea::viewportEvent()
+    processing MouseMove/Enter/Leave events, which internally calls
+    updateScrollBars() → scrollBar->setRange() → a geometry recalculation that
+    repositions the content widget.  When new rows are being added every 8ms the
+    content height is changing constantly, so each mouse move can flip the
+    scrollbar visibility, changing the viewport width, which can in turn change
+    the column count and restart the entire trickle.
+
+    Fix: silently consume MouseMove, Enter, and Leave events on the viewport
+    while trickle is active.  The scroll area still repaints (we don't block
+    Paint), the user can still scroll with the wheel (we don't block Wheel),
+    and clicks still work (we don't block MouseButton).  We only stop Qt from
+    recalculating scrollbar geometry in response to hover position.
+
+    The filter is installed once at construction and permanently attached to
+    the viewport; _active is toggled by _start_trickle / trickle completion.
+    """
+
+    _BLOCKED = {
+        QEvent.Type.MouseMove,
+        QEvent.Type.Enter,
+        QEvent.Type.Leave,
+        QEvent.Type.HoverEnter,
+        QEvent.Type.HoverMove,
+        QEvent.Type.HoverLeave,
+    }
+
+    def __init__(self, parent: QObject = None):
+        super().__init__(parent)
+        self._active = False
+
+    def set_active(self, active: bool):
+        self._active = active
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if self._active and event.type() in self._BLOCKED:
+            return True   # consume — don't propagate to QScrollArea internals
+        return False      # pass through
+
+
 # ── Library View ──────────────────────────────────────────────────────────────
 
 class LibraryView(QWidget):
@@ -264,6 +310,12 @@ class LibraryView(QWidget):
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet(f"background: {COLORS['bg']}; border: none;")
 
+        # Event filter that blocks mouse-move events on the viewport during
+        # trickle — prevents QScrollArea::updateScrollBars() being triggered by
+        # hover, which was repositioning the content widget mid-load.
+        self._viewport_filter = TrickleViewportFilter(self)
+        self.scroll.viewport().installEventFilter(self._viewport_filter)
+
         # Outer container holds rows widget + empty label
         outer = QWidget()
         outer.setStyleSheet(f"background: {COLORS['bg']};")
@@ -293,7 +345,9 @@ class LibraryView(QWidget):
         self._rows_layout.setSpacing(16)
         self._rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         outer_layout.addWidget(self._rows_widget)
-        outer_layout.addStretch()
+        # No addStretch() — a stretch spacer rebalances against _rows_widget on
+        # every addWidget() during trickle, physically shifting rows upward each
+        # time a new row is appended. AlignTop already pins content to the top.
 
         self.scroll.setWidget(outer)
         root.addWidget(self.scroll, 1)
@@ -400,27 +454,33 @@ class LibraryView(QWidget):
 
         tile_size = db.get_setting("tile_size", "medium")
         tile_w    = TILE_WIDTHS.get(tile_size, 160)
-        avail_w   = self.scroll.width() - 56
+        avail_w   = self.scroll.viewport().width()
         cols      = max(1, avail_w // (tile_w + 16))
         self._cols      = cols
         self._last_cols = cols
 
         self._trickle_queue  = list(games)
         self._trickle_active = True
+        self._viewport_filter.set_active(True)   # block mouse events during trickle
         my_gen = self._trickle_gen
 
         def add_next():
             if self._trickle_gen != my_gen:
+                self._viewport_filter.set_active(False)
                 return
 
-            for _ in range(5):
+            tiles_placed = 0
+            while tiles_placed < 5:
                 if not self._trickle_queue:
-                    if self._current_row_layout is not None:
+                    # Flush any partially-filled last row
+                    if self._current_row_widget is not None:
                         self._current_row_layout.addStretch()
-                    self._trickle_active     = False
-                    self._current_row_widget = None
-                    self._current_row_layout = None
-                    self._tiles_in_row       = 0
+                        self._rows_layout.addWidget(self._current_row_widget)
+                        self._current_row_widget = None
+                        self._current_row_layout = None
+                        self._tiles_in_row       = 0
+                    self._trickle_active = False
+                    self._viewport_filter.set_active(False)  # restore mouse events
                     self._unlock_refresh()
                     self.trickle_finished.emit()
                     return
@@ -429,18 +489,17 @@ class LibraryView(QWidget):
                 tile_sz = db.get_setting("tile_size", "medium")
                 tw      = TILE_WIDTHS.get(tile_sz, 160)
 
-                if self._current_row_layout is None or self._tiles_in_row >= self._cols:
-                    if self._current_row_layout is not None:
-                        self._current_row_layout.addStretch()
-
+                # Build row widget detached from _rows_layout until the row is
+                # full. Previously the row was added to the live layout before any
+                # tiles landed in it, then each tile triggered a layout pass on the
+                # live tree — cols+1 passes per row. Now: 1 pass per completed row.
+                if self._current_row_layout is None:
                     row_widget = QWidget()
                     row_widget.setStyleSheet("background: transparent;")
                     row_layout = QHBoxLayout(row_widget)
                     row_layout.setContentsMargins(0, 0, 0, 0)
                     row_layout.setSpacing(16)
                     row_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-                    self._rows_layout.addWidget(row_widget)
-
                     self._current_row_widget = row_widget
                     self._current_row_layout = row_layout
                     self._tiles_in_row       = 0
@@ -450,12 +509,21 @@ class LibraryView(QWidget):
                 self._current_row_layout.addWidget(tile)
                 self._tiles[game["id"]] = tile
                 self._tiles_in_row += 1
+                tiles_placed += 1
 
                 cover_url = _safe_get(game, "cover_url")
                 if cover_url:
                     loader = ImageLoader(game["id"], cover_url)
                     loader.signals.loaded.connect(self._on_image_loaded)
                     self._pool.start(loader)
+
+                # Row complete — attach to live layout in one shot
+                if self._tiles_in_row >= self._cols:
+                    self._current_row_layout.addStretch()
+                    self._rows_layout.addWidget(self._current_row_widget)
+                    self._current_row_widget = None
+                    self._current_row_layout = None
+                    self._tiles_in_row       = 0
 
             QTimer.singleShot(8, add_next)
 
@@ -501,7 +569,7 @@ class LibraryView(QWidget):
             return
         tile_size = db.get_setting("tile_size", "medium")
         tile_w    = TILE_WIDTHS.get(tile_size, 160)
-        avail_w   = self.scroll.width() - 56
+        avail_w   = self.scroll.viewport().width()
         new_cols  = max(1, avail_w // (tile_w + 16))
         if new_cols != self._last_cols:
             self._start_trickle(self._filtered_games())

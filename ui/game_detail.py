@@ -695,16 +695,35 @@ class GameDetailView(QWidget):
         dlg.exec()
 
     def _on_launch_clicked(self):
-        """Launch the installed game via Wine with its saved prefix."""
+        """Launch the installed game via Wine/Proton with its saved prefix."""
         if not self._game_id:
             return
         game = db.get_game(self._game_id)
         if not game:
             return
 
-        exe_path    = (game["exe_path"]    or "").strip()
-        wine_prefix = (game["wine_prefix"] or "").strip()
+        exe_path     = (game["exe_path"]     or "").strip()
+        wine_prefix  = (game["wine_prefix"]  or "").strip()
+        desktop_path = (game["desktop_path"] or "").strip()
 
+        # Best option: parse and run the Exec= line from the .desktop file —
+        # it has all the correct env vars baked in. xdg-open on a .desktop
+        # opens it as a text document rather than executing it.
+        if desktop_path and Path(desktop_path).exists():
+            try:
+                exec_line = None
+                for line in Path(desktop_path).read_text().splitlines():
+                    if line.startswith("Exec="):
+                        exec_line = line[5:].strip()
+                        break
+                if exec_line:
+                    subprocess.Popen(exec_line, shell=True)
+                    log.info("Launched via .desktop Exec: %s", exec_line)
+                    return
+            except Exception as e:
+                log.warning(".desktop exec failed: %s — falling back", e)
+
+        # Fallback: reconstruct the launch command from stored data
         if not exe_path or not Path(exe_path).exists():
             QMessageBox.warning(
                 self, "Launch Error",
@@ -714,30 +733,25 @@ class GameDetailView(QWidget):
             )
             return
 
-        env = {**os.environ}
-        if wine_prefix:
-            env["WINEPREFIX"] = wine_prefix
-
-        # Use the saved launcher script if one exists (preserves user env tweaks)
-        script_path = (game["script_path"] or "").strip()
-        if script_path and Path(script_path).exists():
-            try:
-                subprocess.Popen([script_path], env=env)
-                log.info("Launched via script: %s", script_path)
-            except Exception as e:
-                QMessageBox.warning(self, "Launch Error",
-                                    f"Could not start launcher script:\n{e}")
-            return
-
-        # Direct wine launch
         try:
-            subprocess.Popen(["wine", exe_path], env=env)
-            log.info("Launched: WINEPREFIX=%s wine %s", wine_prefix, exe_path)
-        except FileNotFoundError:
-            QMessageBox.warning(
-                self, "Launch Error",
-                "wine not found. Make sure Wine is installed and on your PATH."
-            )
+            import installer as install_mod
+            stored_version = db.get_setting("default_proton_version", "")
+            wine_bin = install_mod._resolve_wine_bin(
+                protondb_mod.get_version_path(stored_version)
+            ) if stored_version else "wine"
+            prefix_path = Path(wine_prefix) if wine_prefix else None
+            if prefix_path:
+                env = install_mod._build_wine_env(wine_bin, prefix_path)
+            else:
+                env = {**os.environ}
+            if Path(wine_bin).name == "proton":
+                cmd = [wine_bin, "run", exe_path]
+            else:
+                cmd = [wine_bin, exe_path]
+            subprocess.Popen(cmd, env=env)
+            log.info("Launched: %s %s (WINEPREFIX=%s)", wine_bin, exe_path, wine_prefix)
+        except Exception as e:
+            QMessageBox.warning(self, "Launch Error", f"Could not launch game:\n{e}")
         except Exception as e:
             QMessageBox.warning(self, "Launch Error",
                                 f"Could not start game:\n{e}")
