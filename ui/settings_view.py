@@ -456,6 +456,7 @@ class SettingsView(QWidget):
             ("🍷  Wine / Lutris",  self._build_wine_page),
             ("🎨  Appearance",     self._build_appearance_page),
             ("🔄  Scan & Cache",   self._build_scan_page),
+            ("🔔  Version Tracking", self._build_version_tracking_page),
             ("ℹ  About",           self._build_about_page),
         ]
 
@@ -525,6 +526,11 @@ class SettingsView(QWidget):
         # Refresh redistributables status
         self._refresh_steamcmd_status()
         self._refresh_redist_stats()
+
+        # Refresh version tracking status
+        self._refresh_version_status_label()
+        if hasattr(self, "_ver_sites_container"):
+            self._refresh_version_sites()
 
     def _show_page(self, idx: int):
         self._current_page = idx
@@ -1719,6 +1725,26 @@ class SettingsView(QWidget):
                                "How often to check for new games while the app is running",
                                interval_combo)
 
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("Library Filters"))
+
+        recent_combo = QComboBox()
+        for label, val in [("7 days",  "7"),
+                            ("14 days", "14"),
+                            ("30 days", "30"),
+                            ("60 days", "60"),
+                            ("90 days", "90")]:
+            recent_combo.addItem(label, val)
+        idx = recent_combo.findData(db.get_setting("recently_added_days", "14"))
+        recent_combo.setCurrentIndex(max(0, idx))
+        recent_combo.currentIndexChanged.connect(
+            lambda: self._save("recently_added_days", recent_combo.currentData())
+        )
+        self._make_setting_row(layout, "recently_added_days",
+                               "\"Recently Added\" Window",
+                               "How far back the Recently Added sidebar filter looks",
+                               recent_combo)
+
         scan_now_row = SettingsRow("Last Scan", "")
         scan_now_btn = ActionButton("Scan Now")
         scan_now_btn.clicked.connect(lambda: self._trigger_scan_now(scan_now_row))
@@ -1833,10 +1859,474 @@ class SettingsView(QWidget):
             if hasattr(self, "cat_list_layout"):
                 self._refresh_category_list()
 
+    # ── Version Tracking ──────────────────────────────────────────────────────
+
+    def _build_version_tracking_page(self) -> QScrollArea:
+        scroll, layout = self._scrollable_page("Version Tracking")
+
+        # ── Auto-check settings ───────────────────────────────────────────────
+        layout.addWidget(SectionHeader("Automatic Checking"))
+
+        auto_toggle = SettingsToggle(
+            db.get_setting("version_check_auto", "true") == "true")
+        auto_toggle.changed.connect(
+            lambda v: self._save("version_check_auto", "true" if v else "false"))
+        self._make_setting_row(
+            layout, "version_check_auto",
+            "Auto-check for Updates",
+            "Periodically recheck all tracked pages for new version numbers",
+            auto_toggle)
+
+        interval_combo = QComboBox()
+        for lbl, val in [("Every 12 hours", "12"), ("Every 24 hours", "24"),
+                          ("Every 48 hours", "48"), ("Every 7 days", "168")]:
+            interval_combo.addItem(lbl, val)
+        idx = interval_combo.findData(
+            db.get_setting("version_check_interval_hours", "24"))
+        interval_combo.setCurrentIndex(max(0, idx))
+        interval_combo.currentIndexChanged.connect(
+            lambda: self._save("version_check_interval_hours",
+                               interval_combo.currentData()))
+        self._make_setting_row(
+            layout, "version_check_interval_hours",
+            "Check Interval",
+            "How often to recheck all tracked pages in the background",
+            interval_combo)
+
+        # ── Status + manual trigger ───────────────────────────────────────────
+        layout.addSpacing(16)
+        layout.addWidget(SectionHeader("Status"))
+
+        status_row = SettingsRow("Last Check", "When all trackers were last rechecked")
+        self.ver_last_run_lbl = QLabel("")
+        self.ver_last_run_lbl.setFont(QFont("DM Mono", 9))
+        self._refresh_version_status_label()
+        status_row.add_control(self.ver_last_run_lbl)
+        layout.addWidget(status_row)
+
+        check_all_row = SettingsRow(
+            "Check All Now",
+            "Recheck every tracked page immediately")
+        self.ver_check_all_btn = ActionButton("Check All Now")
+        self.ver_check_all_btn.clicked.connect(self._on_check_all_now)
+        check_all_row.add_control(self.ver_check_all_btn)
+        layout.addWidget(check_all_row)
+
+        self.ver_status_lbl = QLabel("")
+        self.ver_status_lbl.setFont(QFont("DM Mono", 9))
+        self.ver_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        layout.addWidget(self.ver_status_lbl)
+
+        # ── Site management ───────────────────────────────────────────────────
+        layout.addSpacing(16)
+        layout.addWidget(SectionHeader("Tracked Sites"))
+
+        site_desc = QLabel(
+            "Sites listed here are used to look up version numbers. "
+            "Formula sites (marked ★) automatically check all new games "
+            "using a slugified URL pattern. Manual sites are game-specific "
+            "and managed via the right-click menu on any game tile."
+        )
+        site_desc.setFont(QFont("DM Sans", 11))
+        site_desc.setStyleSheet(
+            f"color: {COLORS['text_muted']}; padding-bottom: 8px;")
+        site_desc.setWordWrap(True)
+        layout.addWidget(site_desc)
+
+        # Sites list container — rebuilt by _refresh_version_sites()
+        self._ver_sites_container = QWidget()
+        self._ver_sites_container.setStyleSheet("background: transparent;")
+        self._ver_sites_layout = QVBoxLayout(self._ver_sites_container)
+        self._ver_sites_layout.setContentsMargins(0, 0, 0, 0)
+        self._ver_sites_layout.setSpacing(8)
+        layout.addWidget(self._ver_sites_container)
+
+        self._refresh_version_sites()
+
+        layout.addSpacing(8)
+        layout.addWidget(SectionHeader("Add Formula Site"))
+
+        formula_desc = QLabel(
+            "A formula site constructs a URL for each game using its slugified "
+            "name. Provide a base URL, a path prefix, and a suffix. "
+            "The full URL will be: base_url + prefix + slug + suffix.\n"
+            "Example: base='https://pcgamingwiki.com' prefix='/wiki/' suffix=''"
+        )
+        formula_desc.setFont(QFont("DM Sans", 10))
+        formula_desc.setStyleSheet(
+            f"color: {COLORS['text_muted']}; padding-bottom: 6px;")
+        formula_desc.setWordWrap(True)
+        layout.addWidget(formula_desc)
+
+        # Add formula site form
+        form_widget = QWidget()
+        form_widget.setStyleSheet(f"""
+            QWidget {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+            }}
+        """)
+        form_l = QVBoxLayout(form_widget)
+        form_l.setContentsMargins(14, 12, 14, 12)
+        form_l.setSpacing(8)
+
+        for field_name, placeholder, attr in [
+            ("Label",    "PCGamingWiki",                 "_ver_new_label"),
+            ("Base URL", "https://pcgamingwiki.com",     "_ver_new_base"),
+            ("Prefix",   "/wiki/",                       "_ver_new_prefix"),
+            ("Suffix",   "(leave blank if not needed)",  "_ver_new_suffix"),
+        ]:
+            row_l = QHBoxLayout()
+            row_l.setSpacing(10)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            name_lbl = QLabel(field_name)
+            name_lbl.setFont(QFont("DM Mono", 9))
+            name_lbl.setFixedWidth(68)
+            name_lbl.setStyleSheet(
+                f"color: {COLORS['text_muted']}; background: transparent; border: none;")
+            edit = QLineEdit()
+            edit.setFont(QFont("DM Mono", 10))
+            edit.setPlaceholderText(placeholder)
+            edit.setStyleSheet(f"""
+                QLineEdit {{
+                    background: {COLORS['surface3']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 5px;
+                    color: {COLORS['accent2']};
+                    padding: 4px 8px;
+                }}
+                QLineEdit:focus {{ border-color: rgba(255,255,255,0.2); }}
+            """)
+            setattr(self, attr, edit)
+            row_l.addWidget(name_lbl)
+            row_l.addWidget(edit, 1)
+            form_l.addLayout(row_l)
+
+        add_site_row = QHBoxLayout()
+        add_site_row.setContentsMargins(0, 4, 0, 0)
+        add_site_row.setSpacing(10)
+        add_site_row.addStretch()
+
+        self._ver_add_result_lbl = QLabel("")
+        self._ver_add_result_lbl.setFont(QFont("DM Mono", 9))
+        self._ver_add_result_lbl.setStyleSheet(
+            f"color: {COLORS['text_muted']}; background: transparent; border: none;")
+        add_site_row.addWidget(self._ver_add_result_lbl)
+
+        add_site_btn = ActionButton("Add Formula Site")
+        add_site_btn.clicked.connect(self._on_add_formula_site)
+        add_site_row.addWidget(add_site_btn)
+        form_l.addLayout(add_site_row)
+        layout.addWidget(form_widget)
+
+        layout.addStretch()
+        return scroll
+
+    def _refresh_version_sites(self):
+        """Rebuild the site list widget from DB."""
+        while self._ver_sites_layout.count():
+            item = self._ver_sites_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        sites = db.get_version_sites()
+        if not sites:
+            empty = QLabel("No sites configured yet.")
+            empty.setFont(QFont("DM Sans", 11))
+            empty.setStyleSheet(f"color: {COLORS['text_muted']};")
+            self._ver_sites_layout.addWidget(empty)
+            return
+
+        for site in sites:
+            self._ver_sites_layout.addWidget(self._make_site_row(site))
+
+    def _make_site_row(self, site) -> QWidget:
+        """Build one site management row."""
+        is_formula = bool(site["auto_track_new_games"])
+        n_trackers = db.count_trackers_for_site(site["id"])
+
+        row = QWidget()
+        row.setStyleSheet(f"""
+            QWidget {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+            }}
+        """)
+        row_l = QVBoxLayout(row)
+        row_l.setContentsMargins(14, 10, 14, 10)
+        row_l.setSpacing(6)
+
+        # Top: label (editable) + formula badge + tracker count
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.setContentsMargins(0, 0, 0, 0)
+
+        label_edit = QLineEdit(site["label"])
+        label_edit.setFont(QFont("DM Sans", 11, QFont.Weight.Medium))
+        label_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid {COLORS['border']};
+                color: {COLORS['text']};
+                padding: 2px 0;
+            }}
+            QLineEdit:focus {{
+                border-bottom-color: rgba(255,255,255,0.3);
+            }}
+        """)
+        label_edit.setPlaceholderText("Site label…")
+        top.addWidget(label_edit, 1)
+
+        if is_formula:
+            badge = QLabel("★ formula")
+            badge.setFont(QFont("DM Mono", 8))
+            badge.setStyleSheet(f"""
+                color: {COLORS['accent']};
+                background: rgba(232,199,106,0.10);
+                border: 1px solid rgba(232,199,106,0.3);
+                border-radius: 4px;
+                padding: 1px 6px;
+            """)
+            top.addWidget(badge)
+
+        count_lbl = QLabel(f"{n_trackers} tracker{'s' if n_trackers != 1 else ''}")
+        count_lbl.setFont(QFont("DM Mono", 9))
+        count_lbl.setStyleSheet(
+            f"color: {COLORS['text_muted']}; background: transparent; border: none;")
+        top.addWidget(count_lbl)
+        row_l.addLayout(top)
+
+        # Base URL (read-only display)
+        url_lbl = QLabel(site["base_url"] + (site["suffix"] or ""))
+        url_lbl.setFont(QFont("DM Mono", 9))
+        url_lbl.setStyleSheet(
+            f"color: {COLORS['accent2']}; background: transparent; border: none;")
+        url_lbl.setWordWrap(False)
+        row_l.addWidget(url_lbl)
+
+        # Buttons row
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+
+        save_btn = ActionButton("Save Label")
+        save_btn.clicked.connect(
+            lambda _, sid=site["id"], e=label_edit:
+            self._on_save_site_label(sid, e.text().strip()))
+        btn_row.addWidget(save_btn)
+
+        if is_formula:
+            backfill_btn = ActionButton("Backfill Library…")
+            backfill_btn.clicked.connect(
+                lambda _, sid=site["id"], slbl=site["label"]:
+                self._on_backfill_site(sid, slbl))
+            btn_row.addWidget(backfill_btn)
+
+        btn_row.addStretch()
+
+        delete_btn = ActionButton("Delete", danger=True)
+        delete_btn.clicked.connect(
+            lambda _, sid=site["id"], slbl=site["label"], n=n_trackers:
+            self._on_delete_site(sid, slbl, n))
+        btn_row.addWidget(delete_btn)
+
+        row_l.addLayout(btn_row)
+        return row
+
+    def _refresh_version_status_label(self):
+        """Update the last-checked timestamp label from DB."""
+        if not hasattr(self, "ver_last_run_lbl"):
+            return
+        import datetime
+        last_run = db.get_setting("version_check_last_run_at", "")
+        if not last_run:
+            self.ver_last_run_lbl.setText("Never")
+            self.ver_last_run_lbl.setStyleSheet(
+                f"color: {COLORS['text_muted']}; font-family: 'DM Mono'; font-size: 9px;")
+            return
+        try:
+            dt = datetime.datetime.fromisoformat(
+                last_run.replace("T", " ")[:19])
+            delta = (datetime.datetime.utcnow() - dt).days
+            if delta == 0:
+                label = "Today"
+                color = "#4ade80"
+            elif delta == 1:
+                label = "Yesterday"
+                color = COLORS["text_muted"]
+            else:
+                label = f"{delta} days ago"
+                color = COLORS["text_muted"]
+            self.ver_last_run_lbl.setText(label)
+            self.ver_last_run_lbl.setStyleSheet(
+                f"color: {color}; font-family: 'DM Mono'; font-size: 9px;")
+        except (ValueError, TypeError):
+            self.ver_last_run_lbl.setText("—")
+
+    def _on_check_all_now(self):
+        """Trigger Check All Now via main window's version check entry point."""
+        try:
+            main_win = self.window()
+            if hasattr(main_win, "_start_version_check"):
+                self.ver_check_all_btn.setEnabled(False)
+                self.ver_check_all_btn.setText("Checking…")
+                self.ver_status_lbl.setText("Starting version check…")
+                self.ver_status_lbl.setStyleSheet(
+                    f"color: {COLORS['text_muted']};")
+                main_win._start_version_check(manual=True)
+            else:
+                self.ver_status_lbl.setText(
+                    "⚠ Could not reach main window — restart the app.")
+        except Exception as e:
+            self.ver_status_lbl.setText(f"✗ Error: {e}")
+
+    def _on_version_check_done(self, found: int, checked: int, errors: int):
+        """
+        Called by MainWindow._on_version_worker_done() when a check completes.
+        Updates the settings page status without requiring a full reload.
+        """
+        self.ver_check_all_btn.setEnabled(True)
+        self.ver_check_all_btn.setText("Check All Now")
+        msg = f"✓ Done — {found} updated, {checked} checked"
+        if errors:
+            msg += f", {errors} error(s)"
+        self.ver_status_lbl.setText(msg)
+        self.ver_status_lbl.setStyleSheet("color: #4ade80;")
+        self._refresh_version_status_label()
+
+    def _on_add_formula_site(self):
+        """Create a new formula site from the add-site form fields."""
+        label  = self._ver_new_label.text().strip()
+        base   = self._ver_new_base.text().strip().rstrip("/")
+        prefix = self._ver_new_prefix.text().strip()
+        suffix = self._ver_new_suffix.text().strip()
+
+        if not base:
+            self._set_add_result("✗ Base URL is required", "error")
+            return
+
+        import version_check as _vc
+        err = _vc.validate_url(base)
+        if err:
+            self._set_add_result(f"✗ {err}", "error")
+            return
+
+        # The prefix becomes part of the path template.
+        # Stored in version_sites.suffix as the path prefix so that
+        # build_url(base_url, "/" + slug, suffix=prefix_suffix) works.
+        # We store it as: base_url = host, suffix = prefix (goes before slug).
+        # Actually align with how db.get_or_create works:
+        #   base_url = the site root (host only)
+        #   auto-track workers build: base_url + "/" + slug + suffix
+        # So for PCGamingWiki with prefix "/wiki/" the suffix should be "/wiki/"
+        # and workers prepend it: base_url + suffix + slug.
+        # Redefine: store prefix as part of base_url so it's baked in.
+        # e.g. base="https://pcgamingwiki.com" prefix="/wiki/" →
+        #   stored base_url = "https://pcgamingwiki.com/wiki" (no trailing slash)
+        #   workers build: base_url + "/" + slug + suffix
+
+        # Combine base + prefix into base_url (strip trailing slashes)
+        prefix_clean = prefix.lstrip("/").rstrip("/")
+        if prefix_clean:
+            stored_base = base + "/" + prefix_clean
+        else:
+            stored_base = base
+
+        site = db.get_or_create_version_site_by_base_url(
+            base_url   = stored_base,
+            label      = label or _vc._base_url_to_label(base),
+            suffix     = suffix,
+            auto_track = True,
+        )
+
+        # Clear form
+        for attr in ("_ver_new_label", "_ver_new_base",
+                     "_ver_new_prefix", "_ver_new_suffix"):
+            getattr(self, attr).clear()
+
+        self._set_add_result(f"✓ Site '{site['label']}' added", "good")
+        self._refresh_version_sites()
+
+    def _set_add_result(self, text: str, style: str):
+        colors = {"good": "#4ade80", "error": COLORS["danger"],
+                  "muted": COLORS["text_muted"]}
+        self._ver_add_result_lbl.setText(text)
+        self._ver_add_result_lbl.setStyleSheet(
+            f"color: {colors.get(style, COLORS['text_muted'])};"
+            " background: transparent; border: none;")
+
+    def _on_save_site_label(self, site_id: int, new_label: str):
+        if not new_label:
+            return
+        db.update_version_site(site_id, label=new_label)
+        self._refresh_version_sites()
+
+    def _on_delete_site(self, site_id: int, label: str, n_trackers: int):
+        from PyQt6.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Delete Site")
+        msg.setText(f"Delete site '{label}'?")
+        if n_trackers > 0:
+            msg.setInformativeText(
+                f"This will also delete {n_trackers} tracker "
+                f"{'rows' if n_trackers != 1 else 'row'} and all stored "
+                f"version data for this site. This cannot be undone.")
+        else:
+            msg.setInformativeText("This site has no trackers.")
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        msg.setStyleSheet(
+            f"QMessageBox {{ background: {COLORS['surface']}; "
+            f"color: {COLORS['text']}; }}")
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            db.delete_version_site(site_id)
+            self._refresh_version_sites()
+
+    def _on_backfill_site(self, site_id: int, label: str):
+        """Start a backfill pass via main window."""
+        from PyQt6.QtWidgets import QMessageBox
+        import version_checker as vc_mod
+        candidates = db.get_backfill_candidates_for_site(site_id)
+        n = len(candidates)
+        if n == 0:
+            QMessageBox.information(
+                self, "Backfill",
+                f"No new candidates found for '{label}'.\n"
+                "All library games have either been checked or confirmed absent.")
+            return
+        est_secs = vc_mod.estimate_check_seconds(n)
+        est_mins = round(est_secs / 60, 1)
+        reply = QMessageBox.question(
+            self, "Backfill Library",
+            f"Check {n} game{'s' if n != 1 else ''} against '{label}'?\n\n"
+            f"Estimated time: ~{est_mins} minutes\n"
+            "Games already tracked or confirmed absent will be skipped.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok)
+        if reply != QMessageBox.StandardButton.Ok:
+            return
+        try:
+            main_win = self.window()
+            if hasattr(main_win, "start_version_backfill"):
+                main_win.start_version_backfill(site_id)
+                self.ver_status_lbl.setText(
+                    f"Backfill started for '{label}'…")
+                self.ver_status_lbl.setStyleSheet(
+                    f"color: {COLORS['text_muted']};")
+            else:
+                self.ver_status_lbl.setText(
+                    "⚠ Could not reach main window — restart the app.")
+        except Exception as e:
+            self.ver_status_lbl.setText(f"✗ Error: {e}")
+
     # ── About / Version ──────────────────────────────────────────────────────
     # Version is hardcoded here — not stored in the DB.
     # To bump the version, change this constant only.
-    APP_VERSION = "0.2.0-dev"
+    APP_VERSION = "0.3.0-dev"
 
     def _build_about_page(self) -> QScrollArea:
         scroll, layout = self._scrollable_page("About VaultPlay")
@@ -1962,75 +2452,3 @@ class SettingsView(QWidget):
 
         layout.addStretch()
         return scroll
-
-    # ── init ──────────────────────────────────────────────────────────────────
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._widgets = {}
-        self._build()
-
-    def _build(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        # Back bar
-        back_bar = QWidget()
-        back_bar.setFixedHeight(44)
-        back_bar.setStyleSheet(f"background: {COLORS['surface']}; border-bottom: 1px solid {COLORS['border']};")
-        back_layout = QHBoxLayout(back_bar)
-        back_layout.setContentsMargins(20, 0, 20, 0)
-        back_btn = QPushButton("← Back to Library")
-        back_btn.setFont(QFont("DM Sans", 11))
-        back_btn.setStyleSheet(f"""
-            QPushButton {{ background: transparent; border: none; color: {COLORS['text_muted']}; padding: 0; }}
-            QPushButton:hover {{ color: {COLORS['text']}; }}
-        """)
-        back_btn.clicked.connect(self.back_requested)
-        back_layout.addWidget(back_btn)
-        back_layout.addStretch()
-        root.addWidget(back_bar)
-
-        main = QHBoxLayout()
-        main.setContentsMargins(0, 0, 0, 0)
-        main.setSpacing(0)
-        root.addLayout(main, 1)
-
-        self.nav = QWidget()
-        self.nav.setFixedWidth(200)
-        self.nav.setStyleSheet(f"background: {COLORS['surface']}; border-right: 1px solid {COLORS['border']};")
-        nav_layout = QVBoxLayout(self.nav)
-        nav_layout.setContentsMargins(0, 20, 0, 20)
-        nav_layout.setSpacing(0)
-
-        self._nav_items = []
-        self._pages_stack = QStackedWidget()
-
-        nav_defs = [
-            ("🗄  NAS Connection", self._build_nas_page),
-            ("📁  Paths",          self._build_paths_page),
-            ("🗂  Categories",     self._build_categories_page),
-            ("🔑  API Keys",       self._build_api_page),
-            ("🍷  Wine / Lutris",  self._build_wine_page),
-            ("🎨  Appearance",     self._build_appearance_page),
-            ("🔄  Scan & Cache",   self._build_scan_page),
-            ("ℹ  About",           self._build_about_page),
-        ]
-
-        for i, (label, builder) in enumerate(nav_defs):
-            btn = QPushButton(label)
-            btn.setFont(QFont("DM Sans", 11))
-            btn.setProperty("page_idx", i)
-            btn.clicked.connect(lambda _, idx=i: self._show_page(idx))
-            btn.setStyleSheet(self._nav_style(False))
-            self._nav_items.append(btn)
-            nav_layout.addWidget(btn)
-            page = builder()
-            self._pages_stack.addWidget(page)
-
-        nav_layout.addStretch()
-        main.addWidget(self.nav)
-        main.addWidget(self._pages_stack, 1)
-
-        self._current_page = 0
-        self._show_page(0)

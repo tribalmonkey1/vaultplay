@@ -40,6 +40,8 @@ import db
 import scanner
 import metadata as meta_mod
 import protondb as protondb_mod
+import version_checker as vc_mod
+import playtime as playtime_mod
 
 from ui.library_view import LibraryView
 from ui.setup_wizard import SetupWizard
@@ -218,9 +220,12 @@ class Sidebar(QWidget):
         # Library section
         self._add_section_label(layout, "Library")
         self.items: dict[str, SidebarItem] = {}
-        self._add_item(layout, "All Games",    "all",         0)
-        self._add_item(layout, "Installed",    "installed",   0)
-        self._add_item(layout, "Not Installed","uninstalled", 0)
+        self._add_item(layout, "All Games",       "all",         0)
+        self._add_item(layout, "Installed",        "installed",   0)
+        self._add_item(layout, "Not Installed",    "uninstalled", 0)
+        self._add_item(layout, "★  Favorites",     "favorites",   0)
+        self._add_item(layout, "🕐  Recently Added","recent",      0)
+        self._add_item(layout, "⊘  Hidden",        "hidden",      0)
 
         # Genre section
         self.genre_label = self._add_section_label(layout, "Categories")
@@ -292,11 +297,18 @@ class Sidebar(QWidget):
         self._current = key
         self.filter_changed.emit(key)
 
-    def update_counts(self, all_count, installed, uninstalled, cat_counts: dict):
+    def update_counts(self, all_count, installed, uninstalled, cat_counts: dict,
+                      favorites: int = 0, hidden: int = 0):
         """cat_counts: {folder_name: (display_name, count)}"""
         self.items["all"].update_count(all_count)
         self.items["installed"].update_count(installed)
         self.items["uninstalled"].update_count(uninstalled)
+
+        # Update favorites/hidden counts if those items exist
+        if "favorites" in self.items:
+            self.items["favorites"].update_count(favorites)
+        if "hidden" in self.items:
+            self.items["hidden"].update_count(hidden)
 
         # Rebuild category items
         for i in reversed(range(self.genre_layout.count())):
@@ -371,6 +383,11 @@ class MainWindow(QMainWindow):
         self.library_view.refresh_requested.connect(self._start_scan)
         # When the trickle finishes, run any pending scan
         self.library_view.trickle_finished.connect(self._on_trickle_finished)
+        # When a tile context menu changes favorite/hidden state, reload library
+        self.library_view.game_state_changed.connect(self._on_game_state_changed)
+        # When a tile context menu requests version tracking dialog
+        self.library_view.track_versions_requested.connect(
+            self._open_version_tracker_dialog)
 
         self.detail_view = GameDetailView()
         self.detail_view.back_requested.connect(self._show_library)
@@ -391,9 +408,28 @@ class MainWindow(QMainWindow):
         self._meta_worker:   MetadataWorker | None = None
         self._proton_worker: ProtonDBWorker | None = None
 
+        # Version tracking workers — ONE shared running guard across all four
+        # entry points (auto-track, recheck, check-all-now, backfill).
+        self._version_worker: QThread | None = None
+        self._version_worker_running: bool   = False
+
+        # Playtime watchers — keyed by game_id so we never double-track
+        self._playtime_watchers: dict[int, playtime_mod.PlaytimeWatcher] = {}
+
+        # Connect game_launched from detail view
+        self.detail_view.game_launched.connect(self._on_game_launched)
+
+        # Recurring version check timer (persisted across restarts)
+        from PyQt6.QtCore import QTimer as _QTimer
+        self._version_check_timer = _QTimer(self)
+        self._version_check_timer.setSingleShot(True)
+        self._version_check_timer.timeout.connect(self._on_version_check_timer)
+
         # Pending scan: if a scan is requested while the trickle is running,
         # store its args here and fire it when trickle_finished fires.
         self._pending_scan: dict | None = None   # {"nas_path": str, "clear_first": bool}
+        # IDs of games found in the most recent scan, for auto-track pass
+        self._pending_new_game_ids: list = []
 
         # Show setup wizard on first run
         if db.get_setting("first_run_complete", "false") == "false":
@@ -437,6 +473,9 @@ class MainWindow(QMainWindow):
                 "Go to Settings → NAS Connection to configure your library.",
                 timeout=0
             )
+
+        # Arm the persisted version check timer now that the app is loaded
+        self._arm_version_check_timer()
 
     def _on_trickle_finished(self):
         """
@@ -488,30 +527,39 @@ class MainWindow(QMainWindow):
         """
         games = db.get_games_for_library()
 
-        all_count   = len(games)
-        installed   = sum(1 for g in games if g["is_installed"])
+        # Counts for sidebar badges.
+        # all_count excludes hidden games (they only appear in the Hidden view).
+        hidden      = sum(1 for g in games if _safe_get(g, "is_hidden", 0))
+        visible     = [g for g in games if not _safe_get(g, "is_hidden", 0)]
+        all_count   = len(visible)
+        installed   = sum(1 for g in visible if g["is_installed"])
         uninstalled = all_count - installed
+        favorites   = sum(1 for g in visible if _safe_get(g, "is_favorite", 0))
 
         categories = db.get_categories()
         cat_counts = {}
         for cat in categories:
             folder  = cat["folder_name"]
             display = cat["display_name"]
-            count   = sum(1 for g in games if _safe_get(g, "category") == folder)
+            count   = sum(1 for g in visible if _safe_get(g, "category") == folder)
             if count > 0:
                 cat_counts[folder] = (display, count)
 
-        self.sidebar.update_counts(all_count, installed, uninstalled, cat_counts)
+        self.sidebar.update_counts(all_count, installed, uninstalled,
+                                   cat_counts, favorites=favorites, hidden=hidden)
         self.library_view.load_games(games)
 
     def _on_filter_changed(self, key: str):
         self.library_view.apply_filter(key)
         if key.startswith("cat:"):
+            # Set the page title to the category's display name (not the raw folder name)
             cats = db.get_categories()
             for c in cats:
                 if c["folder_name"] == key[4:]:
                     self.library_view.set_page_title(c["display_name"])
                     return
+            # Fallback to folder name if display name not found
+            self.library_view.set_page_title(key[4:])
 
     # ── Scanning ──────────────────────────────────────────────────────────────
 
@@ -572,6 +620,15 @@ class MainWindow(QMainWindow):
         if new and not (self._meta_worker and self._meta_worker.isRunning()):
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(2000, self._start_metadata_fetch)
+
+        # Fire auto-track pass for new games, independent of the metadata chain.
+        # Stored here so the pass can be deferred if a version worker is already
+        # running — it will be consumed by _on_version_worker_done().
+        new_game_ids = result.get("new_game_ids", [])
+        if new_game_ids:
+            self._pending_new_game_ids = new_game_ids
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1000, self._start_auto_track)
 
     def _start_metadata_fetch(self):
         if self._meta_worker and self._meta_worker.isRunning():
@@ -639,3 +696,212 @@ class MainWindow(QMainWindow):
 
     def _on_install_finished(self, game_id: int):
         self._load_library()
+
+    def _on_game_state_changed(self, game_id: int):
+        """
+        Called when a tile context menu changes favorite or hidden state.
+        Reloads the library so sidebar counts and tile visibility update
+        immediately without requiring a full NAS rescan.
+        """
+        self._load_library()
+
+    def _open_version_tracker_dialog(self, game_id: int):
+        """Open the VersionTrackerDialog for a specific game."""
+        from ui.version_tracker_dialog import VersionTrackerDialog
+        dlg = VersionTrackerDialog(game_id, parent=self)
+        dlg.versions_updated.connect(self._on_versions_updated)
+        dlg.exec()
+
+    def _on_versions_updated(self, game_id: int):
+        """
+        Called when VersionTrackerDialog writes new version data.
+        If the game detail view is currently showing this game, reload it
+        so the version rows in the info card update immediately.
+        """
+        if (self.stack.currentIndex() == 1 and
+                self.detail_view._game_id == game_id):
+            self.detail_view.load_game(game_id)
+
+    # ── Version checking ──────────────────────────────────────────────────────
+
+    def _version_worker_busy(self) -> bool:
+        """Return True if any version worker is currently running."""
+        return self._version_worker_running
+
+    def _on_version_worker_done(self, found: int, checked: int, errors: int):
+        """
+        Shared completion handler for all three version workers.
+        Clears the running guard, shows a status message, re-arms the timer,
+        and consumes any pending auto-track pass that was deferred.
+        """
+        self._version_worker_running = False
+        self._version_worker = None
+
+        if checked > 0:
+            msg = f"✓ Version check done — {found} updated"
+            if errors:
+                msg += f", {errors} error(s)"
+            self.library_view.show_status(msg, timeout=4000)
+
+        # Notify settings page if it's watching
+        try:
+            if hasattr(self.settings_view, "_on_version_check_done"):
+                self.settings_view._on_version_check_done(found, checked, errors)
+        except Exception:
+            pass
+
+        # Re-arm recurring timer for the next cycle
+        self._arm_version_check_timer()
+
+        # Run any deferred auto-track pass now that the worker slot is free
+        if self._pending_new_game_ids:
+            ids = self._pending_new_game_ids
+            self._pending_new_game_ids = []
+            self._start_auto_track(ids)
+
+    def _start_auto_track(self, game_ids: list = None):
+        """
+        Start the auto-track pass for new games.
+        If game_ids is None, consumes self._pending_new_game_ids.
+        No-ops if a version worker is already running (stores ids for later).
+        """
+        if game_ids is None:
+            game_ids = self._pending_new_game_ids
+            self._pending_new_game_ids = []
+
+        if not game_ids:
+            return
+
+        if self._version_worker_busy():
+            # Defer — _on_version_worker_done will consume pending ids
+            self._pending_new_game_ids = game_ids
+            log.debug("_start_auto_track: version worker busy, deferring %d ids",
+                      len(game_ids))
+            return
+
+        self._version_worker_running = True
+        worker = vc_mod.VersionAutoTrackWorker(game_ids)
+        worker.progress.connect(self._on_version_progress)
+        worker.finished.connect(self._on_version_worker_done)
+        worker.finished.connect(lambda f, c, e: worker.deleteLater())
+        self._version_worker = worker
+        worker.start()
+        log.info("VersionAutoTrackWorker started for %d new games", len(game_ids))
+
+    def _start_version_check(self, manual: bool = False):
+        """
+        Start the recurring background recheck (or manual Check All Now).
+        No-ops if a version worker is already running.
+        """
+        if self._version_worker_busy():
+            if manual:
+                self.library_view.show_status(
+                    "Version check already running…", timeout=3000)
+            return
+
+        self._version_worker_running = True
+        self.library_view.show_status("Checking for version updates…")
+        worker = vc_mod.VersionCheckWorker()
+        worker.progress.connect(self._on_version_progress)
+        worker.finished.connect(self._on_version_worker_done)
+        worker.finished.connect(lambda f, c, e: worker.deleteLater())
+        self._version_worker = worker
+        worker.start()
+        log.info("VersionCheckWorker started (manual=%s)", manual)
+
+    def start_version_backfill(self, site_id: int):
+        """
+        Start a backfill pass for a specific site.
+        Called from Settings → Version Tracking's Backfill button.
+        No-ops if a version worker is already running.
+        """
+        if self._version_worker_busy():
+            self.library_view.show_status(
+                "Version check already running…", timeout=3000)
+            return
+
+        self._version_worker_running = True
+        self.library_view.show_status("Running version backfill…")
+        worker = vc_mod.VersionBackfillWorker(site_id)
+        worker.progress.connect(self._on_version_progress)
+        worker.finished.connect(self._on_version_worker_done)
+        worker.finished.connect(lambda f, c, e: worker.deleteLater())
+        self._version_worker = worker
+        worker.start()
+        log.info("VersionBackfillWorker started for site_id=%d", site_id)
+
+    def _on_version_progress(self, current: int, total: int, message: str):
+        self.library_view.show_status(f"{message}  ({current}/{total})")
+
+    def _arm_version_check_timer(self):
+        """
+        Compute remaining time until next check and arm the one-shot timer.
+        Called on startup and after every completed check.
+        """
+        self._version_check_timer.stop()
+        delay_ms = vc_mod.get_next_check_delay_ms()
+        if delay_ms is None:
+            log.debug("Version check auto disabled — timer not armed")
+            return
+        log.info("Version check timer armed: %.1f minutes",
+                 delay_ms / 60000)
+        self._version_check_timer.start(delay_ms)
+
+    def _on_version_check_timer(self):
+        """Fired by the recurring timer — start a background recheck."""
+        log.info("Version check timer fired")
+        self._start_version_check(manual=False)
+
+    # ── Playtime tracking ─────────────────────────────────────────────────────
+
+    def _on_game_launched(self, game_id: int, proc, wine_bin: str,
+                          wine_prefix: str):
+        """
+        Start a PlaytimeWatcher for a game that was just launched.
+        Ignores the launch if a watcher is already running for this game
+        (i.e. the game is still open from a previous launch click).
+        The watcher removes itself from _playtime_watchers when it finishes,
+        so a subsequent launch after the game closes works normally.
+        """
+        if game_id in self._playtime_watchers:
+            existing = self._playtime_watchers[game_id]
+            if existing.isRunning():
+                log.info(
+                    "[PLAYTIME] Ignoring duplicate launch for game_id=%d "
+                    "(watcher already running)", game_id)
+                return
+            # Watcher finished but wasn't cleaned up yet — remove it
+            del self._playtime_watchers[game_id]
+
+        watcher = playtime_mod.PlaytimeWatcher(
+            game_id     = game_id,
+            proc        = proc,
+            wine_bin    = wine_bin,
+            wine_prefix = wine_prefix,
+            parent      = self,
+        )
+        watcher.session_ended.connect(self._on_session_ended)
+        watcher.finished.connect(
+            lambda gid=game_id: self._playtime_watchers.pop(gid, None))
+        self._playtime_watchers[game_id] = watcher
+        watcher.start()
+        log.info("[PLAYTIME] Watcher started for game_id=%d  wine_bin=%s",
+                 game_id, wine_bin)
+
+    def _on_session_ended(self, game_id: int, minutes: int):
+        """
+        Called when a PlaytimeWatcher finishes.
+        Refreshes the detail view if it's currently showing this game
+        so the updated playtime and last-played rows appear immediately.
+        """
+        if minutes > 0:
+            log.info("[PLAYTIME] Session recorded: game_id=%d  %d min",
+                     game_id, minutes)
+        else:
+            log.info("[PLAYTIME] Session too short, not recorded: game_id=%d",
+                     game_id)
+
+        # Refresh detail view if it's showing this game
+        if (self.stack.currentIndex() == 1 and
+                self.detail_view._game_id == game_id):
+            self.detail_view.load_game(game_id)

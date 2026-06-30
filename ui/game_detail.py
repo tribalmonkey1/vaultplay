@@ -184,6 +184,10 @@ class InfoRow(QWidget):
 class GameDetailView(QWidget):
     back_requested    = pyqtSignal()
     install_finished  = pyqtSignal(int)   # game_id
+    # Emitted after a successful launch — main window starts PlaytimeWatcher.
+    # Carries everything the watcher needs: game_id, Popen handle, wine_bin, wine_prefix.
+    # Using object type for proc since PyQt6 can't signal with subprocess.Popen directly.
+    game_launched     = pyqtSignal(int, object, str, str)  # game_id, proc, wine_bin, wine_prefix
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -326,6 +330,59 @@ class GameDetailView(QWidget):
         self.info_card_layout.setSpacing(0)
         self._section_title(self.info_card_layout, "Game Info")
         self.right_layout.addWidget(self.info_card)
+
+        # Library actions card (favorite + hide)
+        self.library_card = QFrame()
+        self.library_card.setStyleSheet(f"""
+            QFrame {{
+                background: {COLORS['surface']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 12px;
+            }}
+        """)
+        library_card_layout = QVBoxLayout(self.library_card)
+        library_card_layout.setContentsMargins(16, 14, 16, 14)
+        library_card_layout.setSpacing(8)
+        self._section_title(library_card_layout, "Library")
+
+        lib_btn_row = QHBoxLayout()
+        lib_btn_row.setSpacing(8)
+        lib_btn_row.setContentsMargins(0, 0, 0, 0)
+
+        self.fav_btn = QPushButton("☆  Favorite")
+        self.fav_btn.setFont(QFont("DM Sans", 11))
+        self.fav_btn.setCheckable(False)
+        self.fav_btn.clicked.connect(self._on_favorite_clicked)
+        lib_btn_row.addWidget(self.fav_btn)
+
+        self.hide_btn = QPushButton("⊘  Hide")
+        self.hide_btn.setFont(QFont("DM Sans", 11))
+        self.hide_btn.setCheckable(False)
+        self.hide_btn.clicked.connect(self._on_hide_clicked)
+        lib_btn_row.addWidget(self.hide_btn)
+
+        library_card_layout.addLayout(lib_btn_row)
+
+        self.track_versions_btn = QPushButton("🔔  Track Version Updates…")
+        self.track_versions_btn.setFont(QFont("DM Sans", 11))
+        self.track_versions_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                color: {COLORS['text_muted']};
+                padding: 7px 10px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['text']};
+                background: {COLORS['surface3']};
+            }}
+        """)
+        self.track_versions_btn.clicked.connect(self._on_track_versions_clicked)
+        library_card_layout.addWidget(self.track_versions_btn)
+
+        self.right_layout.addWidget(self.library_card)
 
         # Install card
         self.install_card = QFrame()
@@ -587,6 +644,56 @@ class GameDetailView(QWidget):
                 row = _InfoRow(label, value, mono=(label == "Wine Prefix"))
                 self.info_card_layout.addWidget(row)
 
+        # ── Playtime row ──────────────────────────────────────────────────────
+        try:
+            playtime_mins = int(_safe_get(game, "playtime_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            playtime_mins = 0
+        last_played = _safe_get(game, "last_played")
+
+        from playtime import format_playtime
+        playtime_str = format_playtime(playtime_mins)
+        playtime_row = _InfoRow("Playtime", playtime_str)
+        self.info_card_layout.addWidget(playtime_row)
+
+        if last_played:
+            try:
+                import datetime as _dt
+                dt = _dt.datetime.fromisoformat(
+                    str(last_played).replace("T", " ")[:19])
+                delta = (_dt.datetime.utcnow() - dt).days
+                if delta == 0:
+                    lp_str = "Today"
+                elif delta == 1:
+                    lp_str = "Yesterday"
+                else:
+                    lp_str = f"{delta} days ago"
+                lp_row = _InfoRow("Last Played", lp_str)
+                self.info_card_layout.addWidget(lp_row)
+            except (ValueError, TypeError):
+                pass
+
+        # ── Version tracking rows ─────────────────────────────────────────────
+        # Always show, even when Unknown — gives user a clear hook to add trackers.
+        try:
+            best = db.get_best_versions_for_game(game_id)
+        except Exception:
+            best = {"dotted": None, "plain": None,
+                    "dotted_url": None, "plain_url": None,
+                    "dotted_checked_at": None, "plain_checked_at": None}
+
+        import version_check as _vc
+        for label, val_key, url_key, checked_key in [
+            ("Latest (v)",     "dotted", "dotted_url", "dotted_checked_at"),
+            ("Latest (build)", "plain",  "plain_url",  "plain_checked_at"),
+        ]:
+            val     = best.get(val_key)
+            src_url = best.get(url_key)
+            checked = best.get(checked_key)
+            display = val or "Unknown"
+            row = _VersionRow(label, display, src_url, checked)
+            self.info_card_layout.addWidget(row)
+
         # Install tag info
         try:
             raw_tag2 = game["install_tag"]
@@ -621,6 +728,9 @@ class GameDetailView(QWidget):
         else:
             self.install_btn.show()
             self.launch_btn.hide()
+
+        # Update library action buttons (favorite / hide)
+        self._update_library_buttons(game)
 
         # Screenshots
         for i in reversed(range(self.screenshots_layout.count())):
@@ -682,6 +792,111 @@ class GameDetailView(QWidget):
         except Exception:
             pass
 
+    def _update_library_buttons(self, game):
+        """Sync fav_btn and hide_btn labels/styles with current game_state."""
+        try:
+            is_fav    = bool(game["is_favorite"]) if "is_favorite" in game.keys() else False
+            is_hidden = bool(game["is_hidden"])   if "is_hidden"   in game.keys() else False
+        except (TypeError, KeyError):
+            gs = db.get_game_state(self._game_id)
+            is_fav    = bool(gs["is_favorite"]) if gs else False
+            is_hidden = bool(gs["is_hidden"])   if gs else False
+
+        # Favorite button
+        if is_fav:
+            self.fav_btn.setText("★  Unfavorite")
+            self.fav_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(232,199,106,0.12);
+                    border: 1px solid rgba(232,199,106,0.5);
+                    border-radius: 8px;
+                    color: {COLORS['accent']};
+                    padding: 7px 10px;
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{
+                    background: rgba(232,199,106,0.20);
+                }}
+            """)
+        else:
+            self.fav_btn.setText("☆  Favorite")
+            self.fav_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface2']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 8px;
+                    color: {COLORS['text_muted']};
+                    padding: 7px 10px;
+                }}
+                QPushButton:hover {{
+                    color: {COLORS['accent']};
+                    border-color: rgba(232,199,106,0.4);
+                    background: rgba(232,199,106,0.06);
+                }}
+            """)
+
+        # Hide button
+        if is_hidden:
+            self.hide_btn.setText("👁  Unhide")
+            self.hide_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: rgba(107,114,128,0.15);
+                    border: 1px solid rgba(107,114,128,0.4);
+                    border-radius: 8px;
+                    color: {COLORS['text_dim']};
+                    padding: 7px 10px;
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{
+                    background: rgba(107,114,128,0.25);
+                    color: {COLORS['text']};
+                }}
+            """)
+        else:
+            self.hide_btn.setText("⊘  Hide")
+            self.hide_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface2']};
+                    border: 1px solid {COLORS['border']};
+                    border-radius: 8px;
+                    color: {COLORS['text_muted']};
+                    padding: 7px 10px;
+                }}
+                QPushButton:hover {{
+                    color: {COLORS['text_dim']};
+                    background: {COLORS['surface3']};
+                }}
+            """)
+
+    def _on_favorite_clicked(self):
+        if not self._game_id:
+            return
+        gs = db.get_game_state(self._game_id)
+        currently_fav = bool(gs["is_favorite"]) if gs else False
+        db.set_favorite(self._game_id, not currently_fav)
+        # Reload detail view and notify main window
+        self.load_game(self._game_id)
+        self.install_finished.emit(self._game_id)
+
+    def _on_hide_clicked(self):
+        if not self._game_id:
+            return
+        gs = db.get_game_state(self._game_id)
+        currently_hidden = bool(gs["is_hidden"]) if gs else False
+        db.set_hidden(self._game_id, not currently_hidden)
+        # Reload detail view and notify main window
+        self.load_game(self._game_id)
+        self.install_finished.emit(self._game_id)
+
+    def _on_track_versions_clicked(self):
+        """Open the VersionTrackerDialog for this game."""
+        if not self._game_id:
+            return
+        from ui.version_tracker_dialog import VersionTrackerDialog
+        dlg = VersionTrackerDialog(self._game_id, parent=self)
+        dlg.versions_updated.connect(lambda gid: self.load_game(gid))
+        dlg.exec()
+
     def _on_install_clicked(self):
         if not self._game_id:
             return
@@ -712,13 +927,17 @@ class GameDetailView(QWidget):
         if desktop_path and Path(desktop_path).exists():
             try:
                 exec_line = None
+                wine_bin_from_desktop = "wine"
                 for line in Path(desktop_path).read_text().splitlines():
                     if line.startswith("Exec="):
                         exec_line = line[5:].strip()
-                        break
+                    # Try to extract wine_bin from the env command in Exec= line
+                    # so we can choose the right watcher strategy
                 if exec_line:
-                    subprocess.Popen(exec_line, shell=True)
+                    proc = subprocess.Popen(exec_line, shell=True)
                     log.info("Launched via .desktop Exec: %s", exec_line)
+                    self.game_launched.emit(
+                        self._game_id, proc, wine_bin_from_desktop, wine_prefix)
                     return
             except Exception as e:
                 log.warning(".desktop exec failed: %s — falling back", e)
@@ -748,13 +967,11 @@ class GameDetailView(QWidget):
                 cmd = [wine_bin, "run", exe_path]
             else:
                 cmd = [wine_bin, exe_path]
-            subprocess.Popen(cmd, env=env)
+            proc = subprocess.Popen(cmd, env=env)
             log.info("Launched: %s %s (WINEPREFIX=%s)", wine_bin, exe_path, wine_prefix)
+            self.game_launched.emit(self._game_id, proc, wine_bin, wine_prefix)
         except Exception as e:
             QMessageBox.warning(self, "Launch Error", f"Could not launch game:\n{e}")
-        except Exception as e:
-            QMessageBox.warning(self, "Launch Error",
-                                f"Could not start game:\n{e}")
 
     def _on_open_folder(self):
         """Open the game's install folder in the file manager."""
@@ -890,6 +1107,14 @@ class GameDetailView(QWidget):
         self.install_finished.emit(game_id)
 
 
+def _safe_get(row, key, default=None):
+    """Safely get a value from a sqlite3.Row, returning default if key missing."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
 def _file_type_label(file_type: str) -> str:
     return {
         "rar":   "RAR Archive",
@@ -937,6 +1162,88 @@ class _InfoRow(QWidget):
 
         row.addWidget(lbl)
         row.addWidget(val, 1)
+        outer.addWidget(content)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background: {COLORS['border']}; border: none;")
+        outer.addWidget(sep)
+
+
+class _VersionRow(QWidget):
+    """
+    Info card row for "Latest (v)" and "Latest (build)" version data.
+    Shows the version value (or "Unknown") with a small staleness note.
+    When a source URL is known, the value is rendered as a clickable link.
+    """
+    def __init__(self, label: str, value: str,
+                 source_url: str = None, checked_at: str = None,
+                 parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(content)
+        row.setContentsMargins(0, 6, 0, 4)
+        row.setSpacing(8)
+
+        lbl = QLabel(label)
+        lbl.setFont(QFont("DM Sans", 11))
+        lbl.setStyleSheet(f"color: {COLORS['text_muted']}; background: transparent;")
+        lbl.setFixedWidth(95)
+        row.addWidget(lbl)
+
+        val_col = QVBoxLayout()
+        val_col.setSpacing(1)
+        val_col.setContentsMargins(0, 0, 0, 0)
+
+        is_unknown = (value == "Unknown" or not value)
+        val_color  = COLORS["text_muted"] if is_unknown else COLORS["text"]
+
+        if source_url and not is_unknown:
+            # Clickable link
+            val_lbl = QLabel(
+                f'<a href="{source_url}" style="color:{COLORS["accent2"]};'
+                f' text-decoration:underline;">{value}</a>'
+            )
+            val_lbl.setOpenExternalLinks(True)
+        else:
+            val_lbl = QLabel(value)
+            val_lbl.setStyleSheet(
+                f"color: {val_color}; font-weight: 500; background: transparent;")
+
+        val_lbl.setFont(QFont("DM Mono", 10))
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        val_col.addWidget(val_lbl)
+
+        # Staleness note
+        if checked_at and not is_unknown:
+            import datetime
+            try:
+                dt = datetime.datetime.fromisoformat(
+                    str(checked_at).replace("T", " ")[:19])
+                delta = (datetime.datetime.utcnow() - dt).days
+                if delta == 0:
+                    age = "checked today"
+                elif delta == 1:
+                    age = "checked 1 day ago"
+                else:
+                    age = f"checked {delta} days ago"
+                age_lbl = QLabel(age)
+                age_lbl.setFont(QFont("DM Mono", 8))
+                age_lbl.setStyleSheet(
+                    f"color: {COLORS['text_muted']}; background: transparent;")
+                age_lbl.setAlignment(
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                val_col.addWidget(age_lbl)
+            except (ValueError, TypeError):
+                pass
+
+        row.addLayout(val_col, 1)
         outer.addWidget(content)
 
         sep = QFrame()

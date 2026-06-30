@@ -109,7 +109,7 @@ source "${SCRIPT_DIR}/.build_venv/bin/activate"
 
 info "Installing app dependencies into build venv..."
 pip install --quiet --upgrade pip
-pip install --quiet PyQt6 requests py7zr rarfile Pillow pyyaml
+pip install --quiet PyQt6 requests py7zr rarfile Pillow pyyaml beautifulsoup4
 VENV_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])")
 success "Dependencies installed. Site-packages: ${VENV_SITE}"
 
@@ -140,6 +140,9 @@ cp "${SCRIPT_DIR}/installer.py" "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/protondb.py"  "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/steamdb.py"   "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/redists.py"   "${APPDIR}/usr/bin/"
+cp "${SCRIPT_DIR}/version_check.py" "${APPDIR}/usr/bin/"
+cp "${SCRIPT_DIR}/version_checker.py" "${APPDIR}/usr/bin/"
+cp "${SCRIPT_DIR}/playtime.py"      "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/ui/"*.py      "${APPDIR}/usr/bin/ui/"
 cp "${SCRIPT_DIR}/assets/"*     "${APPDIR}/usr/bin/assets/" 2>/dev/null || true
 success "App source files copied."

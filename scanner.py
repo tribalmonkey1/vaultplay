@@ -366,7 +366,7 @@ def _register_game(folder_path: Path, category: str,
     display_name = folder_display_name(folder_name)
     try:
         info = classify_folder(folder_path)
-        db.upsert_game(
+        game_id = db.upsert_game(
             folder_name  = folder_name,
             nas_path     = str(folder_path),
             display_name = display_name,
@@ -381,6 +381,11 @@ def _register_game(folder_path: Path, category: str,
             counters["updated"] += 1
         else:
             counters["new"] += 1
+            # Track the game_id so the caller can pass newly-discovered games
+            # to the version auto-track worker after the scan completes.
+            # Blacklisted games are never registered (scanner skips those
+            # categories entirely), so no blacklist filter needed here.
+            counters.setdefault("new_game_ids", []).append(game_id)
             log.info("New game: %s [%s] in %s",
                      display_name, info["install_tag"], category)
     except Exception as e:
@@ -454,9 +459,17 @@ def scan_nas(nas_path: str, progress_callback=None) -> dict:
              time.monotonic())
 
     return {
-        "total":      total,
-        "new":        counters["new"],
-        "updated":    counters["updated"],
-        "errors":     counters["errors"],
-        "categories": cats_found,
+        "total":        total,
+        "new":          counters["new"],
+        "updated":      counters["updated"],
+        "errors":       counters["errors"],
+        "categories":   cats_found,
+        # List of game IDs for games first seen in this scan.
+        # Used by VersionAutoTrackWorker to run the auto-track pass against
+        # only the genuinely new games, not the whole library.
+        # NOTE: blacklisted categories are already excluded here passively —
+        # scanner.py never walks their folders, so no games from blacklisted
+        # categories ever appear in this list. If scanner.py's blacklist
+        # handling ever changes, revisit this assumption.
+        "new_game_ids": counters.get("new_game_ids", []),
     }

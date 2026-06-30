@@ -30,6 +30,8 @@ if _parent not in _sys.path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 import logging
+from dataclasses import dataclass, field
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
@@ -45,6 +47,95 @@ from ui.style import COLORS
 log = logging.getLogger(__name__)
 
 TILE_WIDTHS = {"small": 130, "medium": 160, "large": 200}
+
+
+# ── Filter state ──────────────────────────────────────────────────────────────
+
+@dataclass
+class FilterState:
+    """
+    Composable filter applied to the library tile grid.
+
+    Groups are AND-ed: a game must pass every active group to be shown.
+
+    Group A — sidebar quick-filter (mutually exclusive):
+        "all"         show all non-hidden games (default)
+        "installed"   only installed games
+        "uninstalled" only not-installed games
+        "favorites"   only favorited games
+        "recent"      recently added/scanned games (window controlled by
+                      "recently_added_days" setting, default 14 days)
+
+    Group B — category (folder name from NAS, e.g. "PC", "Switch"):
+        None = no category filter
+
+    Group D — completion status:
+        None = no completion filter
+        One of: "unplayed", "in_progress", "completed", "abandoned"
+
+    Search — substring match against title (case-insensitive):
+        "" = no search filter
+
+    Hidden games:
+        Never shown unless sidebar_key == "hidden".
+        Even "all" excludes hidden games.
+    """
+    sidebar_key:  str            = "all"
+    category:     Optional[str]  = None
+    completion:   Optional[str]  = None
+    search:       str            = ""
+
+    def page_title(self) -> str:
+        """Return the header title appropriate for the current filter state."""
+        titles = {
+            "all":         "All Games",
+            "installed":   "Installed",
+            "uninstalled": "Not Installed",
+            "favorites":   "Favorites",
+            "recent":      "Recently Added",
+            "hidden":      "Hidden Games",
+        }
+        base = titles.get(self.sidebar_key, self.sidebar_key)
+        if self.category:
+            # Category view — title is set by the caller from the DB display name
+            return base
+        return base
+
+    def with_sidebar(self, key: str) -> "FilterState":
+        """Return a copy with sidebar_key changed."""
+        return FilterState(
+            sidebar_key=key,
+            category=self.category,
+            completion=self.completion,
+            search=self.search,
+        )
+
+    def with_category(self, cat: Optional[str]) -> "FilterState":
+        """Return a copy with category changed."""
+        return FilterState(
+            sidebar_key=self.sidebar_key,
+            category=cat,
+            completion=self.completion,
+            search=self.search,
+        )
+
+    def with_completion(self, status: Optional[str]) -> "FilterState":
+        """Return a copy with completion status changed."""
+        return FilterState(
+            sidebar_key=self.sidebar_key,
+            category=self.category,
+            completion=status,
+            search=self.search,
+        )
+
+    def with_search(self, text: str) -> "FilterState":
+        """Return a copy with search text changed."""
+        return FilterState(
+            sidebar_key=self.sidebar_key,
+            category=self.category,
+            completion=self.completion,
+            search=text,
+        )
 
 
 # ── Async image loader ────────────────────────────────────────────────────────
@@ -74,27 +165,29 @@ class ImageLoader(QRunnable):
 # ── Game tile ─────────────────────────────────────────────────────────────────
 
 class GameTile(QFrame):
-    clicked = pyqtSignal(int)
+    clicked        = pyqtSignal(int)
+    state_changed  = pyqtSignal(int)   # game_id — emitted after context menu action
+    track_versions = pyqtSignal(int)   # game_id — open VersionTrackerDialog
 
     def __init__(self, game, tile_width: int = 160, parent=None):
         super().__init__(parent)
-        self.game_id    = game["id"]
-        self.tile_width = tile_width
-        cover_h         = int(tile_width * 1.5)
+        self.game_id     = game["id"]
+        self.tile_width  = tile_width
+        self._is_favorite = bool(_safe_get(game, "is_favorite", 0))
+        self._is_hidden   = bool(_safe_get(game, "is_hidden",   0))
 
-        self.setFixedWidth(tile_width)
+        cover_h = int(tile_width * 1.5)
+        tile_h  = cover_h + 32   # cover + footer (8px top + ~14px label + 10px bottom)
+
+        self.setFixedSize(tile_width, tile_h)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
 
-        # Hover handled entirely by CSS :hover — no enterEvent/leaveEvent,
-        # no runtime setStyleSheet() calls, which caused layout jitter.
         self.setStyleSheet(f"""
             QFrame {{
                 background: {COLORS['surface']};
                 border: 1px solid {COLORS['border']};
                 border-radius: 10px;
-            }}
-            QFrame:hover {{
-                border-color: rgba(255,255,255,0.18);
             }}
         """)
 
@@ -133,7 +226,8 @@ class GameTile(QFrame):
         footer_layout.addWidget(title_label)
         layout.addWidget(footer)
 
-        # Installed badge overlay
+        # ── Badge overlays ────────────────────────────────────────────────────
+        # Installed badge — top-right
         if game["is_installed"]:
             badge = QLabel("Installed")
             badge.setParent(self)
@@ -150,6 +244,24 @@ class GameTile(QFrame):
             badge.adjustSize()
             badge.move(tile_width - badge.width() - 8, 8)
             badge.show()
+
+        # Favorite badge — top-left gold star
+        if self._is_favorite:
+            fav_badge = QLabel("★")
+            fav_badge.setParent(self)
+            fav_badge.setFont(QFont("DM Sans", 11))
+            fav_badge.setStyleSheet(f"""
+                QLabel {{
+                    background: rgba(232,199,106,0.18);
+                    border: 1px solid rgba(232,199,106,0.45);
+                    border-radius: 4px;
+                    color: {COLORS['accent']};
+                    padding: 1px 5px;
+                }}
+            """)
+            fav_badge.adjustSize()
+            fav_badge.move(8, 8)
+            fav_badge.show()
 
     def set_cover_image(self, local_path: str):
         pix = QPixmap(local_path)
@@ -170,6 +282,59 @@ class GameTile(QFrame):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.game_id)
+
+    def contextMenuEvent(self, event):
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                padding: 4px 0;
+                color: {COLORS['text']};
+            }}
+            QMenu::item {{
+                padding: 7px 20px 7px 14px;
+                font-size: 12px;
+            }}
+            QMenu::item:selected {{
+                background: {COLORS['surface3']};
+                border-radius: 4px;
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {COLORS['border']};
+                margin: 3px 8px;
+            }}
+        """)
+
+        # Favorite action
+        if self._is_favorite:
+            fav_action = menu.addAction("★  Remove from Favorites")
+        else:
+            fav_action = menu.addAction("☆  Add to Favorites")
+
+        # Hide action
+        menu.addSeparator()
+        if self._is_hidden:
+            hide_action = menu.addAction("👁  Unhide Game")
+        else:
+            hide_action = menu.addAction("⊘  Hide Game")
+
+        # Version tracking
+        menu.addSeparator()
+        track_action = menu.addAction("🔔  Track Version Updates…")
+
+        chosen = menu.exec(event.globalPos())
+        if chosen == fav_action:
+            db.set_favorite(self.game_id, not self._is_favorite)
+            self.state_changed.emit(self.game_id)
+        elif chosen == hide_action:
+            db.set_hidden(self.game_id, not self._is_hidden)
+            self.state_changed.emit(self.game_id)
+        elif chosen == track_action:
+            self.track_versions.emit(self.game_id)
 
 
 # ── Trickle viewport event filter ────────────────────────────────────────────
@@ -221,23 +386,24 @@ class TrickleViewportFilter(QObject):
 # ── Library View ──────────────────────────────────────────────────────────────
 
 class LibraryView(QWidget):
-    game_selected     = pyqtSignal(int)
-    refresh_requested = pyqtSignal(str)
-    trickle_finished  = pyqtSignal()
+    game_selected          = pyqtSignal(int)
+    refresh_requested      = pyqtSignal(str)
+    trickle_finished       = pyqtSignal()
+    game_state_changed     = pyqtSignal(int)   # game_id — emitted after favorite/hide from tile
+    track_versions_requested = pyqtSignal(int) # game_id — open VersionTrackerDialog
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._all_games    : list = []
-        self._filter_key   : str  = "all"
-        self._search_text  : str  = ""
+        self._filter_state : FilterState = FilterState()
         self._tiles        : dict[int, GameTile] = {}
 
-        # Trickle state
-        self._trickle_queue   : list = []
-        self._trickle_active  : bool = False
-        self._trickle_gen     : int  = 0
+        # Generation counter — incremented on each new load to cancel stale image loads
+        self._trickle_queue  : list = []
+        self._trickle_gen    : int  = 0
+        self._trickle_active : bool = False
 
-        # Current row being filled
+        # Current row state (used during synchronous grid build)
         self._current_row_widget : QWidget | None     = None
         self._current_row_layout : QHBoxLayout | None = None
         self._tiles_in_row       : int = 0
@@ -308,18 +474,20 @@ class LibraryView(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.scroll.setStyleSheet(f"background: {COLORS['bg']}; border: none;")
 
-        # Event filter that blocks mouse-move events on the viewport during
-        # trickle — prevents QScrollArea::updateScrollBars() being triggered by
-        # hover, which was repositioning the content widget mid-load.
+        # Event filter that blocks mouse-move events during trickle.
+        # Installed on viewport(), _outer, and _rows_widget — mouse events
+        # land on the tile widgets directly, not on the viewport, so the
+        # filter must be on the content widget tree as well.
         self._viewport_filter = TrickleViewportFilter(self)
         self.scroll.viewport().installEventFilter(self._viewport_filter)
 
         # Outer container holds rows widget + empty label
-        outer = QWidget()
-        outer.setStyleSheet(f"background: {COLORS['bg']};")
-        outer_layout = QVBoxLayout(outer)
+        self._outer = QWidget()
+        self._outer.setStyleSheet(f"background: {COLORS['bg']};")
+        outer_layout = QVBoxLayout(self._outer)
         outer_layout.setContentsMargins(28, 24, 28, 28)
         outer_layout.setSpacing(0)
         outer_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -349,7 +517,13 @@ class LibraryView(QWidget):
         # every addWidget() during trickle, physically shifting rows upward each
         # time a new row is appended. AlignTop already pins content to the top.
 
-        self.scroll.setWidget(outer)
+        # Mouse events land on tile widgets which are children of _outer and
+        # _rows_widget, not on the viewport itself — so install the filter here
+        # too, not just on scroll.viewport().
+        self._outer.installEventFilter(self._viewport_filter)
+        self._rows_widget.installEventFilter(self._viewport_filter)
+
+        self.scroll.setWidget(self._outer)
         root.addWidget(self.scroll, 1)
 
         self._status_timer = QTimer()
@@ -369,20 +543,70 @@ class LibraryView(QWidget):
         self._start_trickle(self._filtered_games())
 
     def apply_filter(self, key: str):
-        self._filter_key = key
+        """
+        Set the Group A sidebar key.
+
+        Accepts the same string keys as before ("all", "installed",
+        "uninstalled", "cat:<folder>") plus new Group A keys ("favorites",
+        "recent", "hidden"). Category keys ("cat:<folder>") also set
+        filter_state.category so the two filters stay in sync.
+        """
+        if key.startswith("cat:"):
+            folder = key[4:]
+            self._filter_state = FilterState(
+                sidebar_key="all",
+                category=folder,
+                completion=self._filter_state.completion,
+                search=self._filter_state.search,
+            )
+        else:
+            self._filter_state = FilterState(
+                sidebar_key=key,
+                category=None,
+                completion=self._filter_state.completion,
+                search=self._filter_state.search,
+            )
+        self._update_page_title()
+        self._start_trickle(self._filtered_games())
+
+    def set_filter_state(self, state: FilterState):
+        """
+        Replace the entire filter state at once.
+        Used by future cogwheel menu / tag filter / completion filter UI.
+        """
+        self._filter_state = state
+        self._update_page_title()
+        self._start_trickle(self._filtered_games())
+
+    def get_filter_state(self) -> FilterState:
+        """Return the current filter state (read-only copy)."""
+        return FilterState(
+            sidebar_key=self._filter_state.sidebar_key,
+            category=self._filter_state.category,
+            completion=self._filter_state.completion,
+            search=self._filter_state.search,
+        )
+
+    def set_page_title(self, title: str):
+        self.page_title.setText(title)
+
+    def _update_page_title(self):
+        """Sync the header title with current filter state."""
+        fs = self._filter_state
+        if fs.category:
+            # Caller is responsible for setting the display name via
+            # set_page_title() after resolving from DB, as before.
+            return
         titles = {
             "all":         "All Games",
             "installed":   "Installed",
             "uninstalled": "Not Installed",
+            "favorites":   "Favorites",
+            "recent":      "Recently Added",
+            "hidden":      "Hidden Games",
         }
-        if key in titles:
-            self.page_title.setText(titles[key])
-        elif key.startswith("cat:"):
-            self.page_title.setText(key[4:])
-        self._start_trickle(self._filtered_games())
-
-    def set_page_title(self, title: str):
-        self.page_title.setText(title)
+        if fs.sidebar_key in titles:
+            self.page_title.setText(titles[fs.sidebar_key])
 
     def show_status(self, message: str, timeout: int = 0):
         self.status_bar.setText(message)
@@ -404,22 +628,56 @@ class LibraryView(QWidget):
     # ── Filtering ─────────────────────────────────────────────────────────────
 
     def _filtered_games(self) -> list:
+        """
+        Apply FilterState to self._all_games and return the matching subset.
+
+        Group A (sidebar_key) and Group B (category) are AND-ed.
+        Group D (completion) is AND-ed on top of those.
+        Search is AND-ed last.
+
+        Hidden games are excluded from every view except sidebar_key == "hidden".
+        """
+        fs    = self._filter_state
         games = self._all_games
-        if self._filter_key == "installed":
+
+        # ── Hidden gate ───────────────────────────────────────────────────────
+        # Must come first: "hidden" view shows ONLY hidden; everything else
+        # excludes hidden entirely.
+        if fs.sidebar_key == "hidden":
+            games = [g for g in games if _safe_get(g, "is_hidden", 0)]
+        else:
+            games = [g for g in games if not _safe_get(g, "is_hidden", 0)]
+
+        # ── Group A — sidebar quick-filter ────────────────────────────────────
+        if fs.sidebar_key == "installed":
             games = [g for g in games if g["is_installed"]]
-        elif self._filter_key == "uninstalled":
+        elif fs.sidebar_key == "uninstalled":
             games = [g for g in games if not g["is_installed"]]
-        elif self._filter_key.startswith("cat:"):
-            folder = self._filter_key[4:]
-            games  = [g for g in games if _safe_get(g, "category") == folder]
-        if self._search_text:
-            q     = self._search_text.lower()
+        elif fs.sidebar_key == "favorites":
+            games = [g for g in games if _safe_get(g, "is_favorite", 0)]
+        elif fs.sidebar_key == "recent":
+            games = _filter_recent(games)
+        # "all" and "hidden" require no additional pass here
+
+        # ── Group B — category ────────────────────────────────────────────────
+        if fs.category:
+            games = [g for g in games if _safe_get(g, "category") == fs.category]
+
+        # ── Group D — completion status ───────────────────────────────────────
+        if fs.completion:
+            games = [g for g in games
+                     if _safe_get(g, "completion_status", "unplayed") == fs.completion]
+
+        # ── Search ────────────────────────────────────────────────────────────
+        if fs.search:
+            q     = fs.search.lower()
             games = [g for g in games
                      if q in (g["title"] or g["display_name"] or "").lower()]
+
         return games
 
     def _on_search(self, text: str):
-        self._search_text = text
+        self._filter_state = self._filter_state.with_search(text)
         self._start_trickle(self._filtered_games())
 
     # ── Trickle rendering ─────────────────────────────────────────────────────
@@ -427,7 +685,8 @@ class LibraryView(QWidget):
     def _start_trickle(self, games: list):
         # Cancel any running trickle
         self._trickle_gen += 1
-        self._trickle_active     = False
+        self._trickle_active = False
+        self._viewport_filter.set_active(False)
 
         # Clear all rows
         while self._rows_layout.count():
@@ -459,9 +718,8 @@ class LibraryView(QWidget):
         self._cols      = cols
         self._last_cols = cols
 
-        self._trickle_queue  = list(games)
         self._trickle_active = True
-        self._viewport_filter.set_active(True)   # block mouse events during trickle
+        self._viewport_filter.set_active(True)
         my_gen = self._trickle_gen
 
         def add_next():
@@ -472,7 +730,6 @@ class LibraryView(QWidget):
             tiles_placed = 0
             while tiles_placed < 5:
                 if not self._trickle_queue:
-                    # Flush any partially-filled last row
                     if self._current_row_widget is not None:
                         self._current_row_layout.addStretch()
                         self._rows_layout.addWidget(self._current_row_widget)
@@ -480,19 +737,14 @@ class LibraryView(QWidget):
                         self._current_row_layout = None
                         self._tiles_in_row       = 0
                     self._trickle_active = False
-                    self._viewport_filter.set_active(False)  # restore mouse events
+                    self._viewport_filter.set_active(False)
                     self._unlock_refresh()
                     self.trickle_finished.emit()
                     return
 
-                game    = self._trickle_queue.pop(0)
-                tile_sz = db.get_setting("tile_size", "medium")
-                tw      = TILE_WIDTHS.get(tile_sz, 160)
+                game   = self._trickle_queue.pop(0)
+                tw     = TILE_WIDTHS.get(db.get_setting("tile_size", "medium"), 160)
 
-                # Build row widget detached from _rows_layout until the row is
-                # full. Previously the row was added to the live layout before any
-                # tiles landed in it, then each tile triggered a layout pass on the
-                # live tree — cols+1 passes per row. Now: 1 pass per completed row.
                 if self._current_row_layout is None:
                     row_widget = QWidget()
                     row_widget.setStyleSheet("background: transparent;")
@@ -506,6 +758,8 @@ class LibraryView(QWidget):
 
                 tile = GameTile(game, tw)
                 tile.clicked.connect(self.game_selected)
+                tile.state_changed.connect(self.game_state_changed)
+                tile.track_versions.connect(self.track_versions_requested)
                 self._current_row_layout.addWidget(tile)
                 self._tiles[game["id"]] = tile
                 self._tiles_in_row += 1
@@ -517,7 +771,6 @@ class LibraryView(QWidget):
                     loader.signals.loaded.connect(self._on_image_loaded)
                     self._pool.start(loader)
 
-                # Row complete — attach to live layout in one shot
                 if self._tiles_in_row >= self._cols:
                     self._current_row_layout.addStretch()
                     self._rows_layout.addWidget(self._current_row_widget)
@@ -525,9 +778,10 @@ class LibraryView(QWidget):
                     self._current_row_layout = None
                     self._tiles_in_row       = 0
 
-            QTimer.singleShot(8, add_next)
+            QTimer.singleShot(0, add_next)
 
-        QTimer.singleShot(8, add_next)
+        self._trickle_queue = list(games)
+        QTimer.singleShot(0, add_next)
 
     def _on_image_loaded(self, game_id: int, local_path: str):
         tile = self._tiles.get(game_id)
@@ -562,6 +816,8 @@ class LibraryView(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._all_games:
+            log.debug("resizeEvent: new size=%s trickle_active=%s",
+                      event.size(), self._trickle_active)
             self._resize_timer.start()
 
     def _on_resize_settled(self):
@@ -571,8 +827,14 @@ class LibraryView(QWidget):
         tile_w    = TILE_WIDTHS.get(tile_size, 160)
         avail_w   = self.scroll.viewport().width()
         new_cols  = max(1, avail_w // (tile_w + 16))
-        if new_cols != self._last_cols:
-            self._start_trickle(self._filtered_games())
+        log.debug("_on_resize_settled: avail_w=%d new_cols=%d last_cols=%d trickle_active=%s",
+                  avail_w, new_cols, self._last_cols, self._trickle_active)
+        if new_cols == self._last_cols:
+            return
+        width_delta = abs(avail_w - (self._last_cols * (tile_w + 16)))
+        if self._trickle_active and width_delta < tile_w:
+            return
+        self._start_trickle(self._filtered_games())
 
     # ── Refresh button ────────────────────────────────────────────────────────
 
@@ -629,3 +891,31 @@ def _safe_get(row, key, default=None):
         return row[key]
     except (IndexError, KeyError):
         return default
+
+
+def _filter_recent(games: list) -> list:
+    """
+    Return games first_seen within the configured recently-added window.
+    Window is controlled by the "recently_added_days" setting (default 14).
+    Falls back to returning all games if the setting is missing or dates
+    can't be parsed, so the filter is always safe to call.
+    """
+    import datetime
+    try:
+        days = int(db.get_setting("recently_added_days", "14"))
+    except (ValueError, TypeError):
+        days = 14
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    result = []
+    for g in games:
+        first_seen = _safe_get(g, "first_seen")
+        if not first_seen:
+            continue
+        try:
+            # SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS"
+            dt = datetime.datetime.fromisoformat(str(first_seen).replace("T", " ")[:19])
+            if dt >= cutoff:
+                result.append(g)
+        except (ValueError, TypeError):
+            pass
+    return result
