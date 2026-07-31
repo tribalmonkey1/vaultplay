@@ -11,6 +11,7 @@ Public API:
     get_redists_path()            → Path to redists.json
     load_redists()                → {app_id_str: [verbs]}
     lookup(steam_app_id)          → list[str] | None
+    refresh_single_game(app_id)   → list[str] | None  (one game, writes immediately)
     refresh_missing(progress_cb)  → int  (games updated)
     refresh_all(progress_cb)      → int  (games updated)
     export_redists(dest_path)     → bool
@@ -18,6 +19,14 @@ Public API:
     get_stats()                   → dict
     is_steamcmd_available()       → bool
     estimate_refresh_seconds(n)   → int
+
+Single-game vs. batch:
+    refresh_single_game() is the one place that actually queries SteamCMD for
+    a Steam App ID and writes the result into redists.json. Both the batch
+    loop (_run_refresh, used by refresh_missing/refresh_all) and any external
+    single-game caller (e.g. Edit Metadata's "Steam App ID changed" re-fetch)
+    go through it, so there's a single source of truth for "check one game
+    and store the result" instead of duplicating that logic per caller.
 """
 
 
@@ -180,6 +189,48 @@ def _query_steamcmd(steam_app_id: int) -> list:
         return []
 
 
+def refresh_single_game(steam_app_id: int, title: str = "",
+                         _data: Optional[dict] = None,
+                         _save: bool = True,
+                         _skip_availability_check: bool = False) -> Optional[list]:
+    """
+    Query SteamCMD for ONE Steam App ID and store the result in redists.json.
+
+    This is the single source of truth for the "check one game" operation.
+    Use this directly for a single-game refresh — e.g. Edit Metadata's
+    "Steam App ID changed" flow should call
+    `redists.refresh_single_game(new_app_id, title)` rather than reaching for
+    steamcmd itself. The batch functions below (_run_refresh, and therefore
+    refresh_missing()/refresh_all()) also call this per game, so there's only
+    one code path that talks to SteamCMD and writes the file.
+
+    Returns:
+        list[str]  — verbs found (may be empty — confirmed no common redists)
+        None       — SteamCMD is not available; caller should check
+                     is_steamcmd_available() itself if it needs to distinguish
+                     "not available" from "checked, found nothing"
+
+    _data / _save / _skip_availability_check are internal — used by
+    _run_refresh() to batch many games against one in-memory dict (avoiding a
+    load/save disk round-trip and a shutil.which() PATH scan per game) instead
+    of calling is_steamcmd_available() and load_redists()/save_redists() on
+    every single iteration. External callers should leave these at defaults.
+    """
+    if not _skip_availability_check and not is_steamcmd_available():
+        log.info("redists: steamcmd not available — skipping app_id=%d", steam_app_id)
+        return None
+
+    data  = _data if _data is not None else load_redists()
+    verbs = _query_steamcmd(steam_app_id)
+    data[str(steam_app_id)] = verbs
+
+    if _save:
+        save_redists(data)
+
+    log.info("redists: app %d (%s) → %s", steam_app_id, title or "?", verbs)
+    return verbs
+
+
 def _get_games_for_refresh(missing_only: bool) -> list:
     """
     Return list of (game_id, title, steam_app_id) for games to refresh.
@@ -218,13 +269,12 @@ def _run_refresh(games: list,
     if not games:
         return 0
 
-    data = load_redists()
+    data  = load_redists()
     count = 0
 
     for i, game in enumerate(games):
-        title    = game["title"]
-        app_id   = game["steam_app_id"]
-        app_key  = str(app_id)
+        title  = game["title"]
+        app_id = game["steam_app_id"]
 
         if progress_cb:
             try:
@@ -232,11 +282,14 @@ def _run_refresh(games: list,
             except Exception:
                 pass
 
-        verbs = _query_steamcmd(app_id)
-        data[app_key] = verbs
+        # _skip_availability_check=True: refresh_missing()/refresh_all() already
+        # verified SteamCMD is available before calling _run_refresh, so we don't
+        # re-run shutil.which() on every single game in a 700-game batch.
+        # _save=False: batch against the one in-memory `data` dict and only
+        # hit disk every 10 games (below) plus once at the end.
+        refresh_single_game(app_id, title, _data=data, _save=False,
+                            _skip_availability_check=True)
         count += 1
-
-        log.debug("redists: app %d (%s) → %s", app_id, title, verbs)
 
         # Save incrementally every 10 games so progress isn't lost on interruption
         if count % 10 == 0:

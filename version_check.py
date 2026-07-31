@@ -87,7 +87,8 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # 4 MB cap — exceeding this → error s
 # ── Version patterns ──────────────────────────────────────────────────────────
 # Ordered most-specific to least-specific.
 # Each entry: (compiled_regex, format_bucket)
-# format_bucket: "dotted" for semantic versions, "plain" for build/revision numbers.
+# format_bucket: "dotted" for semantic versions, "plain" for build/revision
+# numbers, "date" for calendar-date-based versioning.
 #
 # "dotted" bucket — canonical form: one or more numeric segments separated by dots,
 # optionally prefixed with 'v', optionally suffixed with a short label.
@@ -96,10 +97,24 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # 4 MB cap — exceeding this → error s
 # "plain" bucket — long numeric build IDs with no dots.
 # Examples: "Build 11442480", "build 2024031501"
 #
+# "date" bucket — DD.MM.YYYY calendar-date versioning, confirmed common in
+# real NAS release naming (see scanner.py's detect_version() for the same
+# pattern applied to filenames). Kept as a genuinely separate bucket from
+# "dotted" rather than folded in — a date like "14.08.2023" would otherwise
+# get misread as semantic version 14.8.2023 and sort in the wrong order
+# entirely (day-first instead of chronological). See date_sort_key() below.
+#
 # Patterns are applied to individual text lines AFTER HTML stripping and AFTER
 # EXCLUDE_KEYWORDS filtering — see find_versions() for the pipeline.
 
 VERSION_PATTERNS = [
+    # DD.MM.YYYY date-based versioning — checked before the generic dotted
+    # pattern below, since a date is shaped like a 3-segment dotted version
+    # and find_versions() explicitly excludes date-shaped matches from the
+    # dotted bucket (see _looks_like_date()) to avoid double-counting the
+    # same substring into both buckets.
+    (re.compile(r"\b(\d{1,2}\.\d{1,2}\.\d{4})\b"), "date"),
+
     # "updated to version X.Y.Z" / "updated to X.Y.Z"
     (re.compile(
         r"updated\s+to\s+(?:version\s+)?v?(\d+\.\d+(?:\.\d+)*(?:-[a-zA-Z0-9]+)?)(?!\d)(?![.\d])",
@@ -317,6 +332,26 @@ def _filter_lines(text: str) -> list[str]:
     return lines
 
 
+def _looks_like_date(raw: str) -> bool:
+    """
+    True if a dotted-shaped 3-segment string is actually a plausible
+    DD.MM.YYYY calendar date rather than a semantic version — e.g.
+    "21.08.2023" (a date) vs "2.11.0" (a version). Used to keep the
+    generic bare-dotted pattern from double-counting a date match into
+    the "dotted" bucket when the dedicated date pattern already claims it.
+    """
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return False
+    day, month, year = parts
+    if not (day.isdigit() and month.isdigit() and year.isdigit()):
+        return False
+    if len(year) != 4:
+        return False
+    d, m, y = int(day), int(month), int(year)
+    return 1 <= d <= 31 and 1 <= m <= 12 and 1900 <= y <= 2099
+
+
 def find_versions(html_text: str) -> list[tuple[str, str]]:
     """
     Extract all version strings from an HTML page.
@@ -326,6 +361,11 @@ def find_versions(html_text: str) -> list[tuple[str, str]]:
       2. Split into lines, filter EXCLUDE_KEYWORDS lines
       3. Apply VERSION_PATTERNS to each line
       4. Deduplicate (preserve first occurrence of each raw string)
+
+    A date-shaped 3-segment match (see _looks_like_date()) is excluded from
+    the "dotted" bucket even if the generic bare-dotted pattern would also
+    match it — it belongs in "date" only, never both, since the two buckets
+    use incompatible comparison logic (semver-style vs. chronological).
 
     Returns list of (raw_version_string, format_bucket) tuples,
     in order of first appearance.
@@ -339,9 +379,12 @@ def find_versions(html_text: str) -> list[tuple[str, str]]:
         for pattern, fmt in VERSION_PATTERNS:
             for m in pattern.finditer(line):
                 raw = m.group(1).strip()
-                if raw and raw not in seen:
-                    seen.add(raw)
-                    results.append((raw, fmt))
+                if not raw or raw in seen:
+                    continue
+                if fmt == "dotted" and _looks_like_date(raw):
+                    continue
+                seen.add(raw)
+                results.append((raw, fmt))
 
     return results
 
@@ -397,16 +440,40 @@ def sort_key(raw: str) -> tuple:
         return (s,)
 
 
+def date_sort_key(raw: str) -> tuple:
+    """
+    Return a comparable (year, month, day) tuple for a DD.MM.YYYY date
+    version string — chronological ordering, deliberately NOT the same
+    logic as sort_key(). A plain numeric-tuple compare of "14.08.2023" as
+    if it were dotted would sort by day first (14 vs 21) and get the order
+    completely wrong; this reorders to (year, month, day) so comparisons
+    are actually chronological.
+    Returns (0, 0, 0) for anything that doesn't parse as DD.MM.YYYY, so a
+    malformed value always sorts lowest rather than raising.
+    """
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return (0, 0, 0)
+    day, month, year = parts
+    if not (day.isdigit() and month.isdigit() and year.isdigit()):
+        return (0, 0, 0)
+    return (int(year), int(month), int(day))
+
+
 def highest_per_format(matches: list[tuple[str, str]]) -> dict[str, str]:
     """
     Given a list of (raw_str, format_bucket) tuples from find_versions(),
     return the highest version per bucket.
 
-    Returns dict with keys "dotted" and "plain" (either may be None if
-    no match of that type was found):
-        {"dotted": "2.11.0", "plain": None}
+    Returns dict with keys "dotted", "plain", and "date" (any may be None
+    if no match of that type was found):
+        {"dotted": "2.11.0", "plain": None, "date": None}
+
+    "date" is compared using date_sort_key() (chronological), not sort_key()
+    (which "dotted" and "plain" use) — the two are intentionally different,
+    non-interchangeable comparison schemes.
     """
-    best: dict[str, Optional[str]] = {"dotted": None, "plain": None}
+    best: dict[str, Optional[str]] = {"dotted": None, "plain": None, "date": None}
 
     for raw, fmt in matches:
         if fmt not in best:
@@ -416,7 +483,8 @@ def highest_per_format(matches: list[tuple[str, str]]) -> dict[str, str]:
             best[fmt] = raw
         else:
             try:
-                if sort_key(raw) > sort_key(current_best):
+                key_fn = date_sort_key if fmt == "date" else sort_key
+                if key_fn(raw) > key_fn(current_best):
                     best[fmt] = raw
             except TypeError:
                 # Incomparable types (mixed str/int tuple) — keep current
@@ -445,6 +513,7 @@ def check_tracker(tracker_row, is_formula_site: bool = False) -> dict:
             "status":         "ok" | "no_match" | "error",
             "dotted_version": str | None,
             "plain_version":  str | None,
+            "date_version":   str | None,
             "error_msg":      str | None,
             "source_url":     str,
         }
@@ -456,6 +525,7 @@ def check_tracker(tracker_row, is_formula_site: bool = False) -> dict:
             "status":         "error",
             "dotted_version": None,
             "plain_version":  None,
+            "date_version":   None,
             "error_msg":      f"tracker_row missing source_url: {e}",
             "source_url":     "",
         }
@@ -463,6 +533,7 @@ def check_tracker(tracker_row, is_formula_site: bool = False) -> dict:
     result_base = {
         "dotted_version": None,
         "plain_version":  None,
+        "date_version":   None,
         "source_url":     source_url,
     }
 
@@ -524,15 +595,17 @@ def check_tracker(tracker_row, is_formula_site: bool = False) -> dict:
 
     dotted = best.get("dotted")
     plain  = best.get("plain")
+    date   = best.get("date")
 
-    if dotted or plain:
-        log.info("[VERSION] %s → dotted=%s plain=%s",
-                 source_url, dotted, plain)
+    if dotted or plain or date:
+        log.info("[VERSION] %s → dotted=%s plain=%s date=%s",
+                 source_url, dotted, plain, date)
         return {
             **result_base,
             "status":         "ok",
             "dotted_version": dotted,
             "plain_version":  plain,
+            "date_version":   date,
             "error_msg":      None,
         }
     else:
@@ -555,6 +628,7 @@ def check_and_store(tracker_row, is_formula_site: bool = False) -> dict:
         status          = result["status"],
         dotted_version  = result["dotted_version"],
         plain_version   = result["plain_version"],
+        date_version    = result["date_version"],
         error_msg       = result["error_msg"],
     )
     return result

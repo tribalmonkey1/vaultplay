@@ -808,6 +808,43 @@ class SettingsView(QWidget):
             f"color: {COLORS['accent2']}; padding: 8px 0;")
         layout.addWidget(wine_prefix_info)
 
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("Save Backup"))
+
+        save_explain = QLabel(
+            "When enabled, VaultPlay watches a game's Wine prefix the first "
+            "time it's played, detects which folder holds the save data, "
+            "moves it to the location below, and leaves a symlink behind so "
+            "the game keeps saving normally. This protects your save from "
+            "being lost if the Wine prefix is ever deleted (e.g. reinstalling "
+            "with a different Proton version) and makes it easy to sync "
+            "separately (Syncthing, etc.). Off by default."
+        )
+        save_explain.setFont(QFont("DM Sans", 11))
+        save_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 8px;")
+        save_explain.setWordWrap(True)
+        layout.addWidget(save_explain)
+
+        save_toggle = SettingsToggle(
+            db.get_setting("save_backup_enabled", "false") == "true")
+        save_toggle.changed.connect(
+            lambda v: self._save("save_backup_enabled", "true" if v else "false"))
+        self._make_setting_row(layout, "save_backup_enabled",
+                               "Enable Save Backup",
+                               "Detect and back up save files after each play session",
+                               save_toggle)
+
+        save_root_edit = PathEdit(
+            db.get_setting("save_backup_root",
+                          str(Path.home() / "Documents" / "Game Saves")),
+            "Save Backup Location")
+        save_root_edit.changed.connect(lambda v: self._save("save_backup_root", v))
+        self._make_setting_row(layout, "save_backup_root",
+                               "Save Backup Location",
+                               "Where backed-up saves are stored, organized as "
+                               "<location>/PC/<game folder name>/",
+                               save_root_edit)
+
         layout.addStretch()
         return scroll
 

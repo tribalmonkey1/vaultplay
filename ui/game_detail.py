@@ -48,6 +48,7 @@ import db
 import metadata as meta_mod
 import scanner
 import protondb as protondb_mod
+import save_backup
 from ui.style import COLORS, accent_button_style, card_style
 from ui.install_dialog import InstallDialog
 
@@ -694,6 +695,54 @@ class GameDetailView(QWidget):
             row = _VersionRow(label, display, src_url, checked)
             self.info_card_layout.addWidget(row)
 
+        # ── NAS Version / Installed Version (Update & DLC Install Support) ─────
+        # Distinct from Latest(v)/Latest(build) above, which come from the
+        # web version tracker (a scraped page). These reflect what the
+        # scanner itself detected directly from the NAS archive/exe/folder
+        # name (NAS Version, refreshed on every scan), and what's actually
+        # installed right now (Installed Version, set at install time /
+        # after applying an update) — always shown, "Unknown" fallback,
+        # never a blank row.
+        try:
+            nas_version = db.get_nas_version(game_id)
+        except Exception:
+            nas_version = {"dotted": None, "plain": None, "date": None}
+        nas_ver_row = _InfoRow("NAS Version", _format_version_dict(nas_version))
+        self.info_card_layout.addWidget(nas_ver_row)
+
+        if game["is_installed"]:
+            try:
+                installed_version = db.get_installed_version(game_id)
+            except Exception:
+                installed_version = {"dotted": None, "plain": None, "date": None}
+            installed_ver_row = _InfoRow(
+                "Installed Ver.", _format_version_dict(installed_version))
+            self.info_card_layout.addWidget(installed_ver_row)
+
+        # ── Save Backup status ─────────────────────────────────────────────────
+        # Linking happens automatically after the first play session when
+        # the feature is enabled in Settings → Paths (Flow 1). On every
+        # later view of this page, the symlink is re-checked (Flow 2's
+        # cheap check, see save_backup.check_link_status) so a broken link
+        # is visible here even without launching the game.
+        if db.get_setting("save_backup_enabled", "false") == "true":
+            try:
+                save_paths = db.get_save_paths(game_id)
+            except Exception:
+                save_paths = {"save_path": None, "save_source_path": None}
+            link_status = save_backup.check_link_status(
+                save_paths.get("save_source_path"), save_paths.get("save_path"))
+            if link_status == "ok":
+                save_row = _InfoRow("Save Backup", save_paths["save_path"], mono=True)
+            elif link_status == "broken":
+                save_row = _InfoRow(
+                    "Save Backup",
+                    f"⚠ Link broken (was: {save_paths.get('save_path')})",
+                    warn=True)
+            else:
+                save_row = _InfoRow("Save Backup", "Not yet linked")
+            self.info_card_layout.addWidget(save_row)
+
         # Install tag info
         try:
             raw_tag2 = game["install_tag"]
@@ -909,6 +958,134 @@ class GameDetailView(QWidget):
         dlg.install_finished.connect(self._on_install_finished)
         dlg.exec()
 
+    def _maybe_snapshot_before_launch(self, game, wine_bin: str, wine_prefix: str):
+        """
+        Save Backup pre-launch hook, covering all three flows:
+
+        Flow 1 (not yet linked — save_source_path unset, or the canonical
+        backup itself is gone): snapshot the Wine prefix's drive_c before
+        launch so the post-play diff (main_window._maybe_run_save_backup_flow)
+        has a baseline to compare against. Persisted to disk immediately
+        via save_backup.save_pending_snapshot() so it survives the app
+        being closed before the user responds to the post-play prompt.
+
+        Flow 2 (already linked): a cheap check via
+        save_backup.diagnose_source_path() for whether the symlink is
+        still intact.
+
+        Flow 3 (already linked, but the symlink isn't intact — most
+        commonly because the Wine prefix was deleted and recreated):
+        "missing" and "plain_folder" are repaired automatically via
+        save_backup.repair_link() with no confirmation needed — see that
+        function's docstring for why that's safe. "wrong_symlink" (an
+        existing symlink pointing somewhere else entirely) is surprising
+        enough that the user is asked before anything is touched, per
+        spec. If a repair is attempted and fails, this falls back to the
+        same warning Flow 2 always showed for a broken link.
+
+        Never blocks or fails the launch — any error here is logged and
+        swallowed, since a missed backup opportunity for one session is
+        far better than a broken launch.
+        """
+        if db.get_setting("save_backup_enabled", "false") != "true":
+            return
+        if not wine_prefix:
+            return
+        try:
+            existing = db.get_save_paths(self._game_id)
+            source_path = existing.get("save_source_path")
+            save_path   = existing.get("save_path")
+            diag = save_backup.diagnose_source_path(source_path, save_path)
+
+            if diag == "ok":
+                return  # linked and intact — nothing to do
+
+            if diag == "canonical_missing":
+                # Backup itself is gone (e.g. user deleted it directly).
+                # Nothing to restore from — per spec, launch normally.
+                # Not re-triggering Flow 1: this game WAS linked, and
+                # silently starting a brand-new detection pass here could
+                # surprise the user with a second, unrelated backup link
+                # for the same game. Left as-is (visible as "Link Broken"
+                # on the detail page) until the user decides what to do.
+                log.warning(
+                    "[SAVE BACKUP] Canonical save path missing for game_id=%d "
+                    "(%s, was: %s) — launching without managing saves this "
+                    "session", self._game_id, game["folder_name"], save_path)
+                return
+
+            if diag in ("missing", "plain_folder"):
+                ok = save_backup.repair_link(source_path, save_path)
+                if ok:
+                    log.info(
+                        "[SAVE BACKUP] Flow 3: auto-repaired link for "
+                        "game_id=%d (%s)", self._game_id, game["folder_name"])
+                else:
+                    self._warn_broken_save_link(game, source_path, save_path)
+                return
+
+            if diag == "wrong_symlink":
+                current_target = save_backup.current_symlink_target(source_path) or "(unreadable)"
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Save Backup — Unexpected Save Link")
+                msg.setText(
+                    "The save location for this game currently points "
+                    "somewhere unexpected.")
+                msg.setInformativeText(
+                    f"Currently points to:\n{current_target}\n\n"
+                    f"Expected to point to your backed-up save at:\n{save_path}\n\n"
+                    "This can happen if something else changed it since "
+                    "VaultPlay last linked it. Relink it to your backed-up "
+                    "save, or leave it as-is?"
+                )
+                relink_btn = msg.addButton("Relink to Backup", QMessageBox.ButtonRole.AcceptRole)
+                leave_btn  = msg.addButton("Leave As Is", QMessageBox.ButtonRole.RejectRole)
+                msg.setDefaultButton(leave_btn)
+                msg.exec()
+                if msg.clickedButton() == relink_btn:
+                    ok = save_backup.repair_link(source_path, save_path)
+                    if ok:
+                        log.info(
+                            "[SAVE BACKUP] Flow 3: relinked game_id=%d (%s) "
+                            "after user confirmed overwrite of unexpected "
+                            "symlink", self._game_id, game["folder_name"])
+                    else:
+                        self._warn_broken_save_link(game, source_path, save_path)
+                else:
+                    log.info(
+                        "[SAVE BACKUP] User left unexpected symlink as-is "
+                        "for game_id=%d (%s)", self._game_id, game["folder_name"])
+                return
+
+            # diag == "unset" — Flow 1 path, not linked yet
+            import installer as install_mod
+            actual_prefix = install_mod._resolve_actual_prefix(Path(wine_prefix), wine_bin)
+            snapshot = save_backup.snapshot_prefix(actual_prefix)
+            save_backup.save_pending_snapshot(game["folder_name"], snapshot, actual_prefix)
+            log.debug("[SAVE BACKUP] Pre-launch snapshot taken for %s (%d files)",
+                      game["folder_name"], len(snapshot))
+        except Exception as e:
+            log.warning("[SAVE BACKUP] Pre-launch check/snapshot failed: %s", e)
+
+    def _warn_broken_save_link(self, game, source_path, save_path):
+        """Shared fallback warning: shown when a broken link couldn't be
+        auto-repaired (Flow 3 repair_link() failed) or, previously, for
+        every broken-link case before Flow 3 existed."""
+        log.warning(
+            "[SAVE BACKUP] Link broken for game_id=%d (%s): expected %s "
+            "→ %s — game will write a new, unlinked save this session",
+            self._game_id, game["folder_name"], source_path, save_path)
+        QMessageBox.warning(
+            self, "Save Backup — Link Broken",
+            "The linked save folder for this game is missing or has "
+            "changed, and VaultPlay couldn't automatically fix it:\n\n"
+            f"{source_path}\n\n"
+            "The game will still launch, but it will write a NEW save at "
+            "that location instead of using your backed-up save at:\n\n"
+            f"{save_path}\n\n"
+            "Check the app log for details, or restore the save manually."
+        )
+
     def _on_launch_clicked(self):
         """Launch the installed game via Wine/Proton with its saved prefix."""
         if not self._game_id:
@@ -921,26 +1098,49 @@ class GameDetailView(QWidget):
         wine_prefix  = (game["wine_prefix"]  or "").strip()
         desktop_path = (game["desktop_path"] or "").strip()
 
-        # Best option: parse and run the Exec= line from the .desktop file —
-        # it has all the correct env vars baked in. xdg-open on a .desktop
-        # opens it as a text document rather than executing it.
+        # Preferred path: use stored launch_cmd and launch_cwd directly.
+        # These are set by _extract_launch_info at install time and never
+        # depend on the .desktop file being present on disk.
+        launch_cmd = (game["launch_cmd"] or "").strip() if "launch_cmd" in game.keys() else ""
+        launch_cwd = (game["launch_cwd"] or "").strip() if "launch_cwd" in game.keys() else ""
+
+        if launch_cmd:
+            try:
+                cwd      = launch_cwd if (launch_cwd and Path(launch_cwd).exists()) else None
+                wine_bin = _parse_wine_bin(launch_cmd)
+                self._maybe_snapshot_before_launch(game, wine_bin, wine_prefix)
+                proc     = subprocess.Popen(launch_cmd, shell=True, cwd=cwd)
+                log.info("Launched via launch_cmd: %s (cwd=%s wine_bin=%s)",
+                         launch_cmd, cwd, wine_bin)
+                self.game_launched.emit(
+                    self._game_id, proc, wine_bin, wine_prefix)
+                return
+            except Exception as e:
+                log.warning("launch_cmd failed: %s — falling back to .desktop", e)
+
+        # Legacy fallback: parse .desktop file (for games installed before
+        # launch_cmd was added, or where launch_cmd is blank).
         if desktop_path and Path(desktop_path).exists():
             try:
                 exec_line = None
-                wine_bin_from_desktop = "wine"
+                cwd_line  = None
                 for line in Path(desktop_path).read_text().splitlines():
                     if line.startswith("Exec="):
                         exec_line = line[5:].strip()
-                    # Try to extract wine_bin from the env command in Exec= line
-                    # so we can choose the right watcher strategy
+                    elif line.startswith("Path="):
+                        cwd_line = line[5:].strip()
                 if exec_line:
-                    proc = subprocess.Popen(exec_line, shell=True)
-                    log.info("Launched via .desktop Exec: %s", exec_line)
+                    cwd      = cwd_line if (cwd_line and Path(cwd_line).exists()) else None
+                    wine_bin = _parse_wine_bin(exec_line)
+                    self._maybe_snapshot_before_launch(game, wine_bin, wine_prefix)
+                    proc     = subprocess.Popen(exec_line, shell=True, cwd=cwd)
+                    log.info("Launched via .desktop Exec: %s (cwd=%s wine_bin=%s)",
+                             exec_line, cwd, wine_bin)
                     self.game_launched.emit(
-                        self._game_id, proc, wine_bin_from_desktop, wine_prefix)
+                        self._game_id, proc, wine_bin, wine_prefix)
                     return
             except Exception as e:
-                log.warning(".desktop exec failed: %s — falling back", e)
+                log.warning(".desktop exec failed: %s — falling back to exe", e)
 
         # Fallback: reconstruct the launch command from stored data
         if not exe_path or not Path(exe_path).exists():
@@ -967,6 +1167,7 @@ class GameDetailView(QWidget):
                 cmd = [wine_bin, "run", exe_path]
             else:
                 cmd = [wine_bin, exe_path]
+            self._maybe_snapshot_before_launch(game, wine_bin, wine_prefix)
             proc = subprocess.Popen(cmd, env=env)
             log.info("Launched: %s %s (WINEPREFIX=%s)", wine_bin, exe_path, wine_prefix)
             self.game_launched.emit(self._game_id, proc, wine_bin, wine_prefix)
@@ -1115,6 +1316,58 @@ def _safe_get(row, key, default=None):
         return default
 
 
+def _format_version_dict(v: dict) -> str:
+    """
+    Return whichever of dotted/plain/date is populated in a version dict
+    (db.get_nas_version() / db.get_installed_version()'s return shape), or
+    "Unknown" if none are — per decision: show whichever field is set, hide
+    the fact that the others are null, never show a blank row.
+    """
+    if v.get("dotted"):
+        return v["dotted"]
+    if v.get("plain"):
+        return v["plain"]
+    if v.get("date"):
+        return v["date"]
+    return "Unknown"
+
+
+def _parse_wine_bin(launch_cmd: str) -> str:
+    """
+    Extract the Wine or Proton binary name from a launch command string.
+
+    The launch command is a shell string like:
+        env WINEPREFIX="..." STEAM_COMPAT_DATA_PATH="..." "/path/to/proton" run "game.exe"
+        env WINEPREFIX="..." wine "game.exe"
+
+    Strategy: scan tokens left-to-right, skip 'env' and KEY=VALUE pairs,
+    return the first remaining token (the actual binary path or name).
+    Falls back to "wine" if nothing recognisable is found.
+
+    This value is passed to PlaytimeWatcher so it can choose the correct
+    wait strategy (proc.wait() for Proton, wineserver --wait for Wine).
+    Never hardcode "wine" here — the binary changes based on what was
+    configured at install time.
+    """
+    import shlex
+    try:
+        tokens = shlex.split(launch_cmd)
+    except ValueError:
+        # Malformed shell string — fall back to simple split
+        tokens = launch_cmd.split()
+
+    for token in tokens:
+        if token == "env":
+            continue
+        if "=" in token and not token.startswith("/") and not token.startswith('"'):
+            # KEY=VALUE env var — skip
+            continue
+        # First non-env token is the binary
+        return token
+
+    return "wine"  # safe fallback
+
+
 def _file_type_label(file_type: str) -> str:
     return {
         "rar":   "RAR Archive",
@@ -1133,7 +1386,8 @@ def _install_tag_label(tag: str) -> tuple[str, str, str]:
 
 
 class _InfoRow(QWidget):
-    def __init__(self, label: str, value: str, mono: bool = False, parent=None):
+    def __init__(self, label: str, value: str, mono: bool = False,
+                warn: bool = False, parent=None):
         super().__init__(parent)
         # Single outer layout to avoid double-parenting issues
         outer = QVBoxLayout(self)
@@ -1153,10 +1407,14 @@ class _InfoRow(QWidget):
 
         val = QLabel(value)
         val.setFont(QFont("DM Mono" if mono else "DM Sans", 10 if mono else 11))
-        val.setStyleSheet(
-            f"color: {COLORS['accent2']}; background: transparent;" if mono
-            else f"color: {COLORS['text']}; font-weight: 500; background: transparent;"
-        )
+        if warn:
+            val.setStyleSheet(
+                f"color: {COLORS['danger']}; font-weight: 500; background: transparent;")
+        else:
+            val.setStyleSheet(
+                f"color: {COLORS['accent2']}; background: transparent;" if mono
+                else f"color: {COLORS['text']}; font-weight: 500; background: transparent;"
+            )
         val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         val.setWordWrap(True)
 

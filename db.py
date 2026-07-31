@@ -121,6 +121,9 @@ def init_db():
                 launcher_type   TEXT,   -- 'direct' or 'script'
                 desktop_path    TEXT,   -- path to generated .desktop file
                 script_path     TEXT,   -- path to generated launch script
+                launch_cmd      TEXT,   -- full shell command to launch the game
+                launch_cwd      TEXT,   -- working directory for launch_cmd
+                launch_icon     TEXT,   -- path to best available icon PNG
                 installed_at    TEXT DEFAULT (datetime('now')),
                 UNIQUE(game_id)
             );
@@ -152,7 +155,12 @@ def init_db():
                     -- 'unplayed' | 'in_progress' | 'completed' | 'abandoned'
                 playtime_minutes    INTEGER NOT NULL DEFAULT 0,   -- total tracked playtime
                 last_played         TEXT,                         -- ISO datetime or NULL
-                sort_name           TEXT                          -- user override for sort; NULL = use title
+                sort_name           TEXT,                         -- user override for sort; NULL = use title
+                -- Save Backup feature: canonical backup path and the
+                -- in-Wine-prefix path it's symlinked from. Both NULL until
+                -- Flow 1 (first play after install) successfully links a save.
+                save_path           TEXT,
+                save_source_path    TEXT
             );
 
             -- ── Version tracking ──────────────────────────────────────────────────────
@@ -175,11 +183,14 @@ def init_db():
                 game_id         INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
                 site_id         INTEGER NOT NULL REFERENCES version_sites(id) ON DELETE CASCADE,
                 path            TEXT NOT NULL DEFAULT '',
+                is_manual       INTEGER DEFAULT 0,  -- 1 = human-entered URL/edit; never
+                                                     -- append the site's formula suffix
                 last_checked_at TEXT,
                 last_status     TEXT,       -- 'ok' | 'no_match' | 'error'
                 last_error      TEXT,
                 dotted_version  TEXT,       -- highest dotted version EVER seen (monotonic)
                 plain_version   TEXT,       -- highest plain/build-number version EVER seen (monotonic)
+                date_version    TEXT,       -- highest date-based version EVER seen (chronologically monotonic)
                 created_at      TEXT DEFAULT (datetime('now')),
                 UNIQUE(game_id, site_id)
             );
@@ -203,6 +214,35 @@ def init_db():
                 dotted_value TEXT NOT NULL,
                 created_at   TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (game_id, plain_value)
+            );
+
+            -- game_addons: updates, installable DLC, bonus content, and crackfixes
+            -- found alongside a game's base archive — either as subfolders or as
+            -- loose sibling archives at the same level as the base archive.
+            -- One row per detected addon file/folder. addon_type determines how
+            -- it's handled: 'update' and 'installable_dlc' go through the normal
+            -- install pipeline (base -> updates -> installable_dlc -> crackfix);
+            -- 'crackfix' always applies, no version gating; 'bonus' never auto-
+            -- installs, it's a manual extract action only.
+            -- Version columns: at most ONE of the three is ever populated per row
+            -- (dotted/plain/date are different, non-comparable numbering schemes —
+            -- see version_check.py's detect_version()).
+            CREATE TABLE IF NOT EXISTS game_addons (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id                  INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                addon_type               TEXT NOT NULL,   -- 'update' | 'installable_dlc' | 'bonus' | 'crackfix'
+                nas_path                 TEXT NOT NULL,
+                archive_name             TEXT,
+                file_type                TEXT,
+                size_bytes               INTEGER DEFAULT 0,
+                detected_version_dotted  TEXT,
+                detected_version_plain   TEXT,
+                detected_version_date    TEXT,
+                installed                INTEGER DEFAULT 0,
+                installed_at             TEXT,
+                first_seen               TEXT DEFAULT (datetime('now')),
+                last_scanned             TEXT DEFAULT (datetime('now')),
+                UNIQUE(game_id, nas_path, archive_name)
             );
         """)
     _migrate_db()
@@ -245,6 +285,8 @@ def _init_default_settings():
         "version_check_auto":           "true",  # run recurring version check
         "version_check_interval_hours": "24",    # how often to recheck
         "version_check_last_run_at":    "",      # ISO datetime of last full recheck run
+        "save_backup_enabled":          "false", # opt-in — off by default
+        "save_backup_root":             str(Path.home() / "Documents" / "Game Saves"),
     }
     with get_connection() as conn:
         for key, value in defaults.items():
@@ -267,11 +309,17 @@ def _migrate_db():
             ("steam_app_id",            "ALTER TABLE metadata ADD COLUMN steam_app_id INTEGER"),
             ("protondb_internal_id",    "ALTER TABLE metadata ADD COLUMN protondb_internal_id INTEGER"),
             ("protondb_version_counts", "ALTER TABLE metadata ADD COLUMN protondb_version_counts TEXT"),
-            # Inert scaffolding for future current_version feature — nullable, no UI yet.
-            # Split into two columns so comparisons never have to decide whether a
-            # dotted version outranks a plain one (they're different numbering schemes).
+            # current_version_* — the base game's own NAS-detected version,
+            # refreshed on every scan (not just at install time). Was
+            # inert scaffolding until Update & DLC Install Support wired it
+            # up via scanner.py's per-scan base-version detection. Three
+            # columns, not one, for the same reason game_addons and
+            # installs.installed_version_* use three — dotted/plain/date
+            # are different, non-comparable numbering schemes, at most one
+            # populated per game at a time.
             ("current_version_dotted",  "ALTER TABLE metadata ADD COLUMN current_version_dotted TEXT"),
             ("current_version_plain",   "ALTER TABLE metadata ADD COLUMN current_version_plain TEXT"),
+            ("current_version_date",    "ALTER TABLE metadata ADD COLUMN current_version_date TEXT"),
         ]:
             if col not in meta_cols:
                 conn.execute(sql)
@@ -281,8 +329,28 @@ def _migrate_db():
             ("install_tag",          "ALTER TABLE games ADD COLUMN install_tag TEXT"),
             ("install_tag_override", "ALTER TABLE games ADD COLUMN install_tag_override INTEGER DEFAULT 0"),
             ("category",             "ALTER TABLE games ADD COLUMN category TEXT"),
+            # Update & DLC Install Support additions:
+            ("update_patch_mode",    "ALTER TABLE games ADD COLUMN update_patch_mode TEXT DEFAULT 'incremental'"),
+            ("missing_from_nas",     "ALTER TABLE games ADD COLUMN missing_from_nas INTEGER DEFAULT 0"),
         ]:
             if col not in game_cols:
+                conn.execute(sql)
+        # installs table migrations
+        install_cols = {row[1] for row in conn.execute("PRAGMA table_info(installs)").fetchall()}
+        for col, sql in [
+            ("launch_cmd",  "ALTER TABLE installs ADD COLUMN launch_cmd TEXT"),
+            ("launch_cwd",  "ALTER TABLE installs ADD COLUMN launch_cwd TEXT"),
+            ("launch_icon", "ALTER TABLE installs ADD COLUMN launch_icon TEXT"),
+            # Update & DLC Install Support additions — "what version is
+            # actually installed right now", distinct from metadata's
+            # current_version_* ("best version seen on the NAS"). Seeded
+            # from the base archive's own detected version at install time;
+            # cleared automatically when the install row is removed.
+            ("installed_version_dotted", "ALTER TABLE installs ADD COLUMN installed_version_dotted TEXT"),
+            ("installed_version_plain",  "ALTER TABLE installs ADD COLUMN installed_version_plain TEXT"),
+            ("installed_version_date",   "ALTER TABLE installs ADD COLUMN installed_version_date TEXT"),
+        ]:
+            if col not in install_cols:
                 conn.execute(sql)
         # game_state table — create if absent (existing DBs won't have it)
         conn.execute("""
@@ -293,9 +361,22 @@ def _migrate_db():
                 completion_status   TEXT    NOT NULL DEFAULT 'unplayed',
                 playtime_minutes    INTEGER NOT NULL DEFAULT 0,
                 last_played         TEXT,
-                sort_name           TEXT
+                sort_name           TEXT,
+                save_path           TEXT,
+                save_source_path    TEXT
             )
         """)
+        # game_state table migrations — save_path / save_source_path were
+        # added after the table already existed in earlier databases, so
+        # they need their own ALTER (CREATE TABLE IF NOT EXISTS above
+        # won't add columns to an existing table).
+        gs_cols = {row[1] for row in conn.execute("PRAGMA table_info(game_state)").fetchall()}
+        for col, sql in [
+            ("save_path",        "ALTER TABLE game_state ADD COLUMN save_path TEXT"),
+            ("save_source_path", "ALTER TABLE game_state ADD COLUMN save_source_path TEXT"),
+        ]:
+            if col not in gs_cols:
+                conn.execute(sql)
         # Version tracking tables — create if absent (existing DBs won't have them)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS version_sites (
@@ -333,7 +414,33 @@ def _migrate_db():
                 created_at   TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (game_id, plain_value)
             );
+            CREATE TABLE IF NOT EXISTS game_addons (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id                  INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+                addon_type               TEXT NOT NULL,
+                nas_path                 TEXT NOT NULL,
+                archive_name             TEXT,
+                file_type                TEXT,
+                size_bytes               INTEGER DEFAULT 0,
+                detected_version_dotted  TEXT,
+                detected_version_plain   TEXT,
+                detected_version_date    TEXT,
+                installed                INTEGER DEFAULT 0,
+                installed_at             TEXT,
+                first_seen               TEXT DEFAULT (datetime('now')),
+                last_scanned             TEXT DEFAULT (datetime('now')),
+                UNIQUE(game_id, nas_path, archive_name)
+            );
         """)
+        # version_trackers.date_version / is_manual — added after the table
+        # already existed in earlier databases, so they need their own ALTER
+        # (executescript's CREATE TABLE IF NOT EXISTS above won't add
+        # columns to an existing table).
+        vt_cols = {row[1] for row in conn.execute("PRAGMA table_info(version_trackers)").fetchall()}
+        if "date_version" not in vt_cols:
+            conn.execute("ALTER TABLE version_trackers ADD COLUMN date_version TEXT")
+        if "is_manual" not in vt_cols:
+            conn.execute("ALTER TABLE version_trackers ADD COLUMN is_manual INTEGER DEFAULT 0")
 
 
 def update_protondb(game_id: int, tier: str, recommended_proton: str,
@@ -424,6 +531,7 @@ def clear_all_games():
         conn.execute("DELETE FROM installs")
         conn.execute("DELETE FROM metadata")
         conn.execute("DELETE FROM art_cache")
+        conn.execute("DELETE FROM game_addons")
         conn.execute("DELETE FROM games")
         conn.execute("DELETE FROM categories")
     import shutil
@@ -448,6 +556,7 @@ def clear_database():
             DROP TABLE IF EXISTS version_autotrack_log;
             DROP TABLE IF EXISTS version_equivalences;
             DROP TABLE IF EXISTS version_sites;
+            DROP TABLE IF EXISTS game_addons;
             DROP TABLE IF EXISTS metadata;
             DROP TABLE IF EXISTS game_state;
             DROP TABLE IF EXISTS games;
@@ -597,8 +706,8 @@ def get_all_games() -> list:
                    m.recommended_proton, m.protondb_version_counts,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    i.game_path, i.launcher_type, i.desktop_path, i.script_path,
+                   i.launch_cmd, i.launch_cwd, i.launch_icon,
                    (i.id IS NOT NULL) AS is_installed,
-                   COALESCE(gs.is_favorite,       0)          AS is_favorite,
                    COALESCE(gs.is_hidden,         0)          AS is_hidden,
                    COALESCE(gs.completion_status, 'unplayed') AS completion_status,
                    COALESCE(gs.playtime_minutes,  0)          AS playtime_minutes,
@@ -663,6 +772,7 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
                    m.recommended_proton, m.protondb_version_counts,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    i.game_path, i.launcher_type, i.desktop_path, i.script_path,
+                   i.launch_cmd, i.launch_cwd, i.launch_icon,
                    (i.id IS NOT NULL) AS is_installed,
                    COALESCE(gs.is_favorite,       0)          AS is_favorite,
                    COALESCE(gs.is_hidden,         0)          AS is_hidden,
@@ -746,13 +856,16 @@ def upsert_metadata(game_id: int, data: dict):
 def record_install(game_id: int, install_path: str, wine_prefix: str,
                    install_method: str = "", exe_path: str = "",
                    game_path: str = "", launcher_type: str = "direct",
-                   desktop_path: str = "", script_path: str = ""):
+                   desktop_path: str = "", script_path: str = "",
+                   launch_cmd: str = "", launch_cwd: str = "",
+                   launch_icon: str = ""):
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO installs
                 (game_id, install_path, wine_prefix, install_method, exe_path,
-                 game_path, launcher_type, desktop_path, script_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 game_path, launcher_type, desktop_path, script_path,
+                 launch_cmd, launch_cwd, launch_icon)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(game_id) DO UPDATE SET
                 install_path   = excluded.install_path,
                 wine_prefix    = excluded.wine_prefix,
@@ -762,9 +875,13 @@ def record_install(game_id: int, install_path: str, wine_prefix: str,
                 launcher_type  = excluded.launcher_type,
                 desktop_path   = excluded.desktop_path,
                 script_path    = excluded.script_path,
+                launch_cmd     = excluded.launch_cmd,
+                launch_cwd     = excluded.launch_cwd,
+                launch_icon    = excluded.launch_icon,
                 installed_at   = datetime('now')
         """, (game_id, install_path, wine_prefix, install_method, exe_path,
-              game_path, launcher_type, desktop_path, script_path))
+              game_path, launcher_type, desktop_path, script_path,
+              launch_cmd, launch_cwd, launch_icon))
 
 
 def set_install_tag_override(game_id: int, install_tag: str):
@@ -877,6 +994,53 @@ def set_sort_name(game_id: int, sort_name: Optional[str]):
             ON CONFLICT(game_id) DO UPDATE SET
                 sort_name = excluded.sort_name
         """, (game_id, sort_name))
+
+
+# ── Save Backup helpers ────────────────────────────────────────────────────────
+
+def get_save_paths(game_id: int) -> dict:
+    """
+    Return {"save_path": str|None, "save_source_path": str|None} for a game.
+    save_path is the canonical backed-up location; save_source_path is the
+    in-Wine-prefix path that's symlinked to it. Both None if Save Backup
+    has never successfully linked a save for this game.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT save_path, save_source_path FROM game_state WHERE game_id=?",
+            (game_id,)
+        ).fetchone()
+    if not row:
+        return {"save_path": None, "save_source_path": None}
+    return {"save_path": row["save_path"], "save_source_path": row["save_source_path"]}
+
+
+def set_save_paths(game_id: int, save_path: Optional[str] = None,
+                   save_source_path: Optional[str] = None):
+    """
+    Set the canonical save path and/or the in-prefix symlink source path
+    for a game. Only the field(s) passed are written — None leaves that
+    column unchanged, matching set_installed_version()'s partial-update
+    contract elsewhere in this file.
+    """
+    updates = []
+    params  = []
+    if save_path is not None:
+        updates.append("save_path=?"); params.append(save_path)
+    if save_source_path is not None:
+        updates.append("save_source_path=?"); params.append(save_source_path)
+    if not updates:
+        return
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO game_state (game_id) VALUES (?)
+            ON CONFLICT(game_id) DO NOTHING
+        """, (game_id,))
+        params.append(game_id)
+        conn.execute(
+            f"UPDATE game_state SET {', '.join(updates)} WHERE game_id=?",
+            params
+        )
 
 
 def cache_art(url: str, local_path: str):
@@ -1033,28 +1197,45 @@ def count_trackers_for_site(site_id: int) -> int:
         return row["n"] if row else 0
 
 
-def add_version_tracker(game_id: int, site_id: int, path: str) -> sqlite3.Row:
+def add_version_tracker(game_id: int, site_id: int, path: str,
+                        is_manual: bool = False) -> sqlite3.Row:
     """
     Create or update a version_trackers row for this (game, site) pair.
     If the row already exists (UNIQUE constraint), the path is updated and
     previously stored version values are reset — because a path change means
     the old versions came from a different page entirely.
+
+    is_manual: True when the caller is a human directly pasting/editing a
+    URL (AddTrackerSection, TrackerRow's Save & Recheck) — False when the
+    caller is a formula/auto-track worker building a slug-based path
+    (VersionAutoTrackWorker, VersionBackfillWorker). Controls whether the
+    SITE's configured `suffix` gets appended when computing source_url (see
+    get_trackers_for_game()/get_all_trackers()) — a manually-typed URL
+    already represents the complete intended path; appending a formula
+    site's suffix on top of it produces a broken, duplicated URL when the
+    same base_url happens to already exist as a formula site for other
+    games (confirmed real bug: a manually-added tracker producing
+    ".../clair-obscur-expedition-33-download/-download/"). Set on every
+    call, not just creation, so re-editing a tracker's path correctly
+    re-asserts manual intent even if it was formula-created originally.
     Returns the row after upsert.
     """
     with get_connection() as conn:
         conn.execute("""
-            INSERT INTO version_trackers (game_id, site_id, path)
-            VALUES (?, ?, ?)
+            INSERT INTO version_trackers (game_id, site_id, path, is_manual)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(game_id, site_id) DO UPDATE SET
                 path           = excluded.path,
+                is_manual      = excluded.is_manual,
                 -- Editing the path invalidates any previously-found version
                 -- (the old value was from a different URL).
                 dotted_version = NULL,
                 plain_version  = NULL,
+                date_version   = NULL,
                 last_status    = NULL,
                 last_error     = NULL,
                 last_checked_at = NULL
-        """, (game_id, site_id, path))
+        """, (game_id, site_id, path, 1 if is_manual else 0))
         return conn.execute("""
             SELECT * FROM version_trackers
             WHERE game_id=? AND site_id=?
@@ -1070,18 +1251,23 @@ def remove_version_tracker(tracker_id: int):
 def update_version_tracker_result(tracker_id: int, status: str,
                                    dotted_version: Optional[str] = None,
                                    plain_version:  Optional[str] = None,
+                                   date_version:   Optional[str] = None,
                                    error_msg:      Optional[str] = None):
     """
     Record the result of a version check.
 
     Rules:
     - last_status, last_error, last_checked_at always update.
-    - dotted_version / plain_version update ONLY when status == 'ok' AND the new
-      value is strictly higher than what's stored (monotonic — never regress).
+    - dotted_version / plain_version / date_version update ONLY when
+      status == 'ok' AND the new value is strictly higher than what's
+      stored (monotonic — never regress).
     - On 'error' or 'no_match', stored version values are left as-is.
     - If tracker_id no longer exists (deleted while check was running), no-op.
 
-    version_check.py's sort_key() is used for the higher-than comparison.
+    version_check.py's sort_key() is used for dotted/plain comparisons.
+    date_version uses date_sort_key() instead — dates are chronological,
+    NOT comparable via the same numeric-tuple logic as dotted versions
+    (e.g. "14.08.2023" must not be read as major.minor.patch = 14.8.2023).
     """
     try:
         import version_check as _vc
@@ -1098,6 +1284,10 @@ def update_version_tracker_result(tracker_id: int, status: str,
 
         new_dotted = row["dotted_version"]
         new_plain  = row["plain_version"]
+        try:
+            new_date = row["date_version"]
+        except (IndexError, KeyError):
+            new_date = None  # older DB row from before this column existed
 
         if status == "ok" and has_vc:
             if dotted_version and (
@@ -1110,10 +1300,16 @@ def update_version_tracker_result(tracker_id: int, status: str,
                 or _vc.sort_key(plain_version) > _vc.sort_key(new_plain)
             ):
                 new_plain = plain_version
+            if date_version and (
+                not new_date
+                or _vc.date_sort_key(date_version) > _vc.date_sort_key(new_date)
+            ):
+                new_date = date_version
         elif status == "ok":
             # version_check not available — accept values as-is
             new_dotted = dotted_version or new_dotted
             new_plain  = plain_version  or new_plain
+            new_date   = date_version   or new_date
 
         conn.execute("""
             UPDATE version_trackers
@@ -1121,9 +1317,10 @@ def update_version_tracker_result(tracker_id: int, status: str,
                 last_error      = ?,
                 last_checked_at = datetime('now'),
                 dotted_version  = ?,
-                plain_version   = ?
+                plain_version   = ?,
+                date_version    = ?
             WHERE id = ?
-        """, (status, error_msg, new_dotted, new_plain, tracker_id))
+        """, (status, error_msg, new_dotted, new_plain, new_date, tracker_id))
 
 
 def get_trackers_for_game(game_id: int) -> list:
@@ -1131,7 +1328,9 @@ def get_trackers_for_game(game_id: int) -> list:
     with get_connection() as conn:
         return conn.execute("""
             SELECT vt.*, vs.label, vs.base_url, vs.suffix,
-                   (vs.base_url || vt.path || vs.suffix) AS source_url
+                   (vs.base_url || vt.path ||
+                    CASE WHEN vt.is_manual = 1 THEN '' ELSE vs.suffix END
+                   ) AS source_url
             FROM version_trackers vt
             JOIN version_sites vs ON vs.id = vt.site_id
             WHERE vt.game_id = ?
@@ -1151,7 +1350,9 @@ def get_all_trackers(include_blacklisted: bool = False) -> list:
     with get_connection() as conn:
         return conn.execute(f"""
             SELECT vt.*, vs.label, vs.base_url, vs.suffix,
-                   (vs.base_url || vt.path || vs.suffix) AS source_url,
+                   (vs.base_url || vt.path ||
+                    CASE WHEN vt.is_manual = 1 THEN '' ELSE vs.suffix END
+                   ) AS source_url,
                    g.folder_name, g.display_name, g.category,
                    COALESCE(m.title, g.display_name, g.folder_name) AS title
             FROM version_trackers vt
@@ -1173,10 +1374,13 @@ def get_best_versions_for_game(game_id: int) -> dict:
         {
           "dotted": str | None,   -- highest dotted version found
           "plain":  str | None,   -- highest plain/build-number version found
+          "date":   str | None,   -- highest date-based version found (chronological)
           "dotted_url":  str | None,  -- source URL for the dotted winner
           "plain_url":   str | None,  -- source URL for the plain winner
+          "date_url":    str | None,  -- source URL for the date winner
           "dotted_checked_at": str | None,
           "plain_checked_at":  str | None,
+          "date_checked_at":   str | None,
         }
 
     Tie-breaking (multiple trackers with identical highest value):
@@ -1189,12 +1393,14 @@ def get_best_versions_for_game(game_id: int) -> dict:
     try:
         import version_check as _vc
         sort_key = _vc.sort_key
+        date_sort_key = _vc.date_sort_key
     except ImportError:
         sort_key = lambda v: v  # fallback: lexicographic
+        date_sort_key = lambda v: v
 
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT vt.id, vt.dotted_version, vt.plain_version,
+            SELECT vt.id, vt.dotted_version, vt.plain_version, vt.date_version,
                    vt.last_checked_at,
                    (vs.base_url || vt.path || vs.suffix) AS source_url
             FROM version_trackers vt
@@ -1202,13 +1408,14 @@ def get_best_versions_for_game(game_id: int) -> dict:
             WHERE vt.game_id = ?
         """, (game_id,)).fetchall()
 
-    best_dotted = best_plain = None
-    best_dotted_url = best_plain_url = None
-    best_dotted_checked = best_plain_checked = None
+    best_dotted = best_plain = best_date = None
+    best_dotted_url = best_plain_url = best_date_url = None
+    best_dotted_checked = best_plain_checked = best_date_checked = None
 
     # Candidates: (value, url, checked_at, tracker_id)
     dotted_candidates: list[tuple] = []
     plain_candidates:  list[tuple] = []
+    date_candidates:   list[tuple] = []
 
     for row in rows:
         if row["dotted_version"]:
@@ -1219,6 +1426,15 @@ def get_best_versions_for_game(game_id: int) -> dict:
         if row["plain_version"]:
             plain_candidates.append((
                 row["plain_version"], row["source_url"],
+                row["last_checked_at"], row["id"]
+            ))
+        try:
+            row_date = row["date_version"]
+        except (IndexError, KeyError):
+            row_date = None
+        if row_date:
+            date_candidates.append((
+                row_date, row["source_url"],
                 row["last_checked_at"], row["id"]
             ))
 
@@ -1257,13 +1473,24 @@ def get_best_versions_for_game(game_id: int) -> dict:
         )
         best_plain, best_plain_url, best_plain_checked, _ = best
 
+    # Pick best date — chronological comparison, NOT the dotted sort_key
+    if date_candidates:
+        best = max(
+            date_candidates,
+            key=lambda c: (date_sort_key(c[0]), c[2] or "", -c[3])
+        )
+        best_date, best_date_url, best_date_checked, _ = best
+
     return {
         "dotted":            best_dotted,
         "plain":             best_plain,
+        "date":              best_date,
         "dotted_url":        best_dotted_url,
         "plain_url":         best_plain_url,
+        "date_url":          best_date_url,
         "dotted_checked_at": best_dotted_checked,
         "plain_checked_at":  best_plain_checked,
+        "date_checked_at":   best_date_checked,
     }
 
 
@@ -1395,3 +1622,273 @@ def get_dotted_equivalent_for_plain(game_id: int,
             WHERE game_id=? AND plain_value=?
         """, (game_id, plain_value)).fetchone()
         return row["dotted_value"] if row else None
+
+
+# ── game_addons helpers (Update & DLC Install Support) ────────────────────────
+
+VALID_ADDON_TYPES = frozenset({"update", "installable_dlc", "bonus", "crackfix"})
+
+
+def upsert_addon(game_id: int, addon_type: str, nas_path: str,
+                 archive_name: Optional[str], file_type: Optional[str],
+                 size_bytes: int = 0,
+                 detected_version_dotted: Optional[str] = None,
+                 detected_version_plain: Optional[str] = None,
+                 detected_version_date: Optional[str] = None) -> int:
+    """
+    Create or refresh a game_addons row. Called by scanner.py once per
+    detected update/DLC/bonus/crackfix file or folder on every scan pass —
+    upserting refreshes last_scanned, which is what prune_stale_addons()
+    uses afterward to remove rows for anything no longer found on the NAS.
+
+    Re-detecting a version on an existing row OVERWRITES the stored
+    detected_version_* fields — unlike installed_version_* on `installs`,
+    these represent "what's on the NAS right now", not a monotonic history.
+    """
+    if addon_type not in VALID_ADDON_TYPES:
+        raise ValueError(f"Invalid addon_type: {addon_type!r}. "
+                         f"Must be one of {sorted(VALID_ADDON_TYPES)}")
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO game_addons
+                (game_id, addon_type, nas_path, archive_name, file_type,
+                 size_bytes, detected_version_dotted, detected_version_plain,
+                 detected_version_date, last_scanned)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(game_id, nas_path, archive_name) DO UPDATE SET
+                addon_type               = excluded.addon_type,
+                file_type                = excluded.file_type,
+                size_bytes                = excluded.size_bytes,
+                detected_version_dotted   = excluded.detected_version_dotted,
+                detected_version_plain    = excluded.detected_version_plain,
+                detected_version_date     = excluded.detected_version_date,
+                last_scanned               = datetime('now')
+        """, (game_id, addon_type, nas_path, archive_name, file_type,
+              size_bytes, detected_version_dotted, detected_version_plain,
+              detected_version_date))
+        row = conn.execute("""
+            SELECT id FROM game_addons
+            WHERE game_id=? AND nas_path=? AND archive_name IS ?
+        """, (game_id, nas_path, archive_name)).fetchone()
+        return row["id"]
+
+
+def get_addons_for_game(game_id: int, addon_type: Optional[str] = None) -> list:
+    """
+    Return game_addons rows for a game, optionally filtered to one addon_type.
+    Ordered by detected version where meaningful (updates/installable_dlc are
+    typically consumed in ascending version order for incremental application —
+    callers needing that order should sort using version_check.sort_key /
+    date_sort_key on the appropriate column, since SQL text sort isn't correct
+    for version comparison).
+    """
+    with get_connection() as conn:
+        if addon_type:
+            return conn.execute("""
+                SELECT * FROM game_addons
+                WHERE game_id=? AND addon_type=?
+                ORDER BY archive_name COLLATE NOCASE
+            """, (game_id, addon_type)).fetchall()
+        return conn.execute("""
+            SELECT * FROM game_addons
+            WHERE game_id=?
+            ORDER BY addon_type, archive_name COLLATE NOCASE
+        """, (game_id,)).fetchall()
+
+
+def mark_addon_installed(addon_id: int, installed: bool = True):
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE game_addons
+            SET installed = ?, installed_at = CASE WHEN ? THEN datetime('now') ELSE installed_at END
+            WHERE id = ?
+        """, (1 if installed else 0, 1 if installed else 0, addon_id))
+
+
+def prune_stale_addons(game_id: int, scan_started_at: str):
+    """
+    Delete game_addons rows for this game whose last_scanned is older than
+    scan_started_at — meaning the current scan pass upserted everything it
+    found (refreshing last_scanned to "now") but this row wasn't touched,
+    so its backing archive/folder is no longer on the NAS.
+
+    scan_started_at should be an ISO datetime string captured by the caller
+    BEFORE it began upserting this game's addons, so the comparison can't
+    accidentally match rows the current pass just wrote.
+    Safe to call unconditionally after each game's addon scan completes —
+    nothing else references a game_addons row, so pruning is not risky the
+    way deleting a `games` row would be (see set_game_missing_from_nas
+    for why base games are flagged instead of deleted).
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            DELETE FROM game_addons
+            WHERE game_id = ? AND last_scanned < ?
+        """, (game_id, scan_started_at))
+
+
+def delete_addon(addon_id: int):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM game_addons WHERE id=?", (addon_id,))
+
+
+# ── installed-version helpers (on `installs`, distinct from metadata's ────────
+# ── current_version_* which represents "best version seen on the NAS") ────────
+
+def set_installed_version(game_id: int, dotted: Optional[str] = None,
+                          plain: Optional[str] = None,
+                          date: Optional[str] = None):
+    """
+    Update the installed_version_* columns on `installs` after a base install
+    or a successful update apply. Only touches the column(s) actually passed
+    (None = leave that column unchanged) — callers pass whichever single
+    field the winning detection populated, per detect_version()'s "at most
+    one of dotted/plain/date" contract.
+    No-op if there's no installs row for this game (nothing to update yet).
+    """
+    updates = []
+    params  = []
+    if dotted is not None:
+        updates.append("installed_version_dotted=?"); params.append(dotted)
+    if plain is not None:
+        updates.append("installed_version_plain=?"); params.append(plain)
+    if date is not None:
+        updates.append("installed_version_date=?"); params.append(date)
+    if not updates:
+        return
+    params.append(game_id)
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE installs SET {', '.join(updates)} WHERE game_id=?",
+            params
+        )
+
+
+def get_installed_version(game_id: int) -> dict:
+    """
+    Return {"dotted": str|None, "plain": str|None, "date": str|None} for
+    whatever's currently installed. All None if the game isn't installed,
+    or if it was installed before this feature existed and nothing has
+    triggered a re-detection yet.
+    """
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT installed_version_dotted, installed_version_plain,
+                   installed_version_date
+            FROM installs WHERE game_id=?
+        """, (game_id,)).fetchone()
+    if not row:
+        return {"dotted": None, "plain": None, "date": None}
+    return {
+        "dotted": row["installed_version_dotted"],
+        "plain":  row["installed_version_plain"],
+        "date":   row["installed_version_date"],
+    }
+
+
+def set_update_patch_mode(game_id: int, mode: str):
+    """
+    mode: 'incremental' (default — apply every pending update in version
+    order, safe when unsure) or 'cumulative' (apply only the single highest
+    pending update — an explicit opt-in optimization for games confirmed to
+    ship full-replacement patches).
+    """
+    if mode not in ("incremental", "cumulative"):
+        raise ValueError(f"Invalid update_patch_mode: {mode!r}")
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE games SET update_patch_mode=? WHERE id=?",
+            (mode, game_id)
+        )
+
+
+# ── NAS version helpers (metadata.current_version_*) ──────────────────────────
+# The base game's own detected version, refreshed on every scan — distinct
+# from installed_version_* on `installs` (what's actually installed right
+# now) and from game_addons' detected_version_* (updates/DLC/crackfix, not
+# the base game). This is "what version is sitting on the NAS right now",
+# regardless of whether the game is installed at all.
+
+def set_nas_version(game_id: int, dotted: Optional[str] = None,
+                    plain: Optional[str] = None, date: Optional[str] = None):
+    """
+    Upsert the base game's NAS-detected version into metadata. Called by
+    scanner.py on every scan pass, not just at install time — this is a
+    plain overwrite (not monotonic like installed_version_*), since it
+    represents "what's on the NAS right now" and should track a NAS
+    replacement (e.g. Derrick's Dave the Diver incident) faithfully rather
+    than remembering a stale higher value.
+    Only the field(s) passed are written — passing None for a field leaves
+    it unchanged, matching set_installed_version()'s partial-update contract.
+    Creates the metadata row if one doesn't exist yet (e.g. metadata hasn't
+    been fetched from SGDB/IGDB for this game).
+    """
+    updates = []
+    params  = []
+    if dotted is not None:
+        updates.append("current_version_dotted=?"); params.append(dotted)
+    if plain is not None:
+        updates.append("current_version_plain=?"); params.append(plain)
+    if date is not None:
+        updates.append("current_version_date=?"); params.append(date)
+    if not updates:
+        return
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO metadata (game_id) VALUES (?)
+            ON CONFLICT(game_id) DO NOTHING
+        """, (game_id,))
+        params.append(game_id)
+        conn.execute(
+            f"UPDATE metadata SET {', '.join(updates)} WHERE game_id=?",
+            params
+        )
+
+
+def get_nas_version(game_id: int) -> dict:
+    """
+    Return {"dotted": str|None, "plain": str|None, "date": str|None} for
+    the base game's NAS-detected version. All None if never detected
+    (e.g. this game's archive/exe/folder name carries no version signal at
+    all — a real, expected case, not an error).
+    """
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT current_version_dotted, current_version_plain, current_version_date
+            FROM metadata WHERE game_id=?
+        """, (game_id,)).fetchone()
+    if not row:
+        return {"dotted": None, "plain": None, "date": None}
+    return {
+        "dotted": row["current_version_dotted"],
+        "plain":  row["current_version_plain"],
+        "date":   row["current_version_date"],
+    }
+
+
+# ── missing-from-NAS helpers ───────────────────────────────────────────────────
+# Base games are flagged, never auto-deleted, on a scan that no longer finds
+# their NAS folder — deleting outright would cascade away installs/metadata/
+# game_state (favorites, playtime, completion), which would be a silent data
+# loss if the NAS was just temporarily unreachable. game_addons rows don't
+# have this risk (nothing references them), so those ARE safe to auto-prune —
+# see prune_stale_addons() above.
+
+def set_game_missing_from_nas(game_id: int, missing: bool):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE games SET missing_from_nas=? WHERE id=?",
+            (1 if missing else 0, game_id)
+        )
+
+
+def get_missing_games() -> list:
+    """Return games currently flagged missing_from_nas, for the Missing filter."""
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT g.*, COALESCE(m.title, g.display_name, g.folder_name) AS title
+            FROM games g
+            LEFT JOIN metadata m ON m.game_id = g.id
+            WHERE g.missing_from_nas = 1
+            ORDER BY title COLLATE NOCASE
+        """).fetchall()

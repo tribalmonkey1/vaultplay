@@ -65,6 +65,23 @@ TAG_LABELS = {
     "iso":       "ISO        (mount + setup)",
 }
 
+_ADDON_TYPE_LABELS = {
+    "update":           "Update",
+    "installable_dlc":  "DLC",
+    "crackfix":         "Crackfix",
+}
+
+
+def _addon_display_label(addon) -> str:
+    """Build the checklist row label for one game_addons row."""
+    type_label = _ADDON_TYPE_LABELS.get(addon["addon_type"], addon["addon_type"])
+    version = (addon["detected_version_dotted"] or addon["detected_version_plain"]
+              or addon["detected_version_date"])
+    name = addon["archive_name"] or Path(addon["nas_path"]).name
+    if version:
+        return f"[{type_label}]  v{version}  —  {name}"
+    return f"[{type_label}]  {name}"
+
 
 class SettingsToggle(QWidget):
     """Pill-shaped on/off toggle — matches the style used in settings_view.py."""
@@ -455,6 +472,49 @@ class InstallDialog(QDialog):
         grid_l.addLayout(col2)
         redist_box.add(grid_w)
         self.body_layout.addWidget(redist_box)
+
+        # ── Updates & DLC ────────────────────────────────────────────────────
+        # One row per pending update/installable-DLC/crackfix addon found for
+        # this game by the scanner — same visual pattern as Redistributables
+        # above. Bonus content is never shown here — it has no install
+        # pipeline at all, only a separate manual extract action in game
+        # detail. Already-installed addons are excluded (nothing to offer on
+        # a fresh install; on a reinstall they'd already show as applied).
+        self._addon_checks = {}
+        pending_addons = []
+        try:
+            pending_addons = [
+                a for a in db.get_addons_for_game(game.get("id"))
+                if a["addon_type"] in ("update", "installable_dlc", "crackfix")
+                and not a["installed"]
+            ]
+        except Exception as _e:
+            log.warning("Could not load addons for install dialog: %s", _e)
+
+        if pending_addons:
+            _type_order = {"update": 0, "installable_dlc": 1, "crackfix": 2}
+            pending_addons.sort(
+                key=lambda a: (_type_order.get(a["addon_type"], 9),
+                               a["archive_name"] or "")
+            )
+            addon_box = SectionBox(f"Updates & DLC  ·  {len(pending_addons)} found")
+            addon_w = QWidget()
+            addon_w.setStyleSheet("background: transparent; border: none;")
+            addon_col = QVBoxLayout(addon_w)
+            addon_col.setContentsMargins(0, 0, 0, 0)
+            addon_col.setSpacing(4)
+            for addon in pending_addons:
+                cb = QCheckBox(_addon_display_label(addon))
+                cb.setFont(QFont("DM Mono", 10))
+                cb.setChecked(True)
+                cb.setStyleSheet(f"color: {COLORS['accent2']};")
+                self._addon_checks[addon["id"]] = cb
+                row_l = QHBoxLayout()
+                row_l.addWidget(cb)
+                row_l.addStretch()
+                addon_col.addLayout(row_l)
+            addon_box.add(addon_w)
+            self.body_layout.addWidget(addon_box)
 
         # ── Cleanup toggle ────────────────────────────────────────────────────
         cleanup_box = SectionBox()
@@ -997,6 +1057,9 @@ class InstallDialog(QDialog):
         selected_redists = [v for v, cb in self._redist_checks.items() if cb.isChecked()]
         force_redists = False
 
+        selected_addon_ids = {addon_id for addon_id, cb in self._addon_checks.items()
+                              if cb.isChecked()}
+
         if selected_redists and prefix_path.exists():
             already = install_mod.get_installed_redists(prefix_path)
             overlap = [v for v in selected_redists if v in already]
@@ -1024,6 +1087,8 @@ class InstallDialog(QDialog):
         self.check_installed_btn.hide()
         self.proton_combo.setEnabled(False)
         self.tag_toggle.setEnabled(False)
+        for cb in self._addon_checks.values():
+            cb.setEnabled(False)
         self.progress_panel.show()
         self.adjustSize()
 
@@ -1036,6 +1101,7 @@ class InstallDialog(QDialog):
             "cleanup_tmp":      self.cleanup_check.isChecked(),
             "proton_version":   self.proton_combo.currentData(),
             "install_tag":      self._install_tag,
+            "selected_addon_ids": selected_addon_ids,
         }
 
         self._worker = InstallWorker(self.game["id"], options)
@@ -1052,11 +1118,34 @@ class InstallDialog(QDialog):
         self.cancel_btn.setEnabled(True)
 
         if result.get("success"):
-            self.stage_label.setText("✓ Installation complete!")
-            self.stage_label.setStyleSheet(
-                f"color: {COLORS['installed']}; font-weight: 600;")
+            failed_redists = result.get("failed_redists") or []
+            failed_addons  = result.get("failed_addons") or []
+            if failed_redists or failed_addons:
+                self.stage_label.setText("⚠ Installed — some items failed")
+                self.stage_label.setStyleSheet(
+                    f"color: {COLORS['accent']}; font-weight: 600;")
+                parts = []
+                if failed_redists:
+                    parts.append(
+                        "Redistributables: " + ", ".join(failed_redists) +
+                        ". Retry individually with winetricks, or reopen "
+                        "this dialog and use \"Reinstall All\"."
+                    )
+                if failed_addons:
+                    parts.append(
+                        "Updates/DLC: " + ", ".join(failed_addons) +
+                        ". The base game installed fine — reopen this "
+                        "dialog to retry the failed item(s)."
+                    )
+                self.progress_msg.setText(
+                    "The game itself installed fine.\n" + "\n".join(parts)
+                )
+            else:
+                self.stage_label.setText("✓ Installation complete!")
+                self.stage_label.setStyleSheet(
+                    f"color: {COLORS['installed']}; font-weight: 600;")
+                self.progress_msg.setText(result.get("exe_path") or "Done.")
             self.progress_bar.setValue(100)
-            self.progress_msg.setText(result.get("exe_path") or "Done.")
             self.cancel_btn.setText("Close")
             self.install_finished.emit(self.game["id"])
             return

@@ -285,7 +285,13 @@ class TrackerRow(QWidget):
         outer.addWidget(self.result_lbl)
 
     def _computed_url(self) -> str:
-        return vc.build_url(self._base_url, self.path_edit.text(), self._suffix)
+        # This row represents a manually-managed tracker (is_manual=True,
+        # enforced in _on_save_recheck below) — the path the user typed or
+        # pasted is already the complete, intended path. Appending the
+        # site's formula suffix here would double it up, e.g. producing
+        # ".../clair-obscur-expedition-33-download/-download/" whenever the
+        # same base_url also exists as a formula site for other games.
+        return vc.build_url(self._base_url, self.path_edit.text(), "")
 
     def _on_path_changed(self, _text: str):
         self.url_preview.setText(self._computed_url())
@@ -314,18 +320,24 @@ class TrackerRow(QWidget):
             self._set_result("Path cannot be empty", "error")
             return
 
-        # Save updated path (resets stored version if path changed)
-        tracker = db.add_version_tracker(self._game_id, self._site_id, new_path)
+        # Save updated path as a manual tracker (is_manual=True) — the path
+        # the user just edited is the complete intended path, so the site's
+        # formula suffix must never be appended to it. Without is_manual set
+        # here, db.get_trackers_for_game()'s source_url computation would
+        # append vs.suffix on top of an already-complete manual path.
+        tracker = db.add_version_tracker(
+            self._game_id, self._site_id, new_path, is_manual=True)
         self._tracker_id = tracker["id"]
 
         self.save_btn.setEnabled(False)
         self.save_btn.setText("Checking…")
         self._set_result("Checking…", "muted")
 
-        # Build a minimal tracker-like dict for check_tracker
+        # Build a minimal tracker-like dict for check_tracker.
+        # No suffix — this is a manual tracker, see _computed_url().
         fake_row = {
             "id":         self._tracker_id,
-            "source_url": vc.build_url(self._base_url, new_path, self._suffix),
+            "source_url": self._computed_url(),
         }
         self._worker = CheckWorker(fake_row, is_formula=False)
         self._worker.finished.connect(self._on_check_done)
@@ -500,17 +512,26 @@ class AddTrackerSection(QWidget):
                 )
                 return
 
-        # Create tracker
-        tracker = db.add_version_tracker(self._game_id, site["id"], path)
+        # Create tracker as manual — the user pasted a complete, specific
+        # URL, which we've already split into base_url + path above. If
+        # get_or_create_version_site_by_base_url() happened to match an
+        # existing formula site (auto_track_new_games=1) by base_url, that
+        # site's suffix must still never be appended to this tracker's
+        # path — it's not a slug-derived URL, it's the exact page the user
+        # gave us. is_manual=True is what tells get_trackers_for_game()'s
+        # source_url computation to skip vs.suffix for this row.
+        tracker = db.add_version_tracker(
+            self._game_id, site["id"], path, is_manual=True)
         self._pending_tracker = tracker
 
         self.add_btn.setEnabled(False)
         self.add_btn.setText("Checking…")
         self._set_result("Fetching page…", "muted")
 
+        # No suffix — this is a manual tracker (see comment above).
         fake_row = {
             "id":         tracker["id"],
-            "source_url": vc.build_url(base_url, path, site["suffix"] or ""),
+            "source_url": vc.build_url(base_url, path, ""),
         }
         self._worker = CheckWorker(fake_row, is_formula=False)
         self._worker.finished.connect(self._on_check_done)

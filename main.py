@@ -106,8 +106,17 @@ def main():
     QCoreApplication.setApplicationName("VaultPlay")
     QCoreApplication.setOrganizationName("VaultPlay")
 
+    # Set argv[0] to "vaultplay" before QApplication is constructed.
+    # Qt uses argv[0] as the X11 WM_CLASS instance name — without this it
+    # reports "main.py" which confuses KDE's window grouping (it matches
+    # VaultPlay to other Python apps instead of the VaultPlay .desktop entry).
+    sys.argv[0] = "vaultplay"
+
     app = QApplication(sys.argv)
     app.setApplicationDisplayName("VaultPlay")
+    # setDesktopFileName links this process to the .desktop file so KDE
+    # can match the taskbar entry, pinning, and StartupWMClass correctly.
+    app.setDesktopFileName("VaultPlay")
     app.setFont(QFont("DM Sans", 11))
 
     _log_phase("DB init")

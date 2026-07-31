@@ -31,7 +31,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QSizePolicy,
-    QFrame, QApplication
+    QFrame, QApplication, QMessageBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QColor
@@ -42,11 +42,13 @@ import metadata as meta_mod
 import protondb as protondb_mod
 import version_checker as vc_mod
 import playtime as playtime_mod
+import save_backup
 
 from ui.library_view import LibraryView
 from ui.setup_wizard import SetupWizard
 from ui.game_detail import GameDetailView
 from ui.settings_view import SettingsView
+from ui.save_backup_dialog import SaveBackupDialog
 from ui.style import STYLESHEET, COLORS
 
 log = logging.getLogger(__name__)
@@ -901,7 +903,120 @@ class MainWindow(QMainWindow):
             log.info("[PLAYTIME] Session too short, not recorded: game_id=%d",
                      game_id)
 
+        # Save Backup Flow 1 — run regardless of whether playtime met the
+        # minimum threshold to be recorded; even a short session can have
+        # written a save. No-ops immediately if the feature is off, the
+        # game is already linked, or no pre-launch snapshot was taken.
+        self._maybe_run_save_backup_flow(game_id)
+
         # Refresh detail view if it's showing this game
         if (self.stack.currentIndex() == 1 and
                 self.detail_view._game_id == game_id):
             self.detail_view.load_game(game_id)
+
+    # ── Save Backup ───────────────────────────────────────────────────────────
+
+    def _maybe_run_save_backup_flow(self, game_id: int):
+        """
+        Post-play Save Backup detection (Flow 1 — see save_backup.py).
+        No-ops immediately if: the feature is disabled, this game is
+        already linked (save_source_path set — Flow 2 territory, not
+        implemented yet), or no pending snapshot was persisted for this
+        game (meaning no snapshot was taken at launch — e.g. the feature
+        was toggled on mid-session, or the game has no wine_prefix).
+        """
+        if db.get_setting("save_backup_enabled", "false") != "true":
+            return
+
+        game = db.get_game(game_id)
+        if not game:
+            return
+
+        try:
+            existing = db.get_save_paths(game_id)
+        except Exception:
+            existing = {"save_source_path": None}
+        if existing.get("save_source_path"):
+            return  # already linked
+
+        pending = save_backup.load_pending_snapshot(game["folder_name"])
+        if not pending:
+            return
+
+        actual_prefix = Path(pending["prefix_path"])
+        snapshot      = pending["snapshot"]
+        title = game["title"] or game["display_name"] or game["folder_name"]
+
+        # Fast path: known common save locations
+        known = save_backup.scan_known_locations(actual_prefix, title)
+        if known:
+            candidates = save_backup.candidates_from_known_locations(known)
+        else:
+            changed = save_backup.diff_snapshot(actual_prefix, snapshot)
+            drive_c = actual_prefix / "drive_c"
+            kept, filtered = save_backup.filter_noise(changed, drive_c)
+            if filtered:
+                log.debug("[SAVE BACKUP] Filtered %d noise file(s) for game_id=%d: %s",
+                          len(filtered), game_id,
+                          [str(f) for f in filtered[:20]])
+            candidates = save_backup.rank_candidate_folders(kept, drive_c, title)
+
+        if not candidates:
+            log.debug("[SAVE BACKUP] No changed save folders detected for "
+                      "game_id=%d (%s)", game_id, title)
+            save_backup.delete_pending_snapshot(game["folder_name"])
+            return
+
+        dlg = SaveBackupDialog(title, candidates, parent=self)
+        if dlg.exec() != SaveBackupDialog.DialogCode.Accepted:
+            # Skipped — save_source_path stays unset, so Flow 1 runs again
+            # the next time this game is played.
+            log.info("[SAVE BACKUP] User skipped backup prompt for game_id=%d (%s)",
+                     game_id, title)
+            save_backup.delete_pending_snapshot(game["folder_name"])
+            return
+
+        chosen = dlg.chosen_path()
+        save_backup.delete_pending_snapshot(game["folder_name"])
+        if not chosen:
+            return
+
+        save_root = db.get_setting(
+            "save_backup_root", str(Path.home() / "Documents" / "Game Saves"))
+        self._apply_save_backup(game_id, game["folder_name"], Path(chosen), Path(save_root))
+
+    def _apply_save_backup(self, game_id: int, folder_name: str,
+                           chosen_folder: Path, save_root: Path):
+        """Move the user-chosen folder to the canonical save path and
+        record the link in game_state. Handles the overwrite-conflict
+        confirmation if a previous backup already exists at that path."""
+        try:
+            canonical = save_backup.move_and_link(chosen_folder, save_root, folder_name)
+        except save_backup.SaveMoveConflict as e:
+            reply = QMessageBox.question(
+                self, "Save Backup",
+                f"A backed-up save already exists at:\n{e.canonical_path}\n\n"
+                "Continuing will overwrite it with the save you just picked. "
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                log.info("[SAVE BACKUP] User declined overwrite for game_id=%d — skipped",
+                         game_id)
+                return
+            try:
+                canonical = save_backup.move_and_link(
+                    chosen_folder, save_root, folder_name, overwrite_confirmed=True)
+            except Exception as e2:
+                log.error("[SAVE BACKUP] move_and_link failed after overwrite confirm: %s", e2)
+                self.library_view.show_status(f"⚠ Save Backup failed: {e2}", timeout=6000)
+                return
+        except Exception as e:
+            log.error("[SAVE BACKUP] move_and_link failed: %s", e)
+            self.library_view.show_status(f"⚠ Save Backup failed: {e}", timeout=6000)
+            return
+
+        db.set_save_paths(game_id, save_path=str(canonical), save_source_path=str(chosen_folder))
+        log.info("[SAVE BACKUP] Linked game_id=%d: %s → %s", game_id, chosen_folder, canonical)
+        self.library_view.show_status(f"✓ Save backed up to {canonical}", timeout=5000)

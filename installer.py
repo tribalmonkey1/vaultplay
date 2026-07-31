@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional, Callable
 
 import db
+import scanner
 
 log = logging.getLogger(__name__)
 
@@ -830,45 +831,31 @@ def _safe_name(title: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", title).strip("_").lower()
 
 
-def create_direct_desktop(title: str, exe_path: str,
-                           prefix_path: Path, wine_bin: str = "wine",
-                           icon_path: str = "") -> str:
-    """Create a .desktop file that launches the game via the given Wine/Proton binary."""
+def create_direct_desktop(title: str, launch_cmd: str,
+                           launch_cwd: str = "", icon_path: str = "") -> str:
+    """
+    Write a .desktop file from pre-computed launch values stored in the DB.
+    This is a pure file-writing utility — it does not figure out what to launch.
+    _extract_launch_info() is responsible for determining the correct values.
+    """
     APPS_DIR.mkdir(parents=True, exist_ok=True)
     safe_title = re.sub(r"[/\x00]", "_", title).strip()
     desktop = APPS_DIR / f"{safe_title}.desktop"
 
-    # Extract icon from the exe if we don't already have one from SteamGridDB
-    if not icon_path or not Path(icon_path).exists():
-        icon_cache = Path.home() / ".config" / "vaultplay" / "icons"
-        extracted = extract_exe_icon(Path(exe_path), icon_cache / safe_title)
-        if extracted:
-            icon_path = extracted
-
-    if Path(wine_bin).name == "proton":
-        steam_root  = _find_steam_root()
-        wineprefix  = str(prefix_path / "pfx")
-        compat_data = str(prefix_path)
-        exec_cmd = (
-            f'env WINEPREFIX="{wineprefix}"'
-            f' STEAM_COMPAT_DATA_PATH="{compat_data}"'
-            f' STEAM_COMPAT_CLIENT_INSTALL_PATH="{steam_root}"'
-            f' PROTON_LOG="0"'
-            f' "{wine_bin}" run "{exe_path}"'
-        )
-    else:
-        exec_cmd = f'env WINEPREFIX="{prefix_path}" "{wine_bin}" "{exe_path}"'
-
     content = f"""[Desktop Entry]
 Name={title}
-Exec={exec_cmd}
+Exec={launch_cmd}
 Type=Application
 Categories=Game;
+StartupNotify=true
 """
+    if launch_cwd and Path(launch_cwd).exists():
+        content += f"Path={launch_cwd}\n"
     if icon_path and Path(icon_path).exists():
         content += f"Icon={icon_path}\n"
+
     desktop.write_text(content)
-    log.info("Created .desktop: %s (wine_bin=%s)", desktop, wine_bin)
+    log.info("Wrote .desktop: %s", desktop)
     return str(desktop)
 
 
@@ -909,6 +896,67 @@ Categories=Game;
 
     log.info("Created script launcher: %s + %s", script, desktop)
     return str(script), str(desktop)
+
+
+def _extract_launch_info(title: str, prefix_path: Path, exe_path: str,
+                          wine_bin: str, game_dir: str) -> tuple:
+    """
+    Determine the best launch command, working directory, and icon for a game.
+
+    Priority:
+      1. If winemenubuilder created a .desktop for this game (after the Windows
+         installer ran), parse its Exec= and Path= lines — these represent what
+         the game's own installer decided was the correct launch target, which
+         may be a .lnk shortcut rather than a raw .exe.
+      2. Otherwise, construct the Exec= line from exe_path and wine_bin directly.
+
+    Returns (launch_cmd, launch_cwd, icon_path) — all strings, any may be "".
+    """
+    # Try to find a winemenubuilder .desktop first
+    for f in APPS_DIR.glob("*.desktop"):
+        try:
+            text  = f.read_text(errors="replace")
+            lines = {}
+            for l in text.splitlines():
+                if "=" in l:
+                    k, _, v = l.partition("=")
+                    lines[k.strip()] = v.strip()
+            name  = lines.get("Name", "")
+            exec_ = lines.get("Exec", "")
+            path_ = lines.get("Path", "")
+            # Must reference our prefix path
+            if str(prefix_path) not in exec_:
+                continue
+            # Title must loosely match
+            if (title.lower() not in name.lower() and
+                    name.lower() not in title.lower()):
+                continue
+            # Found a match — use its Exec= and Path=.
+            # Do NOT use its Icon= value — winemenubuilder Icon= fields are
+            # bare icon names (e.g. "2035_DELTARUN-2.0"), not file paths.
+            # Icon resolution is handled by the caller using SteamGridDB art.
+            cwd = path_ if (path_ and Path(path_).exists()) else game_dir
+            log.info("Using winemenubuilder Exec= for '%s': %s", title, exec_)
+            return exec_, cwd, ""   # icon always "" — caller fills it in
+        except Exception:
+            continue
+
+    # No winemenubuilder match — construct from raw values
+    if Path(wine_bin).name == "proton":
+        steam_root  = _find_steam_root()
+        wineprefix  = str(prefix_path / "pfx")
+        compat_data = str(prefix_path)
+        launch_cmd = (
+            f'env WINEPREFIX="{wineprefix}"'
+            f' STEAM_COMPAT_DATA_PATH="{compat_data}"'
+            f' STEAM_COMPAT_CLIENT_INSTALL_PATH="{steam_root}"'
+            f' PROTON_LOG="0"'
+            f' "{wine_bin}" run "{exe_path}"'
+        )
+    else:
+        launch_cmd = f'env WINEPREFIX="{prefix_path}" "{wine_bin}" "{exe_path}"'
+
+    return launch_cmd, game_dir, ""
 
 
 # ── Pre-flight helpers ────────────────────────────────────────────────────────
@@ -1010,6 +1058,202 @@ def _find_new_exe(install_path: Path, before: set) -> Optional[Path]:
 
 
 # ── Main install pipeline ─────────────────────────────────────────────────────
+
+# ── Update & DLC Install Support — addon application ────────────────────────
+
+def _addon_sort_key(addon_row) -> tuple:
+    """
+    Comparable sort key for ordering addon rows in ascending version order
+    (used to apply updates in the correct sequence). Handles whichever of
+    dotted/plain/date is populated on the row — per detect_version()'s
+    contract, exactly one is. Rows with no detected version at all sort
+    first (lowest), so an unversioned update still gets applied, just
+    without a defined position relative to versioned siblings.
+    """
+    import version_check as vc
+    try:
+        if addon_row["detected_version_date"]:
+            return (2, vc.date_sort_key(addon_row["detected_version_date"]))
+    except (IndexError, KeyError):
+        pass
+    try:
+        if addon_row["detected_version_dotted"]:
+            return (1, vc.sort_key(addon_row["detected_version_dotted"]))
+    except (IndexError, KeyError):
+        pass
+    try:
+        if addon_row["detected_version_plain"]:
+            return (1, vc.sort_key(addon_row["detected_version_plain"]))
+    except (IndexError, KeyError):
+        pass
+    return (0, ())
+
+
+def _addon_containing_dir(addon_row) -> Path:
+    """
+    Return the directory that actually contains addon_row's archive.
+    nas_path means different things depending on how the addon was found —
+    for a subfolder-style addon it's already a directory; for a loose
+    sibling archive it's the archive file itself (see scanner.py's
+    _scan_one_addon_item) — this normalizes both to "the directory to hand
+    to extract_archive()".
+    """
+    p = Path(addon_row["nas_path"])
+    return p if p.is_dir() else p.parent
+
+
+def _run_addon_installer(addon_row, prefix_path: Path, wine_bin: str,
+                         tmp_base: Path, progress_cb: Callable = None) -> bool:
+    """
+    Extract (if archived) one addon and run its installer/exe via Wine in
+    the given, already-created prefix — the SAME prefix the base game was
+    just installed into, never a new one. Returns True if the installer
+    process completed without a timeout/missing-binary error.
+
+    Like the base install flows, this can't reliably distinguish "the
+    installer ran and genuinely succeeded" from "it ran and silently did
+    nothing" for arbitrary third-party installers — this mirrors the same
+    best-effort completion check the base flows already use.
+    """
+    archive_name = addon_row["archive_name"]
+    file_type    = addon_row["file_type"]
+
+    if archive_name and file_type in ("rar", "7zip", "zip"):
+        containing_dir = _addon_containing_dir(addon_row)
+        tmp_path = tmp_base / f"addon_{addon_row['id']}"
+        ok = extract_archive(str(containing_dir), archive_name, file_type,
+                             tmp_path, progress_cb)
+        if not ok:
+            log.error("Addon extraction failed: %s", archive_name)
+            return False
+        search_root = tmp_path
+    else:
+        # Loose exe(s) directly at nas_path, nothing to extract
+        search_root = Path(addon_row["nas_path"])
+        if search_root.is_file():
+            search_root = search_root.parent
+
+    installer_exe = find_installer_exe(search_root) or find_game_exe(search_root)
+    if not installer_exe:
+        log.warning("No installer/exe found for addon at %s", search_root)
+        return False
+
+    env = _build_wine_env(wine_bin, prefix_path)
+    try:
+        cmd = ([wine_bin, "run", str(installer_exe)]
+               if Path(wine_bin).name == "proton"
+               else [wine_bin, str(installer_exe)])
+        subprocess.run(cmd, env=env, timeout=1800)
+        return True
+    except subprocess.TimeoutExpired:
+        log.error("Addon installer timed out: %s", installer_exe)
+        return False
+    except FileNotFoundError:
+        log.error("wine not found while installing addon: %s", installer_exe)
+        return False
+
+
+def _install_pending_addons(game_id: int, prefix_path: Path, wine_bin: str,
+                            selected_addon_ids, tmp_base: Path,
+                            progress_cb: Callable = None) -> dict:
+    """
+    Apply selected update/installable-DLC/crackfix addons, in the confirmed
+    order: updates first (ascending version, respecting update_patch_mode),
+    then installable DLC, then crackfix — all run via Wine in the SAME
+    prefix the base game was just installed into.
+
+    selected_addon_ids: set/list of game_addons.id the user left checked in
+    the Install dialog's Updates & DLC section. Addons not in this set are
+    skipped entirely — this is how unchecking a box in the UI takes effect.
+    Pass None to apply every pending addon found (reserved for a future
+    automatic "install all pending updates" action — not currently used by
+    the Install dialog).
+
+    Already-installed addons are always skipped regardless of selection, as
+    a safety net against ever reapplying — matches the decision that DLC
+    only installs if not already installed, extended defensively to
+    updates/crackfix too.
+
+    Bonus content is NEVER applied here regardless of selection — it has no
+    install pipeline at all, only the separate manual extract action.
+
+    Returns:
+        {
+            "failed": list[str],            -- addon display names that failed
+            "installed_version": {           -- from the highest UPDATE applied,
+                "dotted": str|None,           -- for seeding installs.installed_version_*
+                "plain":  str|None,
+                "date":   str|None,
+            },
+        }
+    """
+    def _selected(addon_row) -> bool:
+        return selected_addon_ids is None or addon_row["id"] in selected_addon_ids
+
+    failed: list = []
+    installed_version = {"dotted": None, "plain": None, "date": None}
+
+    # ── Updates — ascending version order ──────────────────────────────────
+    updates = [a for a in db.get_addons_for_game(game_id, "update")
+              if _selected(a) and not a["installed"]]
+    updates.sort(key=_addon_sort_key)
+
+    game = db.get_game(game_id)
+    patch_mode = "incremental"
+    if game and "update_patch_mode" in game.keys() and game["update_patch_mode"]:
+        patch_mode = game["update_patch_mode"]
+    if patch_mode == "cumulative" and updates:
+        # Only the single highest pending update needs applying — it's a
+        # full replacement patch, not a delta requiring the ones before it.
+        updates = [updates[-1]]
+
+    for addon in updates:
+        label = addon["archive_name"] or Path(addon["nas_path"]).name
+        if progress_cb:
+            progress_cb("Installing updates", 0, f"Applying update: {label}…")
+        ok = _run_addon_installer(addon, prefix_path, wine_bin, tmp_base, progress_cb)
+        if ok:
+            db.mark_addon_installed(addon["id"])
+            if addon["detected_version_date"]:
+                installed_version["date"] = addon["detected_version_date"]
+            elif addon["detected_version_dotted"]:
+                installed_version["dotted"] = addon["detected_version_dotted"]
+            elif addon["detected_version_plain"]:
+                installed_version["plain"] = addon["detected_version_plain"]
+        else:
+            failed.append(label)
+            log.warning("Update failed to apply, continuing with remaining addons: %s", label)
+
+    # ── Installable DLC — order doesn't matter between DLC items ──────────
+    dlc_items = [a for a in db.get_addons_for_game(game_id, "installable_dlc")
+                if _selected(a) and not a["installed"]]
+    for addon in dlc_items:
+        label = addon["archive_name"] or Path(addon["nas_path"]).name
+        if progress_cb:
+            progress_cb("Installing DLC", 0, f"Installing DLC: {label}…")
+        ok = _run_addon_installer(addon, prefix_path, wine_bin, tmp_base, progress_cb)
+        if ok:
+            db.mark_addon_installed(addon["id"])
+        else:
+            failed.append(label)
+            log.warning("DLC failed to install, continuing with remaining addons: %s", label)
+
+    # ── Crackfix — always applies if selected, no version gating ──────────
+    crackfixes = [a for a in db.get_addons_for_game(game_id, "crackfix")
+                 if _selected(a) and not a["installed"]]
+    for addon in crackfixes:
+        label = addon["archive_name"] or Path(addon["nas_path"]).name
+        if progress_cb:
+            progress_cb("Applying crackfix", 0, f"Applying: {label}…")
+        ok = _run_addon_installer(addon, prefix_path, wine_bin, tmp_base, progress_cb)
+        if ok:
+            db.mark_addon_installed(addon["id"])
+        else:
+            failed.append(label)
+            log.warning("Crackfix failed to apply, continuing: %s", label)
+
+    return {"failed": failed, "installed_version": installed_version}
+
 
 def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> dict:
     """
@@ -1124,8 +1368,9 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
                 log.info("No external mount points found to map")
         # else: winetricks_default — leave dosdevices as Wine created it
 
+        failed_redists = []
         if options.get("redists"):
-            install_redists(prefix_path, options["redists"], prog,
+            failed_redists = install_redists(prefix_path, options["redists"], prog,
                             force=options.get("force_redists", False))
 
         prog("Installing", 60, f"Running {installer_exe.name} via Wine…")
@@ -1189,22 +1434,35 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             else:
                 log.info("Could not auto-detect game exe — recording install without exe_path")
 
-        # Fetch icon
-        icon_path = ""
+        # Re-fetch game row here — metadata may have arrived since install started
+        fresh_game = db.get_game(game_id) or game
+        icon_path  = ""
         try:
-            icon_url = game.get("cover_url") or ""
-            if icon_url:
-                cached = db.get_cached_art(icon_url)
-                if cached:
-                    icon_path = cached
+            # Icon priority: exe extraction first (correct aspect ratio + authentic),
+            # fall back to SGDB cover art if extraction fails or exe not found yet
+            if exe_path and Path(str(exe_path)).exists():
+                icon_cache = Path.home() / ".config" / "vaultplay" / "icons"
+                safe = re.sub(r"[/\x00]", "_", title).strip()
+                extracted = extract_exe_icon(Path(str(exe_path)), icon_cache / safe)
+                if extracted:
+                    icon_path = extracted
+            if not icon_path:
+                icon_url = fresh_game["cover_url"] or ""
+                if icon_url:
+                    cached = db.get_cached_art(icon_url)
+                    if cached:
+                        icon_path = cached
         except Exception:
             pass
 
-        # Create .desktop if we found the exe
-        desktop_path = ""
+        launch_cmd = launch_cwd = launch_icon = ""
         if exe_path:
-            desktop_path = create_direct_desktop(
-                title, str(exe_path), prefix_path, wine_bin, icon_path)
+            game_dir   = str(actual_install_path) if actual_install_path else ""
+            launch_cmd, launch_cwd, _ = _extract_launch_info(
+                title, prefix_path, str(exe_path), wine_bin, game_dir)
+            launch_icon = icon_path   # use our resolved icon, not _extract_launch_info's
+
+        desktop_path = create_direct_desktop(title, launch_cmd, launch_cwd, launch_icon)
 
         if options.get("cleanup_tmp", True):
             _cleanup(tmp_path, True, prog)
@@ -1215,13 +1473,32 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             wine_prefix=str(prefix_path),
             exe_path=str(exe_path) if exe_path else "",
             desktop_path=desktop_path,
+            launch_cmd=launch_cmd,
+            launch_cwd=launch_cwd,
+            launch_icon=launch_icon,
         )
+
+        # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
+        addon_result = _install_pending_addons(
+            game_id, prefix_path, wine_bin,
+            options.get("selected_addon_ids"), tmp_base, prog)
+        final_version = addon_result["installed_version"]
+        if not (final_version["dotted"] or final_version["plain"] or final_version["date"]):
+            # No update applied — seed installed_version from the base
+            # archive's own detected version instead, if it has one.
+            final_version = scanner.detect_addon_version(
+                archive_name, [exe_path.name] if exe_path else [], game["folder_name"])
+        if final_version["dotted"] or final_version["plain"] or final_version["date"]:
+            db.set_installed_version(game_id, **final_version)
+
         prog("Done", 100, f"'{title}' installed!")
         return {"success": True, "error": None,
                 "exe_path": str(exe_path) if exe_path else "",
                 "desktop_path": desktop_path,
                 "tmp_path": str(tmp_path),
-                "cancelled": False}
+                "cancelled": False,
+                "failed_redists": failed_redists,
+                "failed_addons": addon_result["failed"]}
 
     # ── Installer flow ────────────────────────────────────────────────────────
     elif install_tag == "installer":
@@ -1236,8 +1513,9 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
         if db.get_setting("wine_drive_mapping", "auto") == "auto":
             map_all_drives(_resolve_actual_prefix(prefix_path, wine_bin))
 
+        failed_redists = []
         if options.get("redists"):
-            install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
+            failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
 
         prog("Installing", 50, f"Running {installer_exe.name} via Wine…")
         env = _build_wine_env(wine_bin, prefix_path)
@@ -1288,20 +1566,32 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             else:
                 log.info("Could not auto-detect game exe — recording install without exe_path")
 
-        icon_path = ""
+        fresh_game = db.get_game(game_id) or game
+        icon_path  = ""
         try:
-            icon_url = game.get("cover_url") or ""
-            if icon_url:
-                cached = db.get_cached_art(icon_url)
-                if cached:
-                    icon_path = cached
+            if exe_path and Path(str(exe_path)).exists():
+                icon_cache = Path.home() / ".config" / "vaultplay" / "icons"
+                safe = re.sub(r"[/\x00]", "_", title).strip()
+                extracted = extract_exe_icon(Path(str(exe_path)), icon_cache / safe)
+                if extracted:
+                    icon_path = extracted
+            if not icon_path:
+                icon_url = fresh_game["cover_url"] or ""
+                if icon_url:
+                    cached = db.get_cached_art(icon_url)
+                    if cached:
+                        icon_path = cached
         except Exception:
             pass
 
-        desktop_path = ""
+        launch_cmd = launch_cwd = launch_icon = ""
         if exe_path:
-            desktop_path = create_direct_desktop(
-                title, str(exe_path), prefix_path, wine_bin, icon_path)
+            game_dir   = str(actual_install_path) if actual_install_path else ""
+            launch_cmd, launch_cwd, _ = _extract_launch_info(
+                title, prefix_path, str(exe_path), wine_bin, game_dir)
+            launch_icon = icon_path
+
+        desktop_path = create_direct_desktop(title, launch_cmd, launch_cwd, launch_icon)
 
         if options.get("cleanup_tmp", True):
             _cleanup(tmp_path, True, prog)
@@ -1311,13 +1601,30 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             wine_prefix=str(prefix_path),
             exe_path=str(exe_path) if exe_path else "",
             desktop_path=desktop_path,
+            launch_cmd=launch_cmd,
+            launch_cwd=launch_cwd,
+            launch_icon=launch_icon,
         )
+
+        # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
+        addon_result = _install_pending_addons(
+            game_id, prefix_path, wine_bin,
+            options.get("selected_addon_ids"), tmp_base, prog)
+        final_version = addon_result["installed_version"]
+        if not (final_version["dotted"] or final_version["plain"] or final_version["date"]):
+            final_version = scanner.detect_addon_version(
+                archive_name, [exe_path.name] if exe_path else [], game["folder_name"])
+        if final_version["dotted"] or final_version["plain"] or final_version["date"]:
+            db.set_installed_version(game_id, **final_version)
+
         prog("Done", 100, f"'{title}' installed!")
         return {"success": True, "error": None,
                 "exe_path": str(exe_path) if exe_path else "",
                 "desktop_path": desktop_path,
                 "tmp_path": str(tmp_path),
-                "cancelled": False}
+                "cancelled": False,
+                "failed_redists": failed_redists,
+                "failed_addons": addon_result["failed"]}
 
     # ── Portable flow ─────────────────────────────────────────────────────────
     elif install_tag == "portable":
@@ -1327,8 +1634,9 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
         if db.get_setting("wine_drive_mapping", "auto") == "auto":
             map_all_drives(_resolve_actual_prefix(prefix_path, wine_bin))
 
+        failed_redists = []
         if options.get("redists"):
-            install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
+            failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
 
         prog("Copying files", 40, f"Copying to {game_dest}…")
         try:
@@ -1347,20 +1655,29 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
         script_path   = ""
         desktop_path  = ""
 
-        icon_path = ""
+        fresh_game = db.get_game(game_id) or game
+        icon_path  = ""
         try:
-            icon_url = game["cover_url"] or ""
-            if icon_url:
-                cached = db.get_cached_art(icon_url)
-                if cached:
-                    icon_path = cached
+            if exe_path and Path(str(exe_path)).exists():
+                icon_cache = Path.home() / ".config" / "vaultplay" / "icons"
+                safe = re.sub(r"[/\x00]", "_", title).strip()
+                extracted = extract_exe_icon(Path(str(exe_path)), icon_cache / safe)
+                if extracted:
+                    icon_path = extracted
+            if not icon_path:
+                icon_url = fresh_game["cover_url"] or ""
+                if icon_url:
+                    cached = db.get_cached_art(icon_url)
+                    if cached:
+                        icon_path = cached
         except Exception:
             pass
 
         prog("Creating launcher", 85, "Generating .desktop launcher…")
-        desktop_path = create_direct_desktop(
-            title, str(exe_path), prefix_path, wine_bin, icon_path
-        )
+        launch_cmd, launch_cwd, _ = _extract_launch_info(
+            title, prefix_path, str(exe_path), wine_bin, str(game_dest))
+        launch_icon  = icon_path
+        desktop_path = create_direct_desktop(title, launch_cmd, launch_cwd, launch_icon)
 
         if options.get("cleanup_tmp", True):
             _cleanup(tmp_path, True, prog)
@@ -1374,7 +1691,22 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launcher_type=launcher_type,
             desktop_path=desktop_path,
             script_path=script_path,
+            launch_cmd=launch_cmd,
+            launch_cwd=launch_cwd,
+            launch_icon=launch_icon,
         )
+
+        # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
+        addon_result = _install_pending_addons(
+            game_id, prefix_path, wine_bin,
+            options.get("selected_addon_ids"), tmp_base, prog)
+        final_version = addon_result["installed_version"]
+        if not (final_version["dotted"] or final_version["plain"] or final_version["date"]):
+            final_version = scanner.detect_addon_version(
+                archive_name, [exe_path.name] if exe_path else [], game["folder_name"])
+        if final_version["dotted"] or final_version["plain"] or final_version["date"]:
+            db.set_installed_version(game_id, **final_version)
+
         prog("Done", 100, f"'{title}' installed!")
         return {
             "success":      True,
@@ -1384,6 +1716,8 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             "script_path":  script_path,
             "tmp_path":     str(tmp_path),
             "cancelled":    False,
+            "failed_redists": failed_redists,
+            "failed_addons": addon_result["failed"],
         }
 
     return fail(f"Unknown install_tag: {install_tag}")

@@ -14,13 +14,31 @@ It blocks on a single wait call appropriate for the Wine variant in use:
       meaning it naturally handles multi-process games and the case where
       the Wine launcher wrapper exits immediately after spawning the game.
 
+      wineserver --wait waits on a wineserver that's ALREADY running for
+      the prefix — it doesn't start one. Because PlaytimeWatcher.start()
+      fires right after the game's Popen call, the very first call can
+      race ahead of Wine actually spinning up its wineserver for this
+      session (connecting to X, loading DLLs, etc. all take real time),
+      seeing nothing running yet and returning success in milliseconds.
+      This is caught by cross-checking self._proc.poll(): if wineserver
+      claims done while the process we actually launched is still alive,
+      that's the startup race, not a real session end, and the wait is
+      retried — see _wait_wine().
+
   Proton (any binary named "proton"):
-      Calls proc.wait() on the original Popen handle.
-      The Proton wrapper stays alive as a parent process for the full session,
-      so proc.wait() is reliable here.
-      wineserver --wait is NOT used for Proton because Proton's wineserver
-      lives inside the pressure-vessel container and is not accessible via
-      the system wineserver binary.
+      Calls proc.wait() on the original Popen handle, THEN polls /proc for
+      any remaining process whose environment shows STEAM_COMPAT_DATA_PATH
+      matching this session's wine_prefix, blocking until none remain.
+      The second step exists because proc.wait() alone is NOT reliable —
+      some games (e.g. a launcher.exe stub that spawns the real game.exe
+      and exits) have their top-level Proton-launched process exit long
+      before the actual game does. Every process spawned under a Proton
+      launch inherits STEAM_COMPAT_DATA_PATH from the environment
+      installer.py's _build_wine_env() sets, so scanning for it gives the
+      same "wait for everything in the prefix" guarantee wineserver --wait
+      gives plain Wine, without needing access to Proton's internal
+      wineserver (which lives inside the pressure-vessel container and is
+      not accessible via the system wineserver binary).
 
 Safety cap
 ----------
@@ -70,6 +88,7 @@ import datetime
 import logging
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -150,37 +169,149 @@ class PlaytimeWatcher(QThread):
         Block until all Wine processes in the prefix have exited, using
         `wineserver --wait`. Falls back to proc.wait() if wineserver is
         not available or if the prefix path is not set.
+
+        wineserver --wait waits on a wineserver that's ALREADY running for
+        this prefix — it does not start one. If this is called right after
+        the game's process was launched (which is exactly when
+        PlaytimeWatcher.start() fires), it can race ahead of Wine actually
+        spinning up its wineserver for this session — connecting to the X
+        server, loading DLLs, etc. all take real wall-clock time. In that
+        race window, wineserver --wait sees nothing running yet for this
+        prefix and returns success in milliseconds, even though the game
+        is still starting. Cross-checking self._proc.poll() catches this:
+        if wineserver claims nothing is running while the process we
+        actually launched is still alive, that's the race, not a real
+        session end — retry instead of trusting it.
         """
         if not self._wine_prefix:
             log.warning("[PLAYTIME] No wine_prefix — falling back to proc.wait()")
             self._wait_proc()
             return
 
-        try:
-            env = {**os.environ, "WINEPREFIX": self._wine_prefix}
-            result = subprocess.run(
-                ["wineserver", "--wait"],
-                env=env,
-                timeout=MAX_SESSION_SECONDS,
-            )
-            log.debug("[PLAYTIME] wineserver --wait exited with code %d",
-                      result.returncode)
-        except FileNotFoundError:
-            log.warning("[PLAYTIME] wineserver not found — falling back to proc.wait()")
-            self._wait_proc()
-        except subprocess.TimeoutExpired:
-            log.warning("[PLAYTIME] wineserver --wait hit 24h safety cap — ending session")
-        except Exception as e:
-            log.warning("[PLAYTIME] wineserver --wait error: %s — falling back to proc.wait()", e)
-            self._wait_proc()
+        env = {**os.environ, "WINEPREFIX": self._wine_prefix}
+        deadline = time.monotonic() + MAX_SESSION_SECONDS
+        logged_race = False
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning("[PLAYTIME] wineserver --wait retry loop hit 24h "
+                           "safety cap — ending session")
+                return
+            try:
+                t0 = time.monotonic()
+                result = subprocess.run(
+                    ["wineserver", "--wait"],
+                    env=env,
+                    timeout=remaining,
+                )
+                elapsed = time.monotonic() - t0
+                log.debug("[PLAYTIME] wineserver --wait exited with code %d after %.2fs",
+                          result.returncode, elapsed)
+            except FileNotFoundError:
+                log.warning("[PLAYTIME] wineserver not found — falling back to proc.wait()")
+                self._wait_proc()
+                return
+            except subprocess.TimeoutExpired:
+                log.warning("[PLAYTIME] wineserver --wait hit 24h safety cap — ending session")
+                return
+            except Exception as e:
+                log.warning("[PLAYTIME] wineserver --wait error: %s — falling back to proc.wait()", e)
+                self._wait_proc()
+                return
+
+            if self._proc.poll() is None:
+                # wineserver reported nothing running, but the process we
+                # actually launched is still alive — startup race. Retry.
+                if not logged_race:
+                    log.info("[PLAYTIME] wineserver --wait returned but the launched "
+                             "process is still running (likely raced ahead of "
+                             "wineserver starting up) — retrying")
+                    logged_race = True
+                time.sleep(1.0)
+                continue
+
+            return
 
     def _wait_proton(self):
         """
-        Block until the Proton wrapper process exits using proc.wait().
-        The Proton wrapper stays alive for the full session, so this is reliable.
+        Block until every process belonging to this Proton session has
+        exited — not just the top-level launched process.
+
+        proc.wait() alone is insufficient: some games run a launcher.exe
+        stub under Proton that spawns the real game.exe and then exits,
+        which would otherwise end the tracked session (and, previously,
+        fire the post-play Save Backup prompt) within seconds of launch
+        while the actual game keeps running. See module docstring.
         """
         log.debug("[PLAYTIME] Using proc.wait() for Proton session")
         self._wait_proc()
+        self._wait_for_prefix_processes_to_exit()
+
+    def _wait_for_prefix_processes_to_exit(self, poll_interval: float = 2.0):
+        """
+        Poll /proc for any process whose environment shows
+        STEAM_COMPAT_DATA_PATH matching this session's wine_prefix, and
+        block until none remain (or the 24h safety cap is hit). This is
+        the Proton equivalent of _wait_wine()'s `wineserver --wait` — see
+        module docstring for why it's necessary and why it's reliable.
+        No-op if wine_prefix wasn't provided (nothing to match against).
+        """
+        if not self._wine_prefix:
+            return
+        target   = self._wine_prefix.rstrip("/")
+        deadline = time.monotonic() + MAX_SESSION_SECONDS
+
+        # Give a just-exited top-level process a brief moment to have its
+        # spawned child actually appear in /proc before the first check —
+        # avoids a race where we check in the split second between the
+        # launcher exiting and the real game.exe process existing.
+        time.sleep(1.0)
+
+        logged_continuation = False
+        while time.monotonic() < deadline:
+            if not self._any_process_in_prefix(target):
+                return
+            if not logged_continuation:
+                log.info("[PLAYTIME] Top-level process exited but other "
+                         "process(es) still running in prefix %s — "
+                         "continuing session", target)
+                logged_continuation = True
+            time.sleep(poll_interval)
+
+        log.warning("[PLAYTIME] Proton prefix process check hit 24h safety "
+                    "cap — ending session")
+
+    @staticmethod
+    def _any_process_in_prefix(target_prefix: str) -> bool:
+        """
+        True if any currently-running process has STEAM_COMPAT_DATA_PATH
+        equal to target_prefix in its environment. Reading another
+        process's /proc/<pid>/environ requires matching UID, which holds
+        here since every Wine/Proton/Steam process runs as the same user.
+        Silently skips any PID it can't read (permission errors, the
+        process exiting mid-scan, zombies with empty environ) rather than
+        treating a read failure as "still running".
+        """
+        try:
+            pids = os.listdir("/proc")
+        except OSError:
+            return False
+        for pid_str in pids:
+            if not pid_str.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid_str}/environ", "rb") as f:
+                    raw = f.read()
+            except (OSError, PermissionError):
+                continue
+            for entry in raw.split(b"\x00"):
+                if entry.startswith(b"STEAM_COMPAT_DATA_PATH="):
+                    value = entry.split(b"=", 1)[1].decode(errors="replace").rstrip("/")
+                    if value == target_prefix:
+                        return True
+                    break
+        return False
 
     def _wait_proc(self):
         """

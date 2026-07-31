@@ -1,16 +1,26 @@
 """
 ui/library_view.py — Game library tile grid for VaultPlay
 
-Rendering approach:
-  - Tiles trickle in one per event-loop tick via chained QTimer.singleShot(0)
-  - Row-based layout (QVBoxLayout of QHBoxLayout rows) so rows append at the
-    bottom without shifting anything above
-  - Hover effect uses CSS :hover pseudo-selector only — no enterEvent/leaveEvent,
-    no runtime setStyleSheet() calls, which was the cause of vertical jitter
-  - Resize debounced at 200ms; reflows only if column count changed
-  - Refresh button disabled while trickle or scan is in progress
-  - Status bar has fixed height so it never expands and shifts the grid
-  - Scroll area always visible so header stays in position even when empty
+Rendering approach: VIRTUALIZED grid (replaces the old trickle-load approach).
+
+  - Tiles are NOT managed by a QLayout. QGridLayout has no virtualization
+    support, and a layout-per-tile approach doesn't scale — every tile has
+    to exist as a widget the whole time the library is loaded.
+  - Instead, a single fixed-size "canvas" QWidget sits inside the
+    QScrollArea. Its size is computed once from the full filtered game
+    count (rows * tile height), and every tile is a plain child widget of
+    the canvas, positioned directly with setGeometry().
+  - Only tiles that fall within the current viewport (plus a small buffer
+    of rows above/below, for smooth scrolling) are ever instantiated.
+    Scrolling diffs the "wanted" index range against the currently-live
+    tile pool: tiles that scrolled out get deleted, tiles that scrolled in
+    get created.
+  - Because the canvas size never changes while tiles are created/destroyed
+    (only on filter change, resize, or tile-size change), there is nothing
+    for QScrollArea to recalculate mid-scroll — this is the property that
+    made virtualization worth trying as an alternative to the old
+    trickle-based renderer.
+  - Cover art still loads asynchronously per visible tile, same as before.
 """
 
 
@@ -34,10 +44,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QStackedWidget,
     QLabel, QPushButton, QLineEdit, QFrame, QSizePolicy
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRunnable, QThreadPool, pyqtSlot, QObject, QEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRunnable, QThreadPool, pyqtSlot, QObject
 from PyQt6.QtGui import QPixmap, QFont
 
 import db
@@ -173,8 +183,6 @@ class GameTile(QFrame):
         super().__init__(parent)
         self.game_id     = game["id"]
         self.tile_width  = tile_width
-        self._is_favorite = bool(_safe_get(game, "is_favorite", 0))
-        self._is_hidden   = bool(_safe_get(game, "is_hidden",   0))
 
         cover_h = int(tile_width * 1.5)
         tile_h  = cover_h + 32   # cover + footer (8px top + ~14px label + 10px bottom)
@@ -202,6 +210,11 @@ class GameTile(QFrame):
         self.cover_label.setStyleSheet(
             f"background: {COLORS['surface2']}; border: none;"
         )
+        self._has_cover = False   # tracks whether cover_label currently shows a
+                                   # real cover vs. the placeholder — lets
+                                   # _apply_game() skip setStyleSheet() (a real
+                                   # Qt CSS re-parse) on rebinds that never had
+                                   # one loaded in the first place
         layout.addWidget(self.cover_label)
 
         # Footer
@@ -211,73 +224,96 @@ class GameTile(QFrame):
         footer_layout.setContentsMargins(10, 8, 10, 10)
         footer_layout.setSpacing(0)
 
-        title = game["title"] or game["display_name"] or game["folder_name"]
-        title_label = QLabel()
-        title_label.setFont(QFont("DM Sans", 10, QFont.Weight.Medium))
-        title_label.setStyleSheet(
+        self.title_label = QLabel()
+        self.title_label.setFont(QFont("DM Sans", 10, QFont.Weight.Medium))
+        self.title_label.setStyleSheet(
             f"color: {COLORS['text']}; background: transparent;"
         )
-        title_label.setFixedWidth(tile_width - 20)
-        elided = title_label.fontMetrics().elidedText(
-            title, Qt.TextElideMode.ElideRight, tile_width - 20
-        )
-        title_label.setText(elided)
-        title_label.setToolTip(title)
-        footer_layout.addWidget(title_label)
+        self.title_label.setFixedWidth(tile_width - 20)
+        footer_layout.addWidget(self.title_label)
         layout.addWidget(footer)
 
         # ── Badge overlays ────────────────────────────────────────────────────
-        # Installed badge — top-right
-        if game["is_installed"]:
-            badge = QLabel("Installed")
-            badge.setParent(self)
-            badge.setFont(QFont("DM Mono", 8))
-            badge.setStyleSheet(f"""
-                QLabel {{
-                    background: rgba(74,222,128,0.15);
-                    border: 1px solid rgba(74,222,128,0.4);
-                    border-radius: 4px;
-                    color: {COLORS['installed']};
-                    padding: 2px 6px;
-                }}
-            """)
-            badge.adjustSize()
-            badge.move(tile_width - badge.width() - 8, 8)
-            badge.show()
+        # Created once and reused across rebinds — toggled via show()/hide()
+        # rather than being torn down and recreated, since setStyleSheet()
+        # parsing is one of the more expensive things Qt does per-widget and
+        # this class gets rebound frequently while scrolling under
+        # virtualization (see LibraryView's tile pool).
+        self.badge_installed = QLabel("Installed", parent=self)
+        self.badge_installed.setFont(QFont("DM Mono", 8))
+        self.badge_installed.setStyleSheet(f"""
+            QLabel {{
+                background: rgba(74,222,128,0.15);
+                border: 1px solid rgba(74,222,128,0.4);
+                border-radius: 4px;
+                color: {COLORS['installed']};
+                padding: 2px 6px;
+            }}
+        """)
+        self.badge_installed.adjustSize()
+        self.badge_installed.move(tile_width - self.badge_installed.width() - 8, 8)
+        self.badge_installed.hide()
 
-        # Favorite badge — top-left gold star
-        if self._is_favorite:
-            fav_badge = QLabel("★")
-            fav_badge.setParent(self)
-            fav_badge.setFont(QFont("DM Sans", 11))
-            fav_badge.setStyleSheet(f"""
-                QLabel {{
-                    background: rgba(232,199,106,0.18);
-                    border: 1px solid rgba(232,199,106,0.45);
-                    border-radius: 4px;
-                    color: {COLORS['accent']};
-                    padding: 1px 5px;
-                }}
-            """)
-            fav_badge.adjustSize()
-            fav_badge.move(8, 8)
-            fav_badge.show()
+        self.badge_favorite = QLabel("★", parent=self)
+        self.badge_favorite.setFont(QFont("DM Sans", 11))
+        self.badge_favorite.setStyleSheet(f"""
+            QLabel {{
+                background: rgba(232,199,106,0.18);
+                border: 1px solid rgba(232,199,106,0.45);
+                border-radius: 4px;
+                color: {COLORS['accent']};
+                padding: 1px 5px;
+            }}
+        """)
+        self.badge_favorite.adjustSize()
+        self.badge_favorite.move(8, 8)
+        self.badge_favorite.hide()
 
-    def set_cover_image(self, local_path: str):
-        pix = QPixmap(local_path)
-        if pix.isNull():
-            return
-        tw = self.tile_width
-        th = int(tw * 1.5)
-        scaled = pix.scaled(
-            tw, th,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation
+        self._apply_game(game)
+
+    def _apply_game(self, game):
+        """
+        Bind this tile to a (possibly different) game row. Used both for
+        initial construction and for reuse via LibraryView's tile pool —
+        keeping this as a single code path means pooled tiles and freshly
+        constructed tiles always end up in an identical state.
+        """
+        self.game_id      = game["id"]
+        self._is_favorite = bool(_safe_get(game, "is_favorite", 0))
+        self._is_hidden    = bool(_safe_get(game, "is_hidden",   0))
+
+        title = game["title"] or game["display_name"] or game["folder_name"]
+        elided = self.title_label.fontMetrics().elidedText(
+            title, Qt.TextElideMode.ElideRight, self.tile_width - 20
         )
-        x = (scaled.width()  - tw) // 2
-        y = (scaled.height() - th) // 2
-        self.cover_label.setPixmap(scaled.copy(x, y, tw, th))
-        self.cover_label.setStyleSheet("background: transparent; border: none;")
+        self.title_label.setText(elided)
+        self.title_label.setToolTip(title)
+
+        self.badge_installed.setVisible(bool(game["is_installed"]))
+        self.badge_favorite.setVisible(self._is_favorite)
+
+        # Reset cover to the placeholder — a stale pixmap from whatever game
+        # previously occupied this pooled tile must never show, even briefly.
+        # Only touch styling if this tile actually had a real cover showing;
+        # a tile that was already on the placeholder needs no CSS re-parse.
+        if self._has_cover:
+            self.cover_label.setPixmap(QPixmap())
+            self.cover_label.setStyleSheet(
+                f"background: {COLORS['surface2']}; border: none;"
+            )
+            self._has_cover = False
+
+    def set_cover_pixmap(self, pixmap: QPixmap):
+        """
+        Apply an already-scaled-and-cropped cover pixmap. Scaling/cropping is
+        done once by LibraryView (see _build_cover_pixmap()) and cached by
+        game_id, so a tile revisited while scrolling back and forth never
+        re-decodes or re-scales the image — this just swaps a pixmap in.
+        """
+        self.cover_label.setPixmap(pixmap)
+        if not self._has_cover:
+            self.cover_label.setStyleSheet("background: transparent; border: none;")
+            self._has_cover = True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -337,88 +373,107 @@ class GameTile(QFrame):
             self.track_versions.emit(self.game_id)
 
 
-# ── Trickle viewport event filter ────────────────────────────────────────────
-
-class TrickleViewportFilter(QObject):
-    """
-    Installed on QScrollArea.viewport() during trickle rendering.
-
-    The shift-jitter during trickle is caused by QScrollArea::viewportEvent()
-    processing MouseMove/Enter/Leave events, which internally calls
-    updateScrollBars() → scrollBar->setRange() → a geometry recalculation that
-    repositions the content widget.  When new rows are being added every 8ms the
-    content height is changing constantly, so each mouse move can flip the
-    scrollbar visibility, changing the viewport width, which can in turn change
-    the column count and restart the entire trickle.
-
-    Fix: silently consume MouseMove, Enter, and Leave events on the viewport
-    while trickle is active.  The scroll area still repaints (we don't block
-    Paint), the user can still scroll with the wheel (we don't block Wheel),
-    and clicks still work (we don't block MouseButton).  We only stop Qt from
-    recalculating scrollbar geometry in response to hover position.
-
-    The filter is installed once at construction and permanently attached to
-    the viewport; _active is toggled by _start_trickle / trickle completion.
-    """
-
-    _BLOCKED = {
-        QEvent.Type.MouseMove,
-        QEvent.Type.Enter,
-        QEvent.Type.Leave,
-        QEvent.Type.HoverEnter,
-        QEvent.Type.HoverMove,
-        QEvent.Type.HoverLeave,
-    }
-
-    def __init__(self, parent: QObject = None):
-        super().__init__(parent)
-        self._active = False
-
-    def set_active(self, active: bool):
-        self._active = active
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if self._active and event.type() in self._BLOCKED:
-            return True   # consume — don't propagate to QScrollArea internals
-        return False      # pass through
-
-
 # ── Library View ──────────────────────────────────────────────────────────────
 
 class LibraryView(QWidget):
-    game_selected          = pyqtSignal(int)
-    refresh_requested      = pyqtSignal(str)
-    trickle_finished       = pyqtSignal()
-    game_state_changed     = pyqtSignal(int)   # game_id — emitted after favorite/hide from tile
-    track_versions_requested = pyqtSignal(int) # game_id — open VersionTrackerDialog
+    game_selected             = pyqtSignal(int)
+    refresh_requested         = pyqtSignal(str)
+    # Kept for MainWindow compatibility (it chains a pending scan off this
+    # signal). With virtualization there's no multi-tick trickle anymore —
+    # this now just fires once the initial visible tiles have been built.
+    trickle_finished          = pyqtSignal()
+    game_state_changed        = pyqtSignal(int)   # game_id — favorite/hide from tile
+    track_versions_requested  = pyqtSignal(int)   # game_id — open VersionTrackerDialog
+
+    # Canvas layout constants — mirror the old outer_layout margins/spacing
+    # so the grid looks the same as before.
+    MARGIN_LEFT   = 28
+    MARGIN_TOP    = 24
+    MARGIN_RIGHT  = 28
+    MARGIN_BOTTOM = 28
+    ROW_SPACING   = 16
+    COL_SPACING   = 16
+    # Extra rows rendered above/below the visible viewport so tiles are
+    # already in place (and their art already loading) before they scroll
+    # into view, rather than popping in right at the edge. Kept modest
+    # deliberately — with many columns (wide/maximized windows) each extra
+    # buffer row costs a full row's worth of tiles, and tile reuse + the
+    # cover pixmap cache make popping a tile in right at the edge cheap
+    # enough that a large buffer isn't needed to stay smooth.
+    BUFFER_ROWS   = 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._all_games    : list = []
+        self._filtered      : list = []
         self._filter_state : FilterState = FilterState()
-        self._tiles        : dict[int, GameTile] = {}
 
-        # Generation counter — incremented on each new load to cancel stale image loads
-        self._trickle_queue  : list = []
-        self._trickle_gen    : int  = 0
-        self._trickle_active : bool = False
+        # index into self._filtered -> live GameTile. Only tiles currently
+        # within [first_index, last_index] (viewport + buffer) exist here.
+        self._tiles: dict[int, GameTile] = {}
+        # game_id -> live GameTile, maintained in lockstep with self._tiles.
+        # ImageLoader completions arrive keyed by game_id (often in bursts —
+        # a whole row's worth, ~cols of them, scrolling in at once), and were
+        # previously found by scanning every live tile; this makes that O(1).
+        self._tiles_by_game_id: dict[int, GameTile] = {}
 
-        # Current row state (used during synchronous grid build)
-        self._current_row_widget : QWidget | None     = None
-        self._current_row_layout : QHBoxLayout | None = None
-        self._tiles_in_row       : int = 0
-        self._cols               : int = 1
+        # Tiles that scrolled out of range are hidden and parked here for
+        # reuse rather than destroyed — recreating a GameTile from scratch
+        # (QFrame + setStyleSheet parsing + child widgets) on every scroll
+        # tick was the main source of scroll lag. Reusing a pooled tile via
+        # GameTile._apply_game() skips almost all of that cost. Capped so a
+        # brief huge-viewport moment (e.g. maximizing) can't leak widgets.
+        self._tile_pool: list = []
+        self._TILE_POOL_MAX = 400
+        self._pool_tile_w: Optional[int] = None   # tile width the pool was built at
 
-        self._last_cols    : int  = 0
+        # game_id -> pre-scaled, pre-cropped QPixmap sized for the CURRENT
+        # tile width. Scrolling back over a game you've already seen this
+        # session skips the disk-cache lookup, the ImageLoader thread-pool
+        # round trip, AND the QPixmap scale/crop — this is the biggest win
+        # for repeated back-and-forth scrolling. Bounded + roughly LRU via
+        # _cover_cache_get()/_cover_cache_put() below so it can't grow
+        # unbounded on a 1000+ game library. Cleared whenever tile size
+        # changes, since cached pixmaps are scaled for the old size.
+        self._cover_cache: dict[int, QPixmap] = {}
+        self._COVER_CACHE_MAX = 600
+        self._cover_cache_tile_w: Optional[int] = None
+
+        # Coalesces bursts of QScrollBar.valueChanged (fired many times per
+        # frame during a fast drag/kinetic scroll) into at most one
+        # _update_visible_tiles() call per event-loop tick.
+        self._scroll_update_pending = False
+
+        self._cols       : int = 1
+        self._tile_w      : int = 160
+        self._tile_h      : int = 0
+        self._row_h       : int = 0
+        self._total_rows  : int = 0
+
         self._scan_running : bool = False
 
         self._pool = QThreadPool.globalInstance()
-        self._pool.setMaxThreadCount(4)
+        # 4 was tuned for narrower grids. A wide/maximized window can have
+        # 10+ columns, so a single row scrolling into view needs that many
+        # cover fetches at once — with only 4 workers, most of a new row
+        # sat queued and popped in staggered rather than together. These are
+        # I/O-bound (disk cache check, occasional network fetch) rather than
+        # CPU-heavy, so raising this costs little.
+        self._pool.setMaxThreadCount(8)
 
         self._resize_timer = QTimer()
         self._resize_timer.setSingleShot(True)
-        self._resize_timer.setInterval(200)
+        self._resize_timer.setInterval(150)
         self._resize_timer.timeout.connect(self._on_resize_settled)
+
+        # Debounces search-as-you-type — without this, every keystroke ran a
+        # full filter + tile release/repopulate pass immediately. Same
+        # pattern as the resize debounce above.
+        self._pending_search_text = ""
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(self._apply_pending_search)
 
         self._build_ui()
 
@@ -470,29 +525,25 @@ class LibraryView(QWidget):
         self.status_bar.hide()
         root.addWidget(self.status_bar)
 
-        # ── Scroll area — always visible so header never shifts ───────────────
+        # ── Scroll area + fixed-size canvas ────────────────────────────────────
+        # No layout is ever installed on the canvas — tiles are positioned
+        # directly with setGeometry(). The canvas is resized to its final
+        # full-content size up front (see _rebuild()), so creating/removing
+        # tiles as the user scrolls never changes the canvas geometry and
+        # never triggers a scrollbar/viewport recalculation.
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.scroll.setStyleSheet(f"background: {COLORS['bg']}; border: none;")
+        self.scroll.verticalScrollBar().valueChanged.connect(self._on_scrolled)
 
-        # Event filter that blocks mouse-move events during trickle.
-        # Installed on viewport(), _outer, and _rows_widget — mouse events
-        # land on the tile widgets directly, not on the viewport, so the
-        # filter must be on the content widget tree as well.
-        self._viewport_filter = TrickleViewportFilter(self)
-        self.scroll.viewport().installEventFilter(self._viewport_filter)
+        self.canvas = QWidget()
+        self.canvas.setStyleSheet(f"background: {COLORS['bg']};")
+        self.scroll.setWidget(self.canvas)
 
-        # Outer container holds rows widget + empty label
-        self._outer = QWidget()
-        self._outer.setStyleSheet(f"background: {COLORS['bg']};")
-        outer_layout = QVBoxLayout(self._outer)
-        outer_layout.setContentsMargins(28, 24, 28, 28)
-        outer_layout.setSpacing(0)
-        outer_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        # Empty state — sits at the top of the outer container
+        # Empty state — its own stack page so it cleanly replaces the scroll
+        # area instead of trying to overlay it inside one layout slot.
         self.empty_label = QLabel(
             "No games found.\n"
             "Configure your NAS path in Settings to get started."
@@ -500,31 +551,21 @@ class LibraryView(QWidget):
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setFont(QFont("DM Sans", 13))
         self.empty_label.setStyleSheet(
-            f"color: {COLORS['text_muted']}; padding: 60px;"
+            f"color: {COLORS['text_muted']}; padding: 60px; background: {COLORS['bg']};"
         )
-        self.empty_label.hide()
-        outer_layout.addWidget(self.empty_label)
 
-        # Rows widget — QVBoxLayout of QHBoxLayout rows
-        self._rows_widget = QWidget()
-        self._rows_widget.setStyleSheet("background: transparent;")
-        self._rows_layout = QVBoxLayout(self._rows_widget)
-        self._rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._rows_layout.setSpacing(16)
-        self._rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        outer_layout.addWidget(self._rows_widget)
-        # No addStretch() — a stretch spacer rebalances against _rows_widget on
-        # every addWidget() during trickle, physically shifting rows upward each
-        # time a new row is appended. AlignTop already pins content to the top.
+        empty_page = QWidget()
+        empty_page.setStyleSheet(f"background: {COLORS['bg']};")
+        empty_layout = QVBoxLayout(empty_page)
+        empty_layout.setContentsMargins(0, 0, 0, 0)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(self.empty_label)
+        self._empty_page = empty_page
 
-        # Mouse events land on tile widgets which are children of _outer and
-        # _rows_widget, not on the viewport itself — so install the filter here
-        # too, not just on scroll.viewport().
-        self._outer.installEventFilter(self._viewport_filter)
-        self._rows_widget.installEventFilter(self._viewport_filter)
-
-        self.scroll.setWidget(self._outer)
-        root.addWidget(self.scroll, 1)
+        self._content_stack = QStackedWidget()
+        self._content_stack.addWidget(self.scroll)      # index 0
+        self._content_stack.addWidget(empty_page)        # index 1
+        root.addWidget(self._content_stack, 1)
 
         self._status_timer = QTimer()
         self._status_timer.setSingleShot(True)
@@ -540,7 +581,7 @@ class LibraryView(QWidget):
 
     def load_games(self, games: list):
         self._all_games = games
-        self._start_trickle(self._filtered_games())
+        self._rebuild(reset_scroll=True)
 
     def apply_filter(self, key: str):
         """
@@ -567,7 +608,7 @@ class LibraryView(QWidget):
                 search=self._filter_state.search,
             )
         self._update_page_title()
-        self._start_trickle(self._filtered_games())
+        self._rebuild(reset_scroll=True)
 
     def set_filter_state(self, state: FilterState):
         """
@@ -576,7 +617,7 @@ class LibraryView(QWidget):
         """
         self._filter_state = state
         self._update_page_title()
-        self._start_trickle(self._filtered_games())
+        self._rebuild(reset_scroll=True)
 
     def get_filter_state(self) -> FilterState:
         """Return the current filter state (read-only copy)."""
@@ -617,7 +658,7 @@ class LibraryView(QWidget):
 
     def set_scan_running(self, running: bool):
         self._scan_running = running
-        if not running and not self._trickle_active:
+        if not running:
             self._set_refresh_btn_style(active=False)
             self.refresh_btn.setEnabled(True)
 
@@ -677,130 +718,211 @@ class LibraryView(QWidget):
         return games
 
     def _on_search(self, text: str):
-        self._filter_state = self._filter_state.with_search(text)
-        self._start_trickle(self._filtered_games())
+        self._pending_search_text = text
+        self._search_timer.start()
 
-    # ── Trickle rendering ─────────────────────────────────────────────────────
+    def _apply_pending_search(self):
+        self._filter_state = self._filter_state.with_search(self._pending_search_text)
+        self._rebuild(reset_scroll=True)
 
-    def _start_trickle(self, games: list):
-        # Cancel any running trickle
-        self._trickle_gen += 1
-        self._trickle_active = False
-        self._viewport_filter.set_active(False)
+    # ── Virtualized grid ──────────────────────────────────────────────────────
 
-        # Clear all rows
-        while self._rows_layout.count():
-            item = self._rows_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._tiles.clear()
-        self._current_row_widget = None
-        self._current_row_layout = None
-        self._tiles_in_row       = 0
+    def _rebuild(self, reset_scroll: bool = False):
+        """
+        Full refilter + regeometry pass. Called on load, filter/search change,
+        tile-size change, and column-count-affecting resizes.
 
-        if not games:
-            self.empty_label.show()
-            self._rows_widget.hide()
-            self.trickle_finished.emit()
+        Computes the canvas size for the ENTIRE filtered list up front (so
+        the scrollbar range is correct immediately), clears any currently
+        live tiles, then populates only the tiles that fall in the current
+        viewport (+ buffer).
+        """
+        self._filtered = self._filtered_games()
+
+        if not self._filtered:
+            self._clear_tiles()
+            self._content_stack.setCurrentWidget(self._empty_page)
             self._unlock_refresh()
+            self.trickle_finished.emit()
             return
 
-        self.empty_label.hide()
-        self._rows_widget.show()
+        self._content_stack.setCurrentWidget(self.scroll)
 
-        self.refresh_btn.setEnabled(False)
-        self._set_refresh_btn_style(active=True)
+        tile_size   = db.get_setting("tile_size", "medium")
+        self._tile_w = TILE_WIDTHS.get(tile_size, 160)
+        self._tile_h = int(self._tile_w * 1.5) + 32
+        self._row_h  = self._tile_h + self.ROW_SPACING
 
-        tile_size = db.get_setting("tile_size", "medium")
-        tile_w    = TILE_WIDTHS.get(tile_size, 160)
-        avail_w   = self.scroll.viewport().width()
-        cols      = max(1, avail_w // (tile_w + 16))
-        self._cols      = cols
-        self._last_cols = cols
+        if self._pool_tile_w is not None and self._pool_tile_w != self._tile_w:
+            # Pooled tiles were built at the old tile size (GameTile locks
+            # its size in __init__) — they can't be resized via _apply_game,
+            # so drop them rather than risk handing out a wrong-size tile.
+            for tile in self._tile_pool:
+                tile.deleteLater()
+            self._tile_pool.clear()
+        self._pool_tile_w = self._tile_w
 
-        self._trickle_active = True
-        self._viewport_filter.set_active(True)
-        my_gen = self._trickle_gen
+        if self._cover_cache_tile_w != self._tile_w:
+            # Cached pixmaps are scaled/cropped for the old tile width —
+            # wrong size to reuse, so drop them rather than risk showing a
+            # mis-scaled cover.
+            self._cover_cache.clear()
+            self._cover_cache_tile_w = self._tile_w
 
-        def add_next():
-            if self._trickle_gen != my_gen:
-                self._viewport_filter.set_active(False)
-                return
+        avail_w    = max(1, self.scroll.viewport().width()
+                          - self.MARGIN_LEFT - self.MARGIN_RIGHT)
+        self._cols = max(1, (avail_w + self.COL_SPACING)
+                          // (self._tile_w + self.COL_SPACING))
+        self._total_rows = -(-len(self._filtered) // self._cols)  # ceil div
 
-            tiles_placed = 0
-            while tiles_placed < 5:
-                if not self._trickle_queue:
-                    if self._current_row_widget is not None:
-                        self._current_row_layout.addStretch()
-                        self._rows_layout.addWidget(self._current_row_widget)
-                        self._current_row_widget = None
-                        self._current_row_layout = None
-                        self._tiles_in_row       = 0
-                    self._trickle_active = False
-                    self._viewport_filter.set_active(False)
-                    self._unlock_refresh()
-                    self.trickle_finished.emit()
-                    return
+        canvas_w = self.scroll.viewport().width()
+        canvas_h = (self.MARGIN_TOP
+                    + self._total_rows * self._tile_h
+                    + max(0, self._total_rows - 1) * self.ROW_SPACING
+                    + self.MARGIN_BOTTOM)
+        self.canvas.setFixedSize(canvas_w, canvas_h)
 
-                game   = self._trickle_queue.pop(0)
-                tw     = TILE_WIDTHS.get(db.get_setting("tile_size", "medium"), 160)
+        self._clear_tiles()
+        if reset_scroll:
+            self.scroll.verticalScrollBar().setValue(0)
 
-                if self._current_row_layout is None:
-                    row_widget = QWidget()
-                    row_widget.setStyleSheet("background: transparent;")
-                    row_layout = QHBoxLayout(row_widget)
-                    row_layout.setContentsMargins(0, 0, 0, 0)
-                    row_layout.setSpacing(16)
-                    row_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-                    self._current_row_widget = row_widget
-                    self._current_row_layout = row_layout
-                    self._tiles_in_row       = 0
+        self._update_visible_tiles()
+        self._unlock_refresh()
+        self.trickle_finished.emit()
 
-                tile = GameTile(game, tw)
+    def _clear_tiles(self):
+        """
+        Used on full rebuild (filter change, tile-size change, column-count
+        change) where every tile position is about to be recomputed anyway.
+        Sends everything to the pool rather than destroying it outright, so
+        a filter switch doesn't throw away perfectly reusable widgets.
+        """
+        for tile in self._tiles.values():
+            self._release_tile(tile)
+        self._tiles.clear()
+
+    def _release_tile(self, tile: "GameTile"):
+        """Hide a tile and either pool it for reuse or destroy it if the pool is full."""
+        tile.hide()
+        self._tiles_by_game_id.pop(tile.game_id, None)
+        if len(self._tile_pool) < self._TILE_POOL_MAX:
+            self._tile_pool.append(tile)
+        else:
+            tile.deleteLater()
+
+    def _on_scrolled(self, _value: int):
+        if not self._filtered:
+            return
+        if self._scroll_update_pending:
+            return
+        self._scroll_update_pending = True
+        QTimer.singleShot(0, self._deferred_scroll_update)
+
+    def _deferred_scroll_update(self):
+        self._scroll_update_pending = False
+        if self._filtered:
+            self._update_visible_tiles()
+
+    def _tile_pos(self, index: int) -> tuple[int, int]:
+        row = index // self._cols
+        col = index % self._cols
+        x = self.MARGIN_LEFT + col * (self._tile_w + self.COL_SPACING)
+        y = self.MARGIN_TOP + row * self._row_h
+        return x, y
+
+    def _update_visible_tiles(self):
+        """
+        Diff the currently-live tile pool against the index range implied by
+        the current scroll position (+ BUFFER_ROWS on each side). Tiles that
+        fell out of range are deleted; tiles newly in range are created.
+        """
+        if not self._filtered or self._cols <= 0 or self._row_h <= 0:
+            return
+
+        vp_top    = self.scroll.verticalScrollBar().value()
+        vp_height = self.scroll.viewport().height()
+        vp_bottom = vp_top + vp_height
+
+        first_row = max(0, (vp_top - self.MARGIN_TOP) // self._row_h - self.BUFFER_ROWS)
+        last_row  = (vp_bottom - self.MARGIN_TOP) // self._row_h + self.BUFFER_ROWS
+        last_row  = min(self._total_rows - 1, max(int(first_row), int(last_row)))
+        first_row = min(int(first_row), last_row)
+
+        first_index = first_row * self._cols
+        last_index  = min(len(self._filtered) - 1, (last_row + 1) * self._cols - 1)
+
+        wanted = set(range(first_index, last_index + 1)) if last_index >= first_index else set()
+
+        # Return tiles that scrolled out of range to the pool
+        for idx in list(self._tiles.keys()):
+            if idx not in wanted:
+                self._release_tile(self._tiles.pop(idx))
+
+        # Populate tiles that scrolled into range — reuse a pooled tile
+        # (just rebinds its content, no widget construction) when one is
+        # available, only building a fresh GameTile as a last resort.
+        for idx in sorted(wanted):
+            if idx in self._tiles:
+                continue
+            game = self._filtered[idx]
+
+            if self._tile_pool:
+                tile = self._tile_pool.pop()
+                tile._apply_game(game)
+            else:
+                tile = GameTile(game, self._tile_w, parent=self.canvas)
                 tile.clicked.connect(self.game_selected)
                 tile.state_changed.connect(self.game_state_changed)
                 tile.track_versions.connect(self.track_versions_requested)
-                self._current_row_layout.addWidget(tile)
-                self._tiles[game["id"]] = tile
-                self._tiles_in_row += 1
-                tiles_placed += 1
 
+            x, y = self._tile_pos(idx)
+            tile.setGeometry(x, y, self._tile_w, self._tile_h)
+            tile.show()
+            self._tiles[idx] = tile
+            self._tiles_by_game_id[tile.game_id] = tile
+
+            cached_pixmap = self._cover_cache_get(game["id"])
+            if cached_pixmap is not None:
+                tile.set_cover_pixmap(cached_pixmap)
+            else:
                 cover_url = _safe_get(game, "cover_url")
                 if cover_url:
                     loader = ImageLoader(game["id"], cover_url)
                     loader.signals.loaded.connect(self._on_image_loaded)
                     self._pool.start(loader)
 
-                if self._tiles_in_row >= self._cols:
-                    self._current_row_layout.addStretch()
-                    self._rows_layout.addWidget(self._current_row_widget)
-                    self._current_row_widget = None
-                    self._current_row_layout = None
-                    self._tiles_in_row       = 0
+    def _cover_cache_get(self, game_id: int) -> Optional[QPixmap]:
+        pix = self._cover_cache.pop(game_id, None)
+        if pix is not None:
+            self._cover_cache[game_id] = pix   # re-insert → most-recently-used
+        return pix
 
-            QTimer.singleShot(0, add_next)
-
-        self._trickle_queue = list(games)
-        QTimer.singleShot(0, add_next)
+    def _cover_cache_put(self, game_id: int, pixmap: QPixmap):
+        self._cover_cache[game_id] = pixmap
+        if len(self._cover_cache) > self._COVER_CACHE_MAX:
+            # dicts preserve insertion order — the first key is the
+            # least-recently-used one thanks to the re-insert in
+            # _cover_cache_get() above.
+            self._cover_cache.pop(next(iter(self._cover_cache)))
 
     def _on_image_loaded(self, game_id: int, local_path: str):
-        tile = self._tiles.get(game_id)
-        if tile:
-            tile.set_cover_image(local_path)
+        pixmap = _build_cover_pixmap(local_path, self._tile_w)
+        if pixmap is None:
+            return
+        self._cover_cache_put(game_id, pixmap)
+        tile = self._tiles_by_game_id.get(game_id)
+        if tile is not None:
+            tile.set_cover_pixmap(pixmap)
 
     def refresh_tile(self, game_id: int):
         """
         Called after a single game's metadata is saved.
-        If the tile is visible, fetches its cover art immediately.
+        If the tile is currently visible, fetches its cover art immediately.
         """
-        tile = self._tiles.get(game_id)
-        if not tile:
+        if game_id not in self._tiles_by_game_id:
             return
         try:
-            game = db.get_games_for_library()
-            # Find this game's cover_url from a lightweight lookup
-            import db as _db
-            with _db.get_connection() as conn:
+            with db.get_connection() as conn:
                 row = conn.execute(
                     "SELECT cover_url FROM metadata WHERE game_id=?", (game_id,)
                 ).fetchone()
@@ -816,25 +938,31 @@ class LibraryView(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._all_games:
-            log.debug("resizeEvent: new size=%s trickle_active=%s",
-                      event.size(), self._trickle_active)
             self._resize_timer.start()
 
     def _on_resize_settled(self):
-        if not self._all_games:
+        if not self._all_games or not self._filtered:
             return
+
         tile_size = db.get_setting("tile_size", "medium")
         tile_w    = TILE_WIDTHS.get(tile_size, 160)
-        avail_w   = self.scroll.viewport().width()
-        new_cols  = max(1, avail_w // (tile_w + 16))
-        log.debug("_on_resize_settled: avail_w=%d new_cols=%d last_cols=%d trickle_active=%s",
-                  avail_w, new_cols, self._last_cols, self._trickle_active)
-        if new_cols == self._last_cols:
+        avail_w   = max(1, self.scroll.viewport().width()
+                         - self.MARGIN_LEFT - self.MARGIN_RIGHT)
+        new_cols  = max(1, (avail_w + self.COL_SPACING) // (tile_w + self.COL_SPACING))
+
+        if new_cols == self._cols and tile_w == self._tile_w:
+            # Column count and tile size unchanged (e.g. just the scrollbar
+            # gutter appearing/disappearing) — only the canvas width needs
+            # to track the viewport; tile positions stay exactly as they
+            # are, no rebuild needed.
+            self.canvas.setFixedSize(self.scroll.viewport().width(), self.canvas.height())
             return
-        width_delta = abs(avail_w - (self._last_cols * (tile_w + 16)))
-        if self._trickle_active and width_delta < tile_w:
-            return
-        self._start_trickle(self._filtered_games())
+
+        # Column count or tile size genuinely changed — full regeometry.
+        # This is cheap under virtualization (only visible tiles get
+        # recreated), unlike the old trickle renderer where this had to be
+        # guarded against with a width-delta threshold to avoid flicker.
+        self._rebuild(reset_scroll=False)
 
     # ── Refresh button ────────────────────────────────────────────────────────
 
@@ -885,6 +1013,29 @@ class LibraryView(QWidget):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _build_cover_pixmap(local_path: str, tile_w: int) -> Optional[QPixmap]:
+    """
+    Load, scale, and center-crop a cover image file into a QPixmap sized for
+    a tile_w-wide grid tile. Pulled out as a standalone function (rather than
+    living inside GameTile) so LibraryView can build it once and cache it by
+    game_id — a tile scrolled back into view reuses the cached pixmap
+    directly instead of re-decoding and re-scaling the source image file.
+    Returns None if the file can't be loaded as an image.
+    """
+    pix = QPixmap(local_path)
+    if pix.isNull():
+        return None
+    th = int(tile_w * 1.5)
+    scaled = pix.scaled(
+        tile_w, th,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation
+    )
+    x = (scaled.width()  - tile_w) // 2
+    y = (scaled.height() - th) // 2
+    return scaled.copy(x, y, tile_w, th)
+
 
 def _safe_get(row, key, default=None):
     try:

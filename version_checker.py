@@ -48,6 +48,20 @@ log = logging.getLogger(__name__)
 CHECK_DELAY_SECONDS = 0.5   # between individual HTTP checks in any batch
 
 
+def _safe_get(row, key, default=None):
+    """
+    Safely read a value from a sqlite3.Row.
+    sqlite3.Row supports row["key"] indexing but has no .get() method —
+    calling .get() on one raises AttributeError. This was crashing
+    VersionCheckWorker unconditionally the first time it ran against any
+    real trackers (db.get_all_trackers() returns sqlite3.Row objects).
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
 # ── Shared progress/result signal shapes ─────────────────────────────────────
 # All three workers use the same signal signatures so MainWindow can connect
 # a single set of slots regardless of which worker is running.
@@ -129,11 +143,13 @@ class VersionAutoTrackWorker(QThread):
                     status         = "ok",
                     dotted_version = result["dotted_version"],
                     plain_version  = result["plain_version"],
+                    date_version   = result["date_version"],
                 )
                 found += 1
-                log.info("Auto-track OK: %s @ %s → dotted=%s plain=%s",
+                log.info("Auto-track OK: %s @ %s → dotted=%s plain=%s date=%s",
                          title, site["label"],
-                         result["dotted_version"], result["plain_version"])
+                         result["dotted_version"], result["plain_version"],
+                         result["date_version"])
             elif status == "no_match":
                 # Log as no_match — won't be retried for this game/site pair
                 db.log_autotrack_attempt(game["id"], site["id"], "no_match")
@@ -187,8 +203,8 @@ class VersionCheckWorker(QThread):
         errors  = 0
 
         for i, tracker in enumerate(trackers):
-            title = tracker.get("title") or tracker.get("display_name") or ""
-            site_label = tracker.get("label") or ""
+            title = _safe_get(tracker, "title") or _safe_get(tracker, "display_name") or ""
+            site_label = _safe_get(tracker, "label") or ""
             self.progress.emit(
                 i + 1, total,
                 f"Checking {i+1}/{total} — {title} @ {site_label}"
@@ -203,6 +219,7 @@ class VersionCheckWorker(QThread):
                 status         = status,
                 dotted_version = result["dotted_version"],
                 plain_version  = result["plain_version"],
+                date_version   = result["date_version"],
                 error_msg      = result.get("error_msg"),
             )
 
@@ -294,10 +311,12 @@ class VersionBackfillWorker(QThread):
                     status         = "ok",
                     dotted_version = result["dotted_version"],
                     plain_version  = result["plain_version"],
+                    date_version   = result["date_version"],
                 )
                 found += 1
-                log.info("Backfill OK: %s → dotted=%s plain=%s",
-                         title, result["dotted_version"], result["plain_version"])
+                log.info("Backfill OK: %s → dotted=%s plain=%s date=%s",
+                         title, result["dotted_version"], result["plain_version"],
+                         result["date_version"])
             elif status == "no_match":
                 db.log_autotrack_attempt(game["id"], self._site_id, "no_match")
                 log.debug("Backfill no_match: %s", title)

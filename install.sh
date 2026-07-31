@@ -143,8 +143,23 @@ cp "${SCRIPT_DIR}/redists.py"   "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/version_check.py" "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/version_checker.py" "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/playtime.py"      "${APPDIR}/usr/bin/"
+cp "${SCRIPT_DIR}/save_backup.py"   "${APPDIR}/usr/bin/"
 cp "${SCRIPT_DIR}/ui/"*.py      "${APPDIR}/usr/bin/ui/"
 cp "${SCRIPT_DIR}/assets/"*     "${APPDIR}/usr/bin/assets/" 2>/dev/null || true
+
+# Bundle icoutils (wrestool + icotool) for .exe icon extraction.
+# These are standard system binaries — copy them directly if available.
+# If not installed on the build machine, icon extraction will silently
+# fall back to SGDB cover art at install time (no crash, just no exe icon).
+for _tool in wrestool icotool; do
+    _tool_path="$(command -v ${_tool} 2>/dev/null || true)"
+    if [ -n "${_tool_path}" ]; then
+        cp "${_tool_path}" "${APPDIR}/usr/bin/"
+        success "Bundled ${_tool} from ${_tool_path}"
+    else
+        warn "icoutils: ${_tool} not found on build machine — exe icon extraction will not be available in this build. Install icoutils and rebuild to enable it."
+    fi
+done
 success "App source files copied."
 
 # =============================================================================
@@ -222,6 +237,10 @@ PYVER="\$(\$PYTHON -c 'import sys; print(f"python{sys.version_info.major}.{sys.v
 # PYTHONPATH: app source dir FIRST (so debug.py, db.py etc. are always found),
 # then bundled site-packages (PyQt6, requests etc.)
 export PYTHONPATH="\${APPDIR}/usr/bin:\${APPDIR}/usr/lib/\${PYVER}/site-packages:\${PYTHONPATH}"
+
+# Prepend AppDir bin to PATH so bundled tools (wrestool, icotool) are
+# found before any system versions.
+export PATH="\${APPDIR}/usr/bin:\${PATH}"
 
 # Qt platform — xcb works on KDE Plasma and Hyprland.
 # Override with QT_QPA_PLATFORM=wayland for native Wayland.
