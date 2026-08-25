@@ -1,0 +1,8 @@
+
+# VaultPlay build artifacts
+.appimage_build/
+.build_venv/
+*.AppImage
+__pycache__/
+*.pyc
+.vscode/

@@ -1,0 +1,56 @@
+name: Release
+
+# Push a tag like "v0.4.0" to trigger a build + published GitHub Release.
+# update_check.py (AppImage Self-Update Check) polls
+# api.github.com/repos/tribalmonkey1/vaultplay/releases/latest and expects:
+#   - a tag named "v<version>"
+#   - exactly one *.AppImage asset attached to the release
+# Both are produced automatically by this workflow — nothing to upload by hand.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build + release (e.g. v0.4.0) — for manual re-runs"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag/version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Write VERSION file
+        run: echo "${{ steps.ver.outputs.version }}" > VERSION
+
+      - name: Build AppImage
+        run: bash scripts/build_appimage.sh
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: VaultPlay ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: VaultPlay-x86_64.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

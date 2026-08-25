@@ -1,1 +1,0 @@
-# VaultPlay UI package
