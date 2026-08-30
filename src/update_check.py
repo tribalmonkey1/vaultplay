@@ -14,13 +14,22 @@ but GitHub's unauthenticated rate limit is 60 req/hour/IP. This module only ever
 calls the API once per launch plus once per manual click, so that's not a practical
 concern — noted here in case a future change (e.g. polling) needs to account for it.
 
-Five responsibilities:
+Six responsibilities:
   1. fetch_latest_release()   — hit the GitHub releases API, return the parsed result
   2. is_update_available()    — semantic version compare, current APP_VERSION vs. tag
   3. download_update()        — resumable (HTTP Range) download of the .AppImage asset
   4. launch_self_update()     — write + launch the detached updater shell script
   5. extract_version_from_title() — used only so dismissing the notification can
      record it as skipped_app_version (see ui/library_view.py's NotificationPanel)
+  6. get_changelog() / render_changelog_html() — In-App Changelog (Pull From GitHub):
+     the release's own `body` text (what got typed into the release description box
+     on GitHub at publish time) doubles as the in-app "what's new" copy, replacing
+     the old hand-maintained Python list in ui/settings_view.py. Mirrors the approach
+     already proven out on Derrick's GW2 Wealth Tracker app: fetch straight from the
+     GitHub Releases API (no separate CHANGELOG.md, no commit-message scraping),
+     cache the result client-side for an hour so repeatedly opening Settings → About
+     doesn't refetch every time, and treat a failed fetch as "show nothing new"
+     rather than an error state — same never-raise contract as fetch_latest_release().
 
 Version source of truth stays SettingsView.APP_VERSION in ui/settings_view.py (per
 the Project Log's standing rule — NOT duplicated here). Every function below that
@@ -44,6 +53,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -171,6 +181,10 @@ def fetch_latest_release() -> Optional[dict]:
             "download_url": str | None, # direct .AppImage asset URL, None if
                                          # the release has no AppImage attached
             "asset_size":   int,        # bytes, 0 if unknown
+            "body":         str,        # raw Markdown release notes ("" if blank —
+                                         # e.g. a release published with an empty
+                                         # description box). See get_changelog() /
+                                         # render_changelog_html() for display use.
         }
     or None on any failure (network error, non-200, malformed JSON, no tag) —
     never raises. Per spec, a failed check does nothing silently, so callers
@@ -198,7 +212,149 @@ def fetch_latest_release() -> Optional[dict]:
         "html_url":      data.get("html_url") or GITHUB_RELEASES_PAGE,
         "download_url":  asset.get("browser_download_url") if asset else None,
         "asset_size":    asset.get("size", 0) if asset else 0,
+        "body":          data.get("body") or "",
     }
+
+
+# ── In-App Changelog — Pull From GitHub ───────────────────────────────────────
+# The release's own description text (typed into GitHub's release box at publish
+# time, same box that produces the public release notes) is the single source
+# for the About page's changelog — see module docstring. Cached in-process for
+# an hour so opening Settings → About repeatedly doesn't refetch on every visit;
+# a stale cached copy is preferred over nothing if a later fetch fails.
+
+_CHANGELOG_CACHE_TTL_SECONDS = 3600.0
+_changelog_cache: dict = {"data": None, "fetched_at": 0.0}
+
+
+def get_changelog(force_refresh: bool = False) -> Optional[dict]:
+    """
+    Return the latest release dict (same shape as fetch_latest_release(),
+    including 'body') for display in Settings → About.
+
+    force_refresh=False (default): reuse the in-process cache if it's under
+    an hour old — this is what a normal "About page opened" call should pass.
+    force_refresh=True: bypass the cache and hit the network immediately —
+    for an explicit user action like a "Refresh Changelog" button, if one is
+    ever added; the existing "Check for Updates" button already triggers its
+    own fresh fetch_latest_release() call independently and can populate this
+    cache too (see _on_manual_check_done() in ui/settings_view.py).
+
+    Returns None only if there's no cached data AND the fetch fails — a
+    failed refresh with a still-fresh-enough cache silently keeps serving
+    the cached copy rather than surfacing an error, consistent with
+    fetch_latest_release()'s "never raise, caller shows nothing" contract.
+    """
+    now = time.monotonic()
+    if not force_refresh and _changelog_cache["data"] is not None:
+        age = now - _changelog_cache["fetched_at"]
+        if age < _CHANGELOG_CACHE_TTL_SECONDS:
+            return _changelog_cache["data"]
+
+    release = fetch_latest_release()
+    if release is not None:
+        _changelog_cache["data"] = release
+        _changelog_cache["fetched_at"] = now
+        return release
+
+    # Fetch failed — serve whatever's cached (even if stale) rather than
+    # nothing, since a temporarily-unreachable GitHub shouldn't blank out
+    # a changelog that was showing fine a moment ago.
+    return _changelog_cache["data"]
+
+
+def cache_changelog_release(release: dict) -> None:
+    """
+    Let another already-fetched release dict (e.g. from a manual "Check for
+    Updates" click, which calls fetch_latest_release() on its own) populate
+    this module's changelog cache too, so the About page doesn't immediately
+    refetch right after a check the user just triggered. No-op if release is
+    falsy or missing a tag.
+    """
+    if not release or not release.get("tag"):
+        return
+    _changelog_cache["data"] = release
+    _changelog_cache["fetched_at"] = time.monotonic()
+
+
+# Minimal Markdown → HTML conversion for GitHub release-notes bodies, scoped
+# to exactly what QLabel's rich-text subset renders (basic tags, no CSS
+# classes) and to the handful of Markdown constructs release notes actually
+# use in practice (headers, bullet lists, bold/italic, inline code, links).
+# Deliberately NOT a general-purpose Markdown parser — no tables, no nested
+# lists, no code fences — pulling in a real Markdown dependency isn't
+# warranted for what's typically a short, hand-written notes block.
+_MD_HEADER_RE      = re.compile(r"^(#{1,6})\s+(.*)$")
+_MD_BULLET_RE      = re.compile(r"^[-*]\s+(.*)$")
+_MD_BOLD_RE        = re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC_RE      = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_LINK_RE        = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+
+
+def _escape_html(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
+def _render_inline_md(text: str) -> str:
+    text = _escape_html(text)
+    text = _MD_LINK_RE.sub(r'<a href="\2">\1</a>', text)
+    text = _MD_BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _MD_ITALIC_RE.sub(r"<i>\1</i>", text)
+    text = _MD_INLINE_CODE_RE.sub(r"<code>\1</code>", text)
+    return text
+
+
+def render_changelog_html(body: str) -> str:
+    """
+    Convert a GitHub release-notes Markdown body into HTML suitable for a
+    QLabel with setTextFormat(Qt.TextFormat.RichText) (or the implicit
+    rich-text autodetection QLabel already does when it sees tags). Blank
+    input returns an empty string — caller should show a placeholder
+    ("No release notes for this version.") rather than an empty box.
+    """
+    if not body or not body.strip():
+        return ""
+
+    lines = body.replace("\r\n", "\n").split("\n")
+    html_parts: list[str] = []
+    in_list = False
+
+    def _close_list():
+        nonlocal in_list
+        if in_list:
+            html_parts.append("</ul>")
+            in_list = False
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+
+        if not line.strip():
+            _close_list()
+            continue
+
+        header_match = _MD_HEADER_RE.match(line)
+        if header_match:
+            _close_list()
+            level = min(4, len(header_match.group(1)) + 1)   # keep sizes modest in a small panel
+            html_parts.append(
+                f"<h{level}>{_render_inline_md(header_match.group(2))}</h{level}>")
+            continue
+
+        bullet_match = _MD_BULLET_RE.match(line)
+        if bullet_match:
+            if not in_list:
+                html_parts.append("<ul>")
+                in_list = True
+            html_parts.append(f"<li>{_render_inline_md(bullet_match.group(1))}</li>")
+            continue
+
+        _close_list()
+        html_parts.append(f"<p>{_render_inline_md(line)}</p>")
+
+    _close_list()
+    return "".join(html_parts)
 
 
 # ── Download (resumable via HTTP Range) ───────────────────────────────────────

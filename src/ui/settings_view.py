@@ -2824,104 +2824,77 @@ class SettingsView(QWidget):
         self._refresh_update_status_from_settings()
 
         layout.addSpacing(4)
-        layout.addWidget(SectionHeader("What's new in 0.2.0-dev"))
+        self._changelog_header = SectionHeader("What's New")
+        layout.addWidget(self._changelog_header)
 
-        changelog = [
-            # ── Major features ────────────────────────────────────────────────
-            ("ProtonDB Compatibility — Live Community Data",
-             "Each game's install dialog now shows which Proton version the community "
-             "actually uses, pulled live from ProtonDB reports. The top-voted version "
-             "is pre-selected. Counts are shown next to each version (e.g. 'Proton 9.0 "
-             "· 12 of 30 most recent reports') so you can make your own judgement."),
-            ("Proton Version Download — Install Without Leaving VaultPlay",
-             "If the recommended Proton version isn't installed, it now appears in the "
-             "dropdown marked '(not installed)'. Selecting it shows a Download button. "
-             "GE-Proton versions download and install directly in-app with a progress "
-             "bar. Official Steam Proton versions open Steam's install dialog with one "
-             "click. Begin Install stays locked until the selected version is ready."),
-            ("Redistributable Auto-Detection",
-             "The install dialog auto-detects required redistributables for games that "
-             "have a Steam App ID, using Steam's public API. Known depot IDs and package "
-             "name patterns are mapped to winetricks verbs and pre-checked for you. "
-             "Baseline redists (vcrun2019, vcrun2022, d3dcompiler_47) are always included."),
-            ("NAS Category Scanning",
-             "Each subfolder inside your Games path becomes a category filter in the "
-             "sidebar (PC, PS4, Switch, etc.). Recursive detection up to 3 levels deep "
-             "handles nested folder structures. Categories can be renamed or blacklisted "
-             "in Settings → Categories to hide them from the library entirely."),
-            ("Install Type Auto-Detection",
-             "Games are automatically tagged as Installer, Portable, or ISO by peeking "
-             "inside archives. Multi-part RAR, 7z, and ZIP are all supported. The detected "
-             "type can be overridden in the install dialog."),
-            ("ISO Support",
-             "ISO games are mounted via udisksctl (falls back to fuseiso — no sudo "
-             "needed), the installer is run through Wine, then the ISO is unmounted and "
-             "cleaned up automatically."),
-            ("Multi-Path Install Locations",
-             "Settings → Paths lets you add multiple game install destinations (different "
-             "drives, partitions, etc.). The first is starred as default. Each install "
-             "lets you pick from the list."),
-            ("Game Name Cleaning",
-             "Raw NAS folder names are cleaned for display and metadata search — strips "
-             "scene group tags (CODEX, PLAZA, ElAmigos, EMPRESS, etc.), GOG IDs, version "
-             "strings, MULTiN suffixes, and repack labels across multiple passes."),
-            ("First-Run Setup Wizard",
-             "Fresh installs show a one-time wizard to configure your NAS path, "
-             "SteamGridDB API key, and default install location before the first scan."),
-            # ── Minor improvements ────────────────────────────────────────────
-            ("ProtonDB Refresh",
-             "Settings → Wine → Refresh Now re-fetches compatibility data for all games. "
-             "Previously fetched hashes are reused where valid to save network calls."),
-            ("API Key Validation",
-             "SteamGridDB and IGDB keys each have an Apply button that tests the key "
-             "live and shows a ✓ / ✗ result inline."),
-            ("NAS Connection Testing",
-             "NAS path Apply button tests the connection immediately and shows a 'Scan "
-             "Now' prompt. Sidebar connection status updates without waiting for a scan."),
-            ("Category Blacklist",
-             "Blacklisted categories are skipped entirely during scanning and hidden from "
-             "the sidebar and All Games count. The blacklist flag survives rescans."),
-            # ── Bug fixes & stability ──────────────────────────────────────────
-            ("Stability — Large Libraries",
-             "File descriptor limit raised to 65536 at startup. Image loader thread pool "
-             "capped at 4. Metadata fetch rate-limited to 0.4s per game. Fixes crashes "
-             "on libraries with 600+ games."),
-            ("Stability — SQLite",
-             "WAL journal mode, 30s timeout, 30s busy timeout on all connections. DB path "
-             "computed from environment variables set at startup so every thread uses the "
-             "same absolute path regardless of working directory."),
-            ("Stability — AppImage",
-             "All modules have a sys.path guard that reads $APPDIR at import time. "
-             "Eliminates ModuleNotFoundError when running as an AppImage."),
-            ("Automatic DB Migration",
-             "New columns are added to existing databases on launch without data loss. "
-             "No manual database actions needed when updating."),
-        ]
+        # ── In-App Changelog — Pull From GitHub ─────────────────────────────
+        # Replaces the old hand-maintained Python list below (kept just above
+        # this point in git history for reference — see the Project Log entry
+        # "In-App Changelog — Pull From GitHub"). Content now comes straight
+        # from whatever's typed into the release description box on GitHub at
+        # publish time, fetched via update_check.get_changelog() (1-hour
+        # in-process cache) and rendered with update_check.render_changelog_html().
+        self.changelog_lbl = QLabel("Loading changelog…")
+        self.changelog_lbl.setFont(QFont("DM Sans", 11))
+        self.changelog_lbl.setStyleSheet(f"color: {COLORS['text_dim']};")
+        self.changelog_lbl.setWordWrap(True)
+        self.changelog_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.changelog_lbl.setOpenExternalLinks(True)
+        layout.addWidget(self.changelog_lbl)
 
-        for title, desc in changelog:
-            entry = QWidget()
-            entry.setStyleSheet("background: transparent;")
-            el = QVBoxLayout(entry)
-            el.setContentsMargins(0, 8, 0, 8)
-            el.setSpacing(3)
-            tl = QLabel(f"• {title}")
-            tl.setFont(QFont("DM Sans", 12, QFont.Weight.Medium))
-            tl.setStyleSheet(f"color: {COLORS['text']};")
-            el.addWidget(tl)
-            dl = QLabel(desc)
-            dl.setFont(QFont("DM Sans", 10))
-            dl.setStyleSheet(f"color: {COLORS['text_muted']}; padding-left: 12px;")
-            dl.setWordWrap(True)
-            el.addWidget(dl)
-            sep = QFrame()
-            sep.setFrameShape(QFrame.Shape.HLine)
-            sep.setFixedHeight(1)
-            sep.setStyleSheet(f"background: {COLORS['border']}; border: none;")
-            el.addWidget(sep)
-            layout.addWidget(entry)
+        self._changelog_worker = None
+        self._start_changelog_fetch()
 
         layout.addStretch()
         return scroll
+
+    def _start_changelog_fetch(self, force_refresh: bool = False):
+        """
+        Kick off a background fetch of the latest release's notes for the
+        changelog section. force_refresh=True bypasses update_check.py's
+        1-hour cache — used after a manual "Check for Updates" click, where
+        the person has just explicitly signaled they want fresh data.
+        """
+        if self._changelog_worker and self._changelog_worker.isRunning():
+            return
+
+        from PyQt6.QtCore import QThread, pyqtSignal as _Signal
+
+        class _ChangelogWorker(QThread):
+            done = _Signal(object)   # dict | None
+
+            def __init__(self, force):
+                super().__init__()
+                self._force = force
+
+            def run(self):
+                self.done.emit(update_check.get_changelog(force_refresh=self._force))
+
+        self._changelog_worker = _ChangelogWorker(force_refresh)
+        self._changelog_worker.done.connect(self._on_changelog_fetched)
+        self._changelog_worker.start()
+
+    def _on_changelog_fetched(self, release):
+        if release is None:
+            self.changelog_lbl.setText(
+                "Couldn't load the changelog — check your internet connection. "
+                "The full history is always available on GitHub.")
+            self.changelog_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+            return
+
+        tag = update_check.normalize_tag(release.get("tag", ""))
+        date = release.get("release_date", "")
+        header_text = f"What's New — v{tag}" if tag else "What's New"
+        if date:
+            header_text += f"  ({date})"
+        self._changelog_header.findChild(QLabel).setText(header_text.upper())
+
+        body_html = update_check.render_changelog_html(release.get("body", ""))
+        if not body_html:
+            body_html = ("<p>No release notes were written for this version. "
+                        f"See the full release on <a href=\"{release.get('html_url', '')}\">GitHub</a>.</p>")
+        self.changelog_lbl.setStyleSheet(f"color: {COLORS['text_dim']};")
+        self.changelog_lbl.setText(body_html)
 
     # ── AppImage Self-Update Check ────────────────────────────────────────────
     # Manual check + download run as small local QThread workers, matching the
@@ -3023,6 +2996,14 @@ class SettingsView(QWidget):
                 "✗ Could not reach GitHub — check your internet connection and try again.")
             self.update_status_lbl.setStyleSheet(f"color: {COLORS['danger']};")
             return
+
+        # This fetch already has the latest release data in hand — feed it into
+        # the changelog cache too and re-render, rather than making the person
+        # wait for a second, separate fetch (update_check.get_changelog() would
+        # otherwise just serve its own up-to-an-hour-old cache here).
+        update_check.cache_changelog_release(release)
+        if hasattr(self, "changelog_lbl"):
+            self._on_changelog_fetched(release)
 
         import datetime
         db.set_setting("update_check_last_at", datetime.datetime.utcnow().isoformat())

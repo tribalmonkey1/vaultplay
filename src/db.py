@@ -371,6 +371,15 @@ def _init_default_settings():
         "selection_method":            "both",
         "selection_long_press_ms":     "500",
         "selection_modifier_key":      "ctrl",   # 'ctrl' | 'alt' | 'meta'
+        # Collapsible Sidebar Groups — persisted per-group collapse state.
+        # All groups start expanded ("false") by default on first launch.
+        # Completion Status conflict (flagged 2026-08-03) resolved 2026-08-28
+        # as option (b): migrated into the sidebar as a real group, replacing
+        # the header dropdown that previously lived in library_view.py.
+        "sidebar_library_collapsed":    "false",
+        "sidebar_categories_collapsed": "false",
+        "sidebar_tags_collapsed":       "false",
+        "sidebar_completion_collapsed": "false",
     }
     with get_connection() as conn:
         for key, value in defaults.items():

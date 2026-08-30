@@ -1510,16 +1510,14 @@ class LibraryView(QWidget):
         header_layout.addWidget(self.sort_combo)
         self._refresh_sort_combo()
 
-        # Group D filter — composes with the sidebar's Group A filter (AND-ed
-        # together in _filtered_games()), independent of it. Not reset on
-        # sidebar navigation, matching Group A/B's existing composability.
-        self.completion_combo = NoScrollComboBox()
-        self.completion_combo.setFont(QFont("DM Sans", 10))
-        self.completion_combo.setFixedWidth(150)
-        for label, value in COMPLETION_FILTER_OPTIONS:
-            self.completion_combo.addItem(label, value)
-        self.completion_combo.currentIndexChanged.connect(self._on_completion_filter_changed)
-        header_layout.addWidget(self.completion_combo)
+        # Group D filter (completion status) previously lived here as a
+        # header combo box. Collapsible Sidebar Groups (resolved 2026-08-28
+        # as option b) migrated it into the sidebar as a real collapsible
+        # group instead — see ui/main_window.py's Sidebar completion-status
+        # section and MainWindow._on_completion_filter_changed(), which
+        # calls set_filter_state()...with_completion(value) the same way
+        # this combo used to. COMPLETION_FILTER_OPTIONS stays defined below
+        # since the sidebar reuses it for its own item list.
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search games…")
@@ -1788,14 +1786,6 @@ class LibraryView(QWidget):
 
         return games   # "custom" (see docstring) or anything unrecognized
 
-    def _on_completion_filter_changed(self, index: int):
-        """Group D — completion status filter, independent of the sidebar's
-        Group A filter and category's Group B filter (all AND-ed together
-        in _filtered_games())."""
-        value = self.completion_combo.currentData()
-        self._filter_state = self._filter_state.with_completion(value)
-        self._rebuild(reset_scroll=True)
-
     def set_filter_state(self, state: FilterState):
         """
         Replace the entire filter state at once.
@@ -1803,13 +1793,6 @@ class LibraryView(QWidget):
         """
         self._filter_state = state
         self._update_page_title()
-        # Keep the header combos' displayed values in sync with whatever
-        # this state carries — blocked so this doesn't itself trigger a
-        # second, redundant _rebuild() via the signal.
-        self.completion_combo.blockSignals(True)
-        idx = self.completion_combo.findData(state.completion)
-        self.completion_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.completion_combo.blockSignals(False)
         self._refresh_sort_combo()
         self._rebuild(reset_scroll=True)
 

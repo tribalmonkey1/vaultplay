@@ -49,7 +49,9 @@ import playtime as playtime_mod
 import save_backup
 import update_check
 
-from ui.library_view import LibraryView, ImageLoader as _CoverImageLoader
+from ui.library_view import (
+    LibraryView, ImageLoader as _CoverImageLoader, COMPLETION_FILTER_OPTIONS
+)
 from ui.setup_wizard import SetupWizard
 from ui.game_detail import GameDetailView
 from ui.settings_view import SettingsView
@@ -441,9 +443,59 @@ class TagChipItem(QWidget):
         self.toggled.emit(self.tag_id, self._active)
 
 
+class CollapsibleSectionHeader(QWidget):
+    """
+    Clickable section header for a collapsible sidebar group (Collapsible
+    Sidebar Groups feature). Shows a chevron (⌄ expanded / › collapsed) plus
+    the group title. Purely a display + click-toggle widget — Sidebar owns
+    the actual content-widget show/hide and settings persistence, since the
+    same header shape is reused for every group (Library, Categories, Tags,
+    Completion Status).
+    """
+    toggled = pyqtSignal(bool)   # now_collapsed
+
+    def __init__(self, title: str, collapsed: bool = False, parent=None):
+        super().__init__(parent)
+        self._collapsed = collapsed
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 6, 16, 4)
+        layout.setSpacing(6)
+
+        self.chevron = QLabel()
+        self.chevron.setFixedWidth(12)
+        self.chevron.setFont(QFont("DM Sans", 9))
+        self.chevron.setStyleSheet(f"color: {COLORS['text_muted']}; background: transparent;")
+        layout.addWidget(self.chevron)
+
+        self.title_lbl = QLabel(title.upper())
+        self.title_lbl.setFont(QFont("DM Mono", 8))
+        self.title_lbl.setStyleSheet(
+            f"color: {COLORS['text_muted']}; letter-spacing: 2px; background: transparent;")
+        layout.addWidget(self.title_lbl, 1)
+
+        self._update_chevron()
+
+    def _update_chevron(self):
+        self.chevron.setText("›" if self._collapsed else "⌄")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._collapsed = not self._collapsed
+            self._update_chevron()
+            self.toggled.emit(self._collapsed)
+        super().mousePressEvent(event)
+
+
 class Sidebar(QWidget):
     filter_changed = pyqtSignal(str)
     tag_filter_changed = pyqtSignal(object)   # frozenset[int]
+    # Collapsible Sidebar Groups / Completion Status — emits the selected
+    # completion value ("unplayed"/"in_progress"/"completed"/"abandoned")
+    # or None for "All Statuses". Independent AND filter (Group D), same as
+    # the header dropdown it replaces — never exclusive with Group A/B.
+    completion_filter_changed = pyqtSignal(object)
     settings_requested = pyqtSignal()
     # Collections / Playlists
     collection_selected              = pyqtSignal(int, str)  # collection_id, name
@@ -472,23 +524,26 @@ class Sidebar(QWidget):
         title_layout.addWidget(self.title_label)
         layout.addWidget(title_container)
 
-        # Library section
-        self._add_section_label(layout, "Library")
+        # Library section — Collapsible Sidebar Groups
+        self.library_container = QWidget()
+        self.library_layout = QVBoxLayout(self.library_container)
+        self.library_layout.setContentsMargins(0, 0, 0, 0)
+        self.library_layout.setSpacing(0)
         self.items: dict[str, SidebarItem] = {}
-        self._add_item(layout, "All Games",       "all",         0)
-        self._add_item(layout, "Installed",        "installed",   0)
-        self._add_item(layout, "Not Installed",    "uninstalled", 0)
-        self._add_item(layout, "★  Favorites",     "favorites",   0)
-        self._add_item(layout, "🕐  Recently Added","recent",      0)
-        self._add_item(layout, "⊘  Hidden",        "hidden",      0)
+        self._add_item(self.library_layout, "All Games",       "all",         0)
+        self._add_item(self.library_layout, "Installed",        "installed",   0)
+        self._add_item(self.library_layout, "Not Installed",    "uninstalled", 0)
+        self._add_item(self.library_layout, "★  Favorites",     "favorites",   0)
+        self._add_item(self.library_layout, "🕐  Recently Added","recent",      0)
+        self._add_item(self.library_layout, "⊘  Hidden",        "hidden",      0)
+        self._add_collapsible_group(layout, "Library", "library", self.library_container)
 
-        # Genre section
-        self.genre_label = self._add_section_label(layout, "Categories")
+        # Genre section — Collapsible Sidebar Groups
         self.genre_container = QWidget()
         self.genre_layout = QVBoxLayout(self.genre_container)
         self.genre_layout.setContentsMargins(0, 0, 0, 0)
         self.genre_layout.setSpacing(0)
-        layout.addWidget(self.genre_container)
+        self._add_collapsible_group(layout, "Categories", "categories", self.genre_container)
 
         # Collections section — same static (non-collapsible) style as
         # Categories above. A truly collapsible group is spec'd but depends
@@ -525,11 +580,16 @@ class Sidebar(QWidget):
         nc_layout.addWidget(new_collection_btn)
         layout.addWidget(new_collection_container)
 
-        # Tags section — Group C filter (AND logic). Search box narrows
-        # visibility per spec; full chevron collapse/expand is Collapsible
-        # Sidebar Groups' job and isn't built here — that feature is still
-        # blocked on an unresolved conflict, see its Notion page.
-        self._add_section_label(layout, "Tags")
+        # Tags section — Group C filter (AND logic), wrapped as a
+        # collapsible group (Collapsible Sidebar Groups). Search box lives
+        # INSIDE the collapsible container along with the chip list, per
+        # spec — collapsing the group hides the search box too, but its
+        # typed text is preserved (just a QLineEdit under a hidden parent,
+        # never destroyed) and restored on expand.
+        self.tags_group_container = QWidget()
+        tgc_layout = QVBoxLayout(self.tags_group_container)
+        tgc_layout.setContentsMargins(0, 0, 0, 0)
+        tgc_layout.setSpacing(0)
 
         self.tags_search = QLineEdit()
         self.tags_search.setPlaceholderText("Filter tags…")
@@ -539,16 +599,45 @@ class Sidebar(QWidget):
         tsc_l = QHBoxLayout(tags_search_container)
         tsc_l.setContentsMargins(16, 2, 16, 4)
         tsc_l.addWidget(self.tags_search)
-        layout.addWidget(tags_search_container)
+        tgc_layout.addWidget(tags_search_container)
 
         self.tags_container = QWidget()
         self.tags_layout = QVBoxLayout(self.tags_container)
         self.tags_layout.setContentsMargins(0, 0, 0, 0)
         self.tags_layout.setSpacing(0)
-        layout.addWidget(self.tags_container)
+        tgc_layout.addWidget(self.tags_container)
 
         self._tag_items: dict[int, TagChipItem] = {}
         self._active_tag_ids: set = set()
+
+        self._add_collapsible_group(layout, "Tags", "tags", self.tags_group_container)
+
+        # Completion Status section — Collapsible Sidebar Groups, resolved
+        # 2026-08-28 as option (b): migrated into the sidebar as a real
+        # group (replacing library_view.py's header dropdown), matching
+        # this feature's original spec rather than leaving Completion
+        # Status as a header-only control. Independent AND filter (Group D)
+        # — clicking one of these never touches Group A/B/C selection.
+        self.completion_container = QWidget()
+        self.completion_layout = QVBoxLayout(self.completion_container)
+        self.completion_layout.setContentsMargins(0, 0, 0, 0)
+        self.completion_layout.setSpacing(0)
+        self._completion_items: dict[str, tuple] = {}   # key -> (SidebarItem, value)
+        self._active_completion_value = None
+        for label, value in COMPLETION_FILTER_OPTIONS:
+            key = f"status:{value or 'all'}"
+            item = SidebarItem(label, key, 0)
+            item.clicked.connect(self._on_completion_item_clicked)
+            self._completion_items[key] = (item, value)
+            container = QWidget()
+            cl = QHBoxLayout(container)
+            cl.setContentsMargins(8, 0, 8, 0)
+            cl.addWidget(item)
+            self.completion_layout.addWidget(container)
+        # "All Statuses" active by default — matches the dropdown's old default.
+        self._completion_items["status:all"][0].active = True
+        self._add_collapsible_group(
+            layout, "Completion Status", "completion", self.completion_container)
 
         layout.addStretch()
 
@@ -598,6 +687,27 @@ class Sidebar(QWidget):
         # Activate 'all' by default
         self.items["all"].active = True
         self._current = "all"
+
+    def _add_collapsible_group(self, layout, title: str, setting_key: str,
+                               content_widget: QWidget) -> CollapsibleSectionHeader:
+        """
+        Wrap content_widget in a collapsible group: a clickable chevron
+        header above it. Collapse state is read from (and persisted to)
+        settings key f"sidebar_{setting_key}_collapsed" — all groups start
+        expanded ("false") by default, per Collapsible Sidebar Groups spec.
+        """
+        collapsed = db.get_setting(f"sidebar_{setting_key}_collapsed", "false") == "true"
+        header = CollapsibleSectionHeader(title, collapsed=collapsed)
+        content_widget.setVisible(not collapsed)
+
+        def _on_toggle(now_collapsed: bool, key=setting_key, cw=content_widget):
+            cw.setVisible(not now_collapsed)
+            db.set_setting(f"sidebar_{key}_collapsed", "true" if now_collapsed else "false")
+
+        header.toggled.connect(_on_toggle)
+        layout.addWidget(header)
+        layout.addWidget(content_widget)
+        return header
 
     def _add_section_label(self, layout, text):
         lbl = QLabel(text.upper())
@@ -695,6 +805,24 @@ class Sidebar(QWidget):
         else:
             self._active_tag_ids.discard(tag_id)
         self.tag_filter_changed.emit(frozenset(self._active_tag_ids))
+
+    # ── Completion Status (Collapsible Sidebar Groups) ────────────────────
+
+    def _on_completion_item_clicked(self, key: str):
+        """
+        Single-select within the Completion Status group only — deliberately
+        does NOT touch self.items (Group A/B/B' selection), since completion
+        status is an independent AND filter (Group D), same relationship the
+        header dropdown it replaces always had.
+        """
+        entry = self._completion_items.get(key)
+        if not entry:
+            return
+        value = entry[1]
+        for item, _v in self._completion_items.values():
+            item.active = (item is entry[0])
+        self._active_completion_value = value
+        self.completion_filter_changed.emit(value)
 
     # ── Collections / Playlists ──────────────────────────────────────────────
 
@@ -852,6 +980,7 @@ class MainWindow(QMainWindow):
             self._on_collection_lock_toggle_requested)
         self.sidebar.collection_move_requested.connect(self._on_collection_move_requested)
         self.sidebar.tag_filter_changed.connect(self._on_tag_filter_changed)
+        self.sidebar.completion_filter_changed.connect(self._on_completion_filter_changed)
         root_layout.addWidget(self.sidebar)
 
         # Content stack
@@ -1088,6 +1217,10 @@ class MainWindow(QMainWindow):
     def _on_tag_filter_changed(self, tag_ids):
         self.library_view.set_filter_state(
             self.library_view.get_filter_state().with_tags(tag_ids))
+
+    def _on_completion_filter_changed(self, value):
+        self.library_view.set_filter_state(
+            self.library_view.get_filter_state().with_completion(value))
 
     # ── Collections / Playlists ────────────────────────────────────────────────
 
