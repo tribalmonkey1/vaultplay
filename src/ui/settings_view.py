@@ -897,6 +897,30 @@ class SettingsView(QWidget):
                                "<location>/PC/<game folder name>/",
                                save_root_edit)
 
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("Wishlist"))
+
+        wishlist_explain = QLabel(
+            "The wishlist is stored as a file on a shared folder (e.g. the "
+            "same NAS your games live on) rather than in this app's own "
+            "database, so multiple people can see and edit the same "
+            "wishlist from their own machines. Point every machine that "
+            "should share a wishlist at the same folder."
+        )
+        wishlist_explain.setFont(QFont("DM Sans", 11))
+        wishlist_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 8px;")
+        wishlist_explain.setWordWrap(True)
+        layout.addWidget(wishlist_explain)
+
+        wishlist_path_edit = PathEdit(
+            db.get_setting("wishlist_path", ""), "Wishlist Location")
+        wishlist_path_edit.changed.connect(lambda v: self._save("wishlist_path", v))
+        self._make_setting_row(layout, "wishlist_path",
+                               "Wishlist Location",
+                               "Shared folder where wishlist.json and any "
+                               "uploaded cover art are stored",
+                               wishlist_path_edit)
+
         layout.addStretch()
         return scroll
 

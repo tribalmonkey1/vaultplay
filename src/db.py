@@ -351,6 +351,11 @@ def _init_default_settings():
         "version_check_last_run_at":    "",      # ISO datetime of last full recheck run
         "save_backup_enabled":          "false", # opt-in — off by default
         "save_backup_root":             str(Path.home() / "Documents" / "Game Saves"),
+        # Wishlist — shared NAS folder path. Stored here purely as a config
+        # value; the wishlist data itself lives in a JSON file at this path
+        # (see wishlist_store.py), never in this SQLite DB, since SQLite
+        # over SMB/NFS isn't safe for two machines to share.
+        "wishlist_path":                "",
         # AppImage Self-Update Check — see update_check.py
         "skipped_app_version":          "",  # version the user dismissed the launch notification for
         "update_check_last_at":         "",  # ISO datetime of the last successful check (auto or manual)

@@ -48,6 +48,7 @@ import version_check
 import playtime as playtime_mod
 import save_backup
 import update_check
+import wishlist_store
 
 from ui.library_view import (
     LibraryView, ImageLoader as _CoverImageLoader, COMPLETION_FILTER_OPTIONS
@@ -56,6 +57,7 @@ from ui.setup_wizard import SetupWizard
 from ui.game_detail import GameDetailView
 from ui.settings_view import SettingsView
 from ui.save_backup_dialog import SaveBackupDialog
+from ui.wishlist_view import WishlistView
 from ui.style import STYLESHEET, COLORS
 
 log = logging.getLogger(__name__)
@@ -497,6 +499,12 @@ class Sidebar(QWidget):
     # the header dropdown it replaces — never exclusive with Group A/B.
     completion_filter_changed = pyqtSignal(object)
     settings_requested = pyqtSignal()
+    # Wishlist — own top-level page, not a Library filter (see
+    # MainWindow._show_wishlist()). Deliberately a separate signal from
+    # filter_changed rather than piggybacking on that string-key mechanism
+    # — see _on_item_clicked() below for how the two stay mutually
+    # exclusive in the highlighting.
+    wishlist_requested = pyqtSignal()
     # Collections / Playlists
     collection_selected              = pyqtSignal(int, str)  # collection_id, name
     new_collection_requested         = pyqtSignal()
@@ -537,6 +545,16 @@ class Sidebar(QWidget):
         self._add_item(self.library_layout, "🕐  Recently Added","recent",      0)
         self._add_item(self.library_layout, "⊘  Hidden",        "hidden",      0)
         self._add_collapsible_group(layout, "Library", "library", self.library_container)
+
+        # Wishlist — own top-level page (not a Library filter), so it's a
+        # single always-visible row rather than living inside the Library
+        # collapsible group above. Reuses SidebarItem/the same self.items
+        # highlighting bookkeeping every Library/Category/Collection row
+        # already participates in — see _on_item_clicked()'s special case
+        # for the "wishlist" key — so selecting it correctly un-highlights
+        # whatever else was active, and navigating back to a Library filter
+        # correctly un-highlights it in turn.
+        self._add_item(layout, "🌟  Wishlist", "wishlist", 0)
 
         # Genre section — Collapsible Sidebar Groups
         self.genre_container = QWidget()
@@ -730,6 +748,9 @@ class Sidebar(QWidget):
         for k, item in self.items.items():
             item.active = (k == key)
         self._current = key
+        if key == "wishlist":
+            self.wishlist_requested.emit()
+            return
         self.filter_changed.emit(key)
 
     def update_counts(self, all_count, installed, uninstalled, cat_counts: dict,
@@ -765,6 +786,10 @@ class Sidebar(QWidget):
             cl.setContentsMargins(8, 0, 8, 0)
             cl.addWidget(item)
             self.genre_layout.addWidget(container)
+
+    def update_wishlist_count(self, count: int):
+        if "wishlist" in self.items:
+            self.items["wishlist"].update_count(count)
 
     # ── Tags ──────────────────────────────────────────────────────────────
 
@@ -981,6 +1006,7 @@ class MainWindow(QMainWindow):
         self.sidebar.collection_move_requested.connect(self._on_collection_move_requested)
         self.sidebar.tag_filter_changed.connect(self._on_tag_filter_changed)
         self.sidebar.completion_filter_changed.connect(self._on_completion_filter_changed)
+        self.sidebar.wishlist_requested.connect(self._show_wishlist)
         root_layout.addWidget(self.sidebar)
 
         # Content stack
@@ -1023,9 +1049,14 @@ class MainWindow(QMainWindow):
         self.settings_view.rescan_requested.connect(self._on_rescan_requested)
         self.settings_view.reload_requested.connect(self._load_library)
 
+        self.wishlist_view = WishlistView()
+        self.wishlist_view.back_requested.connect(self._show_library)
+        self.wishlist_view.changed.connect(self._refresh_wishlist_sidebar)
+
         self.stack.addWidget(self.library_view)   # index 0
         self.stack.addWidget(self.detail_view)    # index 1
         self.stack.addWidget(self.settings_view)  # index 2
+        self.stack.addWidget(self.wishlist_view)  # index 3
 
         # Workers
         self._scan_worker:   ScanWorker    | None = None
@@ -1104,6 +1135,11 @@ class MainWindow(QMainWindow):
         # since this is the one-time startup sequence.
         self._refresh_collections_sidebar()
 
+        # Wishlist — populate the sidebar's count badge on startup.
+        # Independent of everything else here (reads straight from the
+        # shared wishlist file, not the games DB).
+        self._refresh_wishlist_sidebar()
+
         # Currently Playing Indicator — restart-reattachment. Must happen
         # after the library is loaded (needs db.get_all_games()) but
         # doesn't depend on the scan below, so it's safe to run regardless
@@ -1169,6 +1205,24 @@ class MainWindow(QMainWindow):
     def _show_settings(self):
         self.settings_view.load_settings()
         self.stack.setCurrentIndex(2)
+
+    def _show_wishlist(self):
+        # No game/settings argument to pass through — WishlistView reloads
+        # itself from its own showEvent() the moment it becomes the
+        # current stack widget, same as switching to it via any other path.
+        self.stack.setCurrentIndex(3)
+
+    def _refresh_wishlist_sidebar(self):
+        """Sync the sidebar's Wishlist row count badge with the shared
+        wishlist file. Safe to call anytime — cheap, and wishlist_store
+        itself never raises. Called at startup, after any local
+        add/edit/remove/reorder (via WishlistView.changed), and after the
+        acquired-game auto-match flow below."""
+        try:
+            count = wishlist_store.get_count() if wishlist_store.is_configured() else 0
+        except Exception:
+            count = 0
+        self.sidebar.update_wishlist_count(count)
 
     # ── Library loading ───────────────────────────────────────────────────────
 
@@ -1374,6 +1428,13 @@ class MainWindow(QMainWindow):
             self._pending_new_game_ids = new_game_ids
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(1000, self._start_auto_track)
+            # Wishlist — Acquired-Game Auto-Match: independent of the
+            # version-tracking auto-track pass above (both are separate
+            # consumers of the same new_game_ids list), staggered slightly
+            # later just so the two don't pop dialogs/status text at
+            # exactly the same moment.
+            QTimer.singleShot(
+                1500, lambda ids=list(new_game_ids): self._check_wishlist_matches(ids))
 
     def _start_metadata_fetch(self):
         if self._meta_worker and self._meta_worker.isRunning():
@@ -1560,6 +1621,82 @@ class MainWindow(QMainWindow):
         if (self.stack.currentIndex() == 1 and
                 self.detail_view._game_id == game_id):
             self.detail_view.load_game(game_id)
+
+    # ── Wishlist — Acquired-Game Auto-Match ──────────────────────────────────
+
+    def _check_wishlist_matches(self, new_game_ids: list):
+        """
+        Fires after every scan that found new games — fuzzy-matches each
+        newly-scanned game's title against the wishlist (see
+        wishlist_store.find_acquired_matches()) and asks about each
+        un-ignored match in turn. No-ops immediately if the wishlist isn't
+        configured, since there's nothing to match against.
+        """
+        if not wishlist_store.is_configured() or not new_game_ids:
+            return
+        try:
+            wanted = set(new_game_ids)
+            games = [g for g in db.get_all_games() if g["id"] in wanted]
+        except Exception as e:
+            log.warning("Wishlist: could not load new games for matching: %s", e)
+            return
+
+        scanned_titles = {
+            g["folder_name"]: (g["title"] or g["display_name"] or g["folder_name"])
+            for g in games
+        }
+        if not scanned_titles:
+            return
+
+        try:
+            matches = wishlist_store.find_acquired_matches(scanned_titles)
+        except Exception as e:
+            log.warning("Wishlist: acquired-match check failed: %s", e)
+            return
+
+        for match in matches:
+            self._confirm_wishlist_match(match)
+
+    def _confirm_wishlist_match(self, match: dict):
+        """
+        One-at-a-time confirmation for a single fuzzy wishlist match.
+        Three outcomes:
+          Remove from Wishlist        — the game was acquired; delete the
+                                         wishlist item.
+          Not This Time               — no change; this exact pair will be
+                                         offered again on a future scan
+                                         (e.g. if it was a false positive
+                                         the user wants to reconsider, or
+                                         they just weren't ready to decide).
+          Keep — Don't Ask Again      — the wishlist item stays, and this
+                                         specific (item, folder) pairing is
+                                         recorded in ignored_matches so it's
+                                         never re-prompted — see
+                                         wishlist_store.add_ignored_match().
+        """
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Wishlist Match Found")
+        msg.setText(
+            f"'{match['scanned_title']}' looks like it might be "
+            f"'{match['wishlist_title']}' from your wishlist.")
+        msg.setInformativeText("Remove it from your wishlist?")
+        remove_btn = msg.addButton("Remove from Wishlist", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Not This Time", QMessageBox.ButtonRole.RejectRole)
+        ignore_btn = msg.addButton("Keep — Don't Ask Again", QMessageBox.ButtonRole.DestructiveRole)
+        msg.setDefaultButton(remove_btn)
+        msg.setStyleSheet(
+            f"QMessageBox {{ background: {COLORS['surface']}; color: {COLORS['text']}; }}")
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked == remove_btn:
+            wishlist_store.remove_item(match["wishlist_id"])
+            self._refresh_wishlist_sidebar()
+            if self.stack.currentIndex() == 3:
+                self.wishlist_view.refresh()
+        elif clicked == ignore_btn:
+            wishlist_store.add_ignored_match(match["wishlist_id"], match["folder_name"])
+        # "Not This Time" — no-op, will be offered again next scan.
 
     # ── Version checking ──────────────────────────────────────────────────────
 
