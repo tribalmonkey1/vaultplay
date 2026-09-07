@@ -513,6 +513,13 @@ class Sidebar(QWidget):
     collection_lock_toggle_requested = pyqtSignal(int)       # collection_id
     collection_move_requested        = pyqtSignal(int, int)  # collection_id, direction (-1/+1)
 
+    # Group A (Library) row keys — used by _on_item_clicked() to tell a
+    # Library click apart from a Category click without touching the
+    # other group's highlighting. See Filter Composability: Group A and
+    # Group B are independent single-select axes, not one shared radio group.
+    _LIBRARY_GROUP_KEYS = frozenset(
+        {"all", "installed", "uninstalled", "favorites", "recent", "hidden"})
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedWidth(220)
@@ -745,17 +752,50 @@ class Sidebar(QWidget):
         layout.addWidget(container)
 
     def _on_item_clicked(self, key: str):
-        for k, item in self.items.items():
-            item.active = (k == key)
-        self._current = key
+        """
+        Library (Group A) and Category/Collection (Group B) are independent
+        single-select groups — clicking in one must never touch the other's
+        highlighting or filter value, so e.g. "Installed" (Group A) and
+        "PC" (Group B) can be active at the same time. Clicking an
+        already-active item deselects it (Group A -> "All Games", Group B
+        -> no category) — Category has no separate "All Categories" pill,
+        so this toggle is the only way to clear it once picked.
+        """
         if key == "wishlist":
+            for k, item in self.items.items():
+                item.active = (k == "wishlist")
+            self._current = key
             self.wishlist_requested.emit()
             return
-        self.filter_changed.emit(key)
+
+        was_active = bool(self.items.get(key) and self.items[key].active)
+
+        if key.startswith("cat:"):
+            new_key = "cat:" if was_active else key   # "cat:" (no folder) = clear category
+            for k, item in self.items.items():
+                if k.startswith("cat:") or k.startswith("coll:"):
+                    item.active = (k == new_key)
+        else:
+            new_key = "all" if was_active else key
+            for k, item in self.items.items():
+                if k in self._LIBRARY_GROUP_KEYS:
+                    item.active = (k == new_key)
+
+        self._current = new_key
+        self.filter_changed.emit(new_key)
 
     def update_counts(self, all_count, installed, uninstalled, cat_counts: dict,
-                      favorites: int = 0, hidden: int = 0):
-        """cat_counts: {folder_name: (display_name, count)}"""
+                      favorites: int = 0, hidden: int = 0,
+                      active_category: Optional[str] = None):
+        """
+        cat_counts: {folder_name: (display_name, count)}
+        active_category: the currently-selected Group B folder name (from
+        LibraryView.get_filter_state().category), if any — category rows
+        are destroyed and recreated below on every call, so without this
+        the currently-active category would visually lose its highlight
+        on every scan/metadata refresh even though the filter itself
+        (which lives in LibraryView's FilterState, not here) stays applied.
+        """
         self.items["all"].update_count(all_count)
         self.items["installed"].update_count(installed)
         self.items["uninstalled"].update_count(uninstalled)
@@ -779,6 +819,7 @@ class Sidebar(QWidget):
         for folder, (display, count) in cat_counts.items():
             key = f"cat:{folder}"
             item = SidebarItem(display, key, count)
+            item.active = (folder == active_category)
             item.clicked.connect(self._on_item_clicked)
             self.items[key] = item
             container = QWidget()
@@ -855,14 +896,15 @@ class Sidebar(QWidget):
         self.new_collection_requested.emit()
 
     def _on_collection_item_clicked(self, key: str, collection_id: int, name: str):
-        """Mirrors _on_item_clicked()'s 'deactivate everyone else, activate
-        the clicked one' behavior, so selecting a collection correctly
-        un-highlights whatever Library/Category item was active before —
-        collection rows aren't wired through _on_item_clicked itself since
+        """Mirrors _on_item_clicked()'s category branch — Collections and
+        Categories share one mutually-exclusive Group B selection,
+        independent of Library (Group A), which is left untouched here.
+        Collection rows aren't wired through _on_item_clicked itself since
         they need to emit collection_selected (id + name), not a bare
         filter key string."""
         for k, item in self.items.items():
-            item.active = (k == key)
+            if k.startswith("cat:") or k.startswith("coll:"):
+                item.active = (k == key)
         self._current = key
         self.collection_selected.emit(collection_id, name)
 
@@ -1252,21 +1294,27 @@ class MainWindow(QMainWindow):
                 cat_counts[folder] = (display, count)
 
         self.sidebar.update_counts(all_count, installed, uninstalled,
-                                   cat_counts, favorites=favorites, hidden=hidden)
+                                   cat_counts, favorites=favorites, hidden=hidden,
+                                   active_category=self.library_view.get_filter_state().category)
         self.sidebar.update_tags(db.get_all_tags())
         self.library_view.load_games(games)
 
     def _on_filter_changed(self, key: str):
         self.library_view.apply_filter(key)
         if key.startswith("cat:"):
+            folder = key[4:]
+            if not folder:
+                # Category was deselected (Sidebar._on_item_clicked's toggle-off) —
+                # apply_filter() already set an appropriate Library-based title.
+                return
             # Set the page title to the category's display name (not the raw folder name)
             cats = db.get_categories()
             for c in cats:
-                if c["folder_name"] == key[4:]:
+                if c["folder_name"] == folder:
                     self.library_view.set_page_title(c["display_name"])
                     return
             # Fallback to folder name if display name not found
-            self.library_view.set_page_title(key[4:])
+            self.library_view.set_page_title(folder)
 
     def _on_tag_filter_changed(self, tag_ids):
         self.library_view.set_filter_state(

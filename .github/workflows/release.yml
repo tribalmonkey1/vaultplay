@@ -1,8 +1,13 @@
 name: Release
 
-# Push a tag like "v0.4.0" to trigger a build + published GitHub Release.
+# Push a tag like "v0.4.0" to trigger a build + a DRAFT GitHub Release.
+# The release is created as a draft (not published) so notes/changelog can be
+# reviewed and edited before manually clicking "Publish release" on GitHub.
 # update_check.py (AppImage Self-Update Check) polls
-# api.github.com/repos/tribalmonkey1/vaultplay/releases/latest and expects:
+# api.github.com/repos/tribalmonkey1/vaultplay/releases/latest, which only
+# ever resolves to the newest PUBLISHED, non-draft, non-prerelease release —
+# so a draft sitting here is never offered to users as an update until it's
+# manually published. Once published, that endpoint expects:
 #   - a tag named "v<version>"
 #   - exactly one *.AppImage asset attached to the release
 # Both are produced automatically by this workflow — nothing to upload by hand.
@@ -45,11 +50,12 @@ jobs:
       - name: Build AppImage
         run: bash scripts/build_appimage.sh
 
-      - name: Publish GitHub Release
+      - name: Create Draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: VaultPlay ${{ steps.ver.outputs.tag }}
+          draft: true
           generate_release_notes: true
           files: VaultPlay-x86_64.AppImage
         env:

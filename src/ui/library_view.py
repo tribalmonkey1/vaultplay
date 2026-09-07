@@ -1657,12 +1657,19 @@ class LibraryView(QWidget):
 
     def apply_filter(self, key: str):
         """
-        Set the Group A sidebar key.
+        Set the Group A (Library) or Group B (Category) sidebar selection.
 
         Accepts the same string keys as before ("all", "installed",
-        "uninstalled", "cat:<folder>") plus new Group A keys ("favorites",
-        "recent", "hidden"). Category keys ("cat:<folder>") also set
-        filter_state.category so the two filters stay in sync.
+        "uninstalled", "cat:<folder>", "coll:<id>") plus Group A keys
+        ("favorites", "recent", "hidden"). Per Filter Composability, Group A
+        (Library) and Group B (Category) are independent axes — selecting
+        one must never clear the other. with_sidebar()/with_category()
+        already implement that (each preserves the field it doesn't own),
+        so this just delegates to them instead of rebuilding FilterState
+        from scratch and accidentally dropping whichever field the caller
+        wasn't setting. A bare "cat:" key (empty folder) means Category was
+        deselected back to "no category filter" — see Sidebar._on_item_clicked()
+        in ui/main_window.py, which is the only place that key shape is built.
         """
         # Multi-Select — real navigation (a different sidebar view) clears
         # any active selection, same "reset on navigation" precedent
@@ -1672,26 +1679,10 @@ class LibraryView(QWidget):
         self._clear_selection()
         if key.startswith("cat:"):
             folder = key[4:]
-            self._filter_state = FilterState(
-                sidebar_key="all",
-                category=folder,
-                collection=None,
-                completion=self._filter_state.completion,
-                search=self._filter_state.search,
-                tags=self._filter_state.tags,
-                sort="az",
-            )
+            self._filter_state = self._filter_state.with_category(folder or None)
         elif key.startswith("coll:"):
             collection_id = int(key[5:])
-            self._filter_state = FilterState(
-                sidebar_key="all",
-                category=None,
-                collection=collection_id,
-                completion=self._filter_state.completion,
-                search=self._filter_state.search,
-                tags=self._filter_state.tags,
-                sort="custom",
-            )
+            self._filter_state = self._filter_state.with_collection(collection_id)
             # Real display name is set by the caller (MainWindow) via
             # set_page_title() right after this call — same pattern
             # already used for categories in MainWindow._on_filter_changed().
@@ -1700,15 +1691,7 @@ class LibraryView(QWidget):
             self._rebuild(reset_scroll=True)
             return
         else:
-            self._filter_state = FilterState(
-                sidebar_key=key,
-                category=None,
-                collection=None,
-                completion=self._filter_state.completion,
-                search=self._filter_state.search,
-                tags=self._filter_state.tags,
-                sort="az",
-            )
+            self._filter_state = self._filter_state.with_sidebar(key)
         self._update_page_title()
         self._refresh_sort_combo()
         self._rebuild(reset_scroll=True)
