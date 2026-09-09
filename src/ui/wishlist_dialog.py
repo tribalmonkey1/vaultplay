@@ -375,6 +375,11 @@ class WishlistItemDialog(QDialog):
             "e.g. March 2027, or leave blank if already released")
         basic_box.add(_field_row("Release Date", self.release_edit))
 
+        self.youtube_edit = QLineEdit(item.get("youtube_url", "") if item else "")
+        self.youtube_edit.setPlaceholderText(
+            "https://www.youtube.com/watch?v=… (optional)")
+        basic_box.add(_field_row("Trailer (YouTube)", self.youtube_edit))
+
         body_l.addWidget(basic_box)
 
         # ── Notes ─────────────────────────────────────────────────────────────
@@ -455,15 +460,16 @@ class WishlistItemDialog(QDialog):
 
         release_date = self.release_edit.text().strip()
         notes = self.notes_edit.toPlainText().strip()
+        youtube_url = self.youtube_edit.text().strip()
 
         if self._item_id:
             ok = wishlist_store.update_item(
                 self._item_id, title=title, release_date=release_date,
-                notes=notes, cover_url=cover_url)
+                notes=notes, cover_url=cover_url, youtube_url=youtube_url)
         else:
             new_item = wishlist_store.add_item(
                 title=title, release_date=release_date, notes=notes,
-                cover_url=cover_url)
+                cover_url=cover_url, youtube_url=youtube_url)
             ok = new_item is not None
             if ok:
                 self._item_id = new_item["id"]

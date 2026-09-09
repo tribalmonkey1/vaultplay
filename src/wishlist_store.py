@@ -36,6 +36,9 @@ wishlist.json shape:
                                                     # machine may mount the
                                                     # shared folder at a
                                                     # different location
+                "youtube_url":  str,               # optional trailer link,
+                                                    # freetext/unvalidated
+                                                    # like release_date
                 "created_at":   ISO8601 str,
             }
         ],
@@ -265,12 +268,16 @@ def get_count() -> int:
 
 
 def add_item(title: str, release_date: str = "", notes: str = "",
-            cover_url: str = "") -> Optional[dict]:
+            cover_url: str = "", youtube_url: str = "") -> Optional[dict]:
     """
     Create a new wishlist item, appended to the bottom of the priority
     list — sort_order = max(existing) + 1, or 0 if the list is empty.
     Same "new items append, never disrupt existing order" convention
     Collections already uses for both new collections and new members.
+
+    youtube_url: optional freetext trailer link (freeform, same
+    unvalidated contract as release_date) — shown as a clickable "watch
+    trailer" chip on the tile when non-blank (see wishlist_view.py).
 
     Returns the new item dict on success, or None if the write failed
     (e.g. wishlist_path unset/unreachable — caller should show an error,
@@ -284,6 +291,7 @@ def add_item(title: str, release_date: str = "", notes: str = "",
         "release_date": (release_date or "").strip(),
         "notes":        (notes or "").strip(),
         "cover_url":    cover_url or "",
+        "youtube_url":  (youtube_url or "").strip(),
         "created_at":   datetime.datetime.utcnow().isoformat(),
     }
 
@@ -300,7 +308,8 @@ def add_item(title: str, release_date: str = "", notes: str = "",
 def update_item(item_id: str, title: Optional[str] = None,
                 release_date: Optional[str] = None,
                 notes: Optional[str] = None,
-                cover_url: Optional[str] = None) -> bool:
+                cover_url: Optional[str] = None,
+                youtube_url: Optional[str] = None) -> bool:
     """
     Partial update — only fields passed as not-None are changed, matching
     the partial-update contract used throughout db.py (e.g.
@@ -320,6 +329,8 @@ def update_item(item_id: str, title: Optional[str] = None,
                     item["notes"] = notes.strip()
                 if cover_url is not None:
                     item["cover_url"] = cover_url
+                if youtube_url is not None:
+                    item["youtube_url"] = youtube_url.strip()
                 found["ok"] = True
                 break
 

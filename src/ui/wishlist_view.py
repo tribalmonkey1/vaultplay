@@ -41,6 +41,7 @@ if _parent not in _sys.path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 import logging
+import subprocess
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -94,6 +95,52 @@ class _ThumbLoader(QRunnable):
             log.debug("_ThumbLoader failed for %s: %s", self.cover_value, e)
 
 
+# ── Trailer badge ──────────────────────────────────────────────────────────
+
+class _TrailerBadge(QLabel):
+    """
+    Small clickable 'watch trailer' chip overlaid on a wishlist tile's
+    cover art — shown only when the item has a YouTube link. Opens the
+    link in the system browser (same xdg-open pattern used everywhere
+    else in this app for external URLs/folders — no in-app player yet).
+    Being a child widget positioned on top of the cover, a click here is
+    delivered to this label rather than the tile underneath, so watching
+    the trailer and opening the Edit dialog (a click anywhere else on
+    the tile) stay two separate actions.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__("▶  Trailer", parent)
+        self._url = ""
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFont(QFont("DM Sans", 8, QFont.Weight.Medium))
+        self.setStyleSheet("""
+            QLabel {
+                background: rgba(13,15,20,0.75);
+                color: #ffffff;
+                border-radius: 4px;
+                padding: 2px 6px;
+            }
+        """)
+        self.setToolTip("Watch trailer on YouTube")
+        self.adjustSize()
+        self.hide()
+
+    def set_url(self, url: str):
+        self._url = (url or "").strip()
+        self.setVisible(bool(self._url))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._url:
+            try:
+                subprocess.Popen(["xdg-open", self._url])
+            except Exception as e:
+                log.warning("Could not open trailer URL %s: %s", self._url, e)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 # ── Wishlist tile ──────────────────────────────────────────────────────────────
 
 class WishlistTile(QFrame):
@@ -138,6 +185,9 @@ class WishlistTile(QFrame):
         self.cover_label.setStyleSheet(
             f"background: {COLORS['surface2']}; color: {COLORS['text_muted']}; border: none;")
         layout.addWidget(self.cover_label)
+
+        self.trailer_badge = _TrailerBadge(parent=self)
+        self.trailer_badge.move(8, 8)
 
         footer = QWidget()
         footer.setStyleSheet(f"background: {COLORS['surface']}; border: none;")
@@ -189,6 +239,8 @@ class WishlistTile(QFrame):
             self.release_chip.show()
         else:
             self.release_chip.hide()
+
+        self.trailer_badge.set_url(item.get("youtube_url", ""))
 
     def set_cover_pixmap(self, pixmap: QPixmap):
         self.cover_label.setPixmap(pixmap)

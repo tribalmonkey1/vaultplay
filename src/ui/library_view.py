@@ -1651,9 +1651,9 @@ class LibraryView(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def load_games(self, games: list):
+    def load_games(self, games: list, reset_scroll: bool = True):
         self._all_games = games
-        self._rebuild(reset_scroll=True)
+        self._rebuild(reset_scroll=reset_scroll)
 
     def apply_filter(self, key: str):
         """

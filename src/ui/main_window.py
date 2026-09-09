@@ -1268,10 +1268,14 @@ class MainWindow(QMainWindow):
 
     # ── Library loading ───────────────────────────────────────────────────────
 
-    def _load_library(self):
+    def _load_library(self, reset_scroll: bool = True):
         """
         Pull the minimal tile data from DB and hand it to the library view,
         which will trickle tiles in one per event-loop tick.
+
+        reset_scroll=False preserves the current scroll position — used by
+        _on_game_state_changed() so a favorite/hide/bulk action from a
+        tile's context menu doesn't bounce the whole grid back to the top.
         """
         games = db.get_games_for_library()
 
@@ -1297,7 +1301,7 @@ class MainWindow(QMainWindow):
                                    cat_counts, favorites=favorites, hidden=hidden,
                                    active_category=self.library_view.get_filter_state().category)
         self.sidebar.update_tags(db.get_all_tags())
-        self.library_view.load_games(games)
+        self.library_view.load_games(games, reset_scroll=reset_scroll)
 
     def _on_filter_changed(self, key: str):
         self.library_view.apply_filter(key)
@@ -1598,11 +1602,14 @@ class MainWindow(QMainWindow):
 
     def _on_game_state_changed(self, game_id: int):
         """
-        Called when a tile context menu changes favorite or hidden state.
-        Reloads the library so sidebar counts and tile visibility update
-        immediately without requiring a full NAS rescan.
+        Called when a tile context menu changes favorite or hidden state
+        (or a bulk action runs across a multi-selection). Reloads library
+        data and sidebar counts in place, WITHOUT resetting scroll — a
+        hidden/unfavorited game just vanishes from the grid and the games
+        after it shift up to fill the gap, instead of bouncing the whole
+        view back to the top.
         """
-        self._load_library()
+        self._load_library(reset_scroll=False)
 
     def _on_notification_navigate(self, type_: str, game_id):
         """
