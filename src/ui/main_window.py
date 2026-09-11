@@ -1304,6 +1304,7 @@ class MainWindow(QMainWindow):
         self.library_view.load_games(games, reset_scroll=reset_scroll)
 
     def _on_filter_changed(self, key: str):
+        self.stack.setCurrentIndex(0)
         self.library_view.apply_filter(key)
         if key.startswith("cat:"):
             folder = key[4:]
@@ -1321,10 +1322,12 @@ class MainWindow(QMainWindow):
             self.library_view.set_page_title(folder)
 
     def _on_tag_filter_changed(self, tag_ids):
+        self.stack.setCurrentIndex(0)
         self.library_view.set_filter_state(
             self.library_view.get_filter_state().with_tags(tag_ids))
 
     def _on_completion_filter_changed(self, value):
+        self.stack.setCurrentIndex(0)
         self.library_view.set_filter_state(
             self.library_view.get_filter_state().with_completion(value))
 
@@ -1335,6 +1338,7 @@ class MainWindow(QMainWindow):
         self.sidebar.update_collections(db.get_collections(), active_collection_id=active)
 
     def _on_collection_selected(self, collection_id: int, name: str):
+        self.stack.setCurrentIndex(0)
         self.library_view.apply_filter(f"coll:{collection_id}")
         self.library_view.set_page_title(name)
         self._refresh_collections_sidebar()
