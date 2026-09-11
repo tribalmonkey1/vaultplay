@@ -1519,6 +1519,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launch_cmd=launch_cmd,
             launch_cwd=launch_cwd,
             launch_icon=launch_icon,
+            proton_version=proton_value,
         )
 
         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
@@ -1648,6 +1649,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launch_cmd=launch_cmd,
             launch_cwd=launch_cwd,
             launch_icon=launch_icon,
+            proton_version=proton_value,
         )
 
         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
@@ -1739,6 +1741,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launch_cmd=launch_cmd,
             launch_cwd=launch_cwd,
             launch_icon=launch_icon,
+            proton_version=proton_value,
         )
 
         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
@@ -1780,13 +1783,26 @@ def parse_wine_bin_from_cmd(launch_cmd: str) -> str:
     like:
         env WINEPREFIX="..." STEAM_COMPAT_DATA_PATH="..." "/path/to/proton" run "game.exe"
         env WINEPREFIX="..." wine "game.exe"
+        gamemoderun env WINEPREFIX="..." "/path/to/proton" run "game.exe"
 
-    Scans tokens left-to-right, skips 'env' and KEY=VALUE pairs, returns the
-    first remaining token. Falls back to "wine" if nothing recognisable is
+    Scans tokens left-to-right, skips 'env', KEY=VALUE pairs, and known
+    wrapper commands (see _LAUNCH_WRAPPERS below), returns the first
+    remaining token. Falls back to "wine" if nothing recognisable is
     found. Centralized here (rather than duplicated) so both game_detail.py
-    (deciding which PlaytimeWatcher wait strategy to use) and cogwheel_menu.py
-    (defaulting the Proton/Wine version picker to what's actually in use) stay
-    in sync — never hardcode "wine" at either call site.
+    (deciding which PlaytimeWatcher wait strategy to use, and which
+    directory Save Backup snapshots/diffs) and cogwheel_menu.py
+    (defaulting the Proton/Wine version picker to what's actually in use)
+    stay in sync — never hardcode "wine" at either call site.
+
+    _LAUNCH_WRAPPERS must track every wrapper launch_options.py's
+    apply_to_launch_cmd() can prepend to the FULL command (currently just
+    "gamemoderun" — see its GameMode section). Missing a wrapper here
+    doesn't just mislabel the binary: is_proton()/_resolve_actual_prefix()
+    both key off this return value, so a wrapper leaking through silently
+    breaks Proton detection — Save Backup snapshots/diffs the wrong
+    directory (plain-Wine drive_c instead of Proton's pfx/drive_c) and
+    PlaytimeWatcher picks the wrong wait strategy, both without raising
+    any error.
     """
     if not launch_cmd:
         return "wine"
@@ -1796,8 +1812,10 @@ def parse_wine_bin_from_cmd(launch_cmd: str) -> str:
     except ValueError:
         tokens = launch_cmd.split()
 
+    _LAUNCH_WRAPPERS = {"gamemoderun"}
+
     for token in tokens:
-        if token == "env":
+        if token == "env" or token in _LAUNCH_WRAPPERS:
             continue
         if "=" in token and not token.startswith("/") and not token.startswith('"'):
             continue

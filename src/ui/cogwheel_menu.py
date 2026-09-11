@@ -62,6 +62,7 @@ if _parent not in _sys.path:
     _sys.path.insert(0, _parent)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -294,6 +295,42 @@ class SectionBox(QFrame):
 # game is already installed; those live in InstallPathsDialog / are simply
 # not applicable here.
 
+def _version_counts_and_sample_for_game(game) -> tuple[dict, int]:
+    """
+    Parse this game's stored protondb_version_counts JSON into
+    ({canonical_key: count}, sample_size). sample_size is the reserved
+    __sample__ marker (see protondb.fetch_and_store()) — the number of
+    reports actually sampled to build the counts, used for the "N of M
+    most recent reports" note under the picker. Returns ({}, 0) on
+    missing/unparseable data. Mirrors install_dialog.py's identical
+    parsing so Manage Install's Proton/Wine picker can show the same
+    community-recommendation note the initial Install dialog does.
+    """
+    try:
+        raw = _safe_get(game, "protondb_version_counts")
+        counts = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        counts = {}
+    if not isinstance(counts, dict):
+        return {}, 0
+    sample = int(counts.pop("__sample__", 0) or 0)
+    return counts, sample
+
+
+def _find_canonical_for_installed_value(value: str, version_counts: dict) -> str:
+    """
+    Reverse-match an installed version's value key (e.g. 'ge-proton-10.5')
+    to its canonical ProtonDB report key (e.g. 'GE-Proton 10'), so the
+    recommended-version highlight can be applied to the right combo item.
+    Mirrors install_dialog.InstallDialog._find_canonical_for_value().
+    """
+    for canonical in version_counts:
+        matched = protondb_mod.match_to_installed(canonical, [(value, value)])
+        if matched:
+            return canonical
+    return ""
+
+
 def _detect_current_proton_value(game) -> str:
     """
     Figure out which installed-version 'value' key this game is ACTUALLY
@@ -411,8 +448,23 @@ class ManageInstallDialog(QDialog):
         # ── Proton / Wine Version ─────────────────────────────────────────────
         current = _detect_current_proton_value(game)
         versions = protondb_mod.get_versions_for_ui()
+
+        # ProtonDB community-recommendation data — same source install_dialog.py
+        # uses to mark its top-voted pick. Loaded here too so Manage Install's
+        # picker isn't a flat, unranked list — the recommended version should
+        # be just as visible when changing it later as it was at first install.
+        self._version_counts, self._sample_size = _version_counts_and_sample_for_game(game)
+        rec_canonical = (_safe_get(game, "recommended_proton", "") or "").strip()
+        self._top_canonical = rec_canonical or (
+            protondb_mod.top_version(self._version_counts) if self._version_counts else "")
+
         matched_label = next((lbl for lbl, val in versions if val == current), "")
+        tier = _safe_get(game, "protondb_tier", "") or ""
+        reports = _safe_get(game, "protondb_reports", 0) or 0
         proton_title = "Proton / Wine Version"
+        if tier:
+            tier_label, _ = protondb_mod.tier_display(tier)
+            proton_title += f"  ·  ProtonDB: {tier_label} ({reports} reports)"
         if matched_label:
             proton_title += f"  ·  currently: {matched_label}"
 
@@ -422,12 +474,35 @@ class ManageInstallDialog(QDialog):
         if not versions:
             self.proton_combo.addItem("No versions found — install via ProtonUp-Qt", "")
         else:
-            for label, value in versions:
-                self.proton_combo.addItem(label, value)
+            for i, (label, value) in enumerate(versions):
+                canonical = _find_canonical_for_installed_value(value, self._version_counts)
+                count = self._version_counts.get(canonical, 0) if canonical else 0
+                is_top = bool(canonical) and canonical == self._top_canonical and count > 0
+                if is_top:
+                    display = f"{label}  ·  {count} reports  ✦"
+                elif count:
+                    display = f"{label}  ·  {count} reports"
+                else:
+                    display = label
+                self.proton_combo.addItem(display, value)
+                if is_top:
+                    self.proton_combo.setItemData(
+                        i, QColor("#e8c76a"), Qt.ItemDataRole.ForegroundRole)
             idx = self.proton_combo.findData(current)
             if idx >= 0:
                 self.proton_combo.setCurrentIndex(idx)
         proton_box.add(self.proton_combo)
+
+        # Note line under the combo — mirrors install_dialog.py's proton_note:
+        # green "Most reported by the community…" when the current selection
+        # IS the top pick, muted "N reports · top choice has M" otherwise,
+        # hidden entirely when there's no report data for the selection at all.
+        self.proton_note = QLabel("")
+        self.proton_note.setFont(QFont("DM Sans", 10))
+        self.proton_note.setWordWrap(True)
+        proton_box.add(self.proton_note)
+        self._update_proton_note()
+
         body_l.addWidget(proton_box)
 
         # ── Redistributables ─────────────────────────────────────────────────
@@ -509,6 +584,44 @@ class ManageInstallDialog(QDialog):
     def _on_proton_combo_changed(self, _index: int):
         self.launch_opts.set_is_proton(
             _is_proton_value(self.proton_combo.currentData()))
+        self._update_proton_note()
+
+    def _update_proton_note(self):
+        """
+        Sync the community-recommendation note under the Proton/Wine combo
+        with whatever is currently selected — mirrors
+        install_dialog.InstallDialog._on_proton_selection_changed(), minus
+        the "not installed" branch (every item here is already installed).
+        """
+        value = self.proton_combo.currentData()
+        if not value:
+            self.proton_note.setText("")
+            self.proton_note.setVisible(False)
+            return
+
+        canonical = _find_canonical_for_installed_value(value, self._version_counts)
+        count = self._version_counts.get(canonical, 0) if canonical else 0
+
+        if canonical and canonical == self._top_canonical and count:
+            count_str = (f"{count} of {self._sample_size} most recent reports"
+                        if self._sample_size else f"{count} reports")
+            text  = f"Most reported by the community  ·  {count_str}"
+            color = "#4ade80"
+        elif count:
+            top_count = self._version_counts.get(self._top_canonical, 0) if self._top_canonical else 0
+            if self._sample_size:
+                text = (f"{count} of {self._sample_size} most recent reports  ·  "
+                        f"top choice has {top_count} reports")
+            else:
+                text = f"{count} reports  ·  top choice has {top_count} reports"
+            color = COLORS["text_muted"]
+        else:
+            text = ""
+            color = COLORS["text_muted"]
+
+        self.proton_note.setText(text)
+        self.proton_note.setStyleSheet(f"color: {color}; {_LABEL_BASE}")
+        self.proton_note.setVisible(bool(text))
 
     def _on_launch_opts_reset(self):
         self._status_lbl.setText(

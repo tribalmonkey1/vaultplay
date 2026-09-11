@@ -995,14 +995,23 @@ def record_install(game_id: int, install_path: str, wine_prefix: str,
                    game_path: str = "", launcher_type: str = "direct",
                    desktop_path: str = "", script_path: str = "",
                    launch_cmd: str = "", launch_cwd: str = "",
-                   launch_icon: str = ""):
+                   launch_icon: str = "", proton_version: str = ""):
+    """
+    proton_version: the version key (e.g. "ge-proton-10.5") the user picked
+    in the Install dialog. Persisted here — rather than left for the
+    Cogwheel Menu to reverse-parse out of launch_cmd later via
+    installer.parse_wine_bin_from_cmd() + protondb.find_version_value_for_binary()
+    — so "Manage Install" always defaults its picker to what was actually
+    chosen at install time, not a best-effort guess (which can miss, e.g.
+    when a launch wrapper like gamemoderun is prepended to launch_cmd).
+    """
     with get_connection() as conn:
         conn.execute("""
             INSERT INTO installs
                 (game_id, install_path, wine_prefix, install_method, exe_path,
                  game_path, launcher_type, desktop_path, script_path,
-                 launch_cmd, launch_cwd, launch_icon)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 launch_cmd, launch_cwd, launch_icon, proton_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(game_id) DO UPDATE SET
                 install_path   = excluded.install_path,
                 wine_prefix    = excluded.wine_prefix,
@@ -1015,10 +1024,11 @@ def record_install(game_id: int, install_path: str, wine_prefix: str,
                 launch_cmd     = excluded.launch_cmd,
                 launch_cwd     = excluded.launch_cwd,
                 launch_icon    = excluded.launch_icon,
+                proton_version = excluded.proton_version,
                 installed_at   = datetime('now')
         """, (game_id, install_path, wine_prefix, install_method, exe_path,
               game_path, launcher_type, desktop_path, script_path,
-              launch_cmd, launch_cwd, launch_icon))
+              launch_cmd, launch_cwd, launch_icon, proton_version))
 
 
 def set_install_tag_override(game_id: int, install_tag: str):

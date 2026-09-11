@@ -1888,36 +1888,22 @@ def _parse_wine_bin(launch_cmd: str) -> str:
     """
     Extract the Wine or Proton binary name from a launch command string.
 
-    The launch command is a shell string like:
-        env WINEPREFIX="..." STEAM_COMPAT_DATA_PATH="..." "/path/to/proton" run "game.exe"
-        env WINEPREFIX="..." wine "game.exe"
-
-    Strategy: scan tokens left-to-right, skip 'env' and KEY=VALUE pairs,
-    return the first remaining token (the actual binary path or name).
-    Falls back to "wine" if nothing recognisable is found.
+    Thin wrapper around installer.parse_wine_bin_from_cmd() — that copy is
+    the single source of truth (it also has to stay in sync with
+    launch_options.py's list of command wrappers, e.g. "gamemoderun", that
+    can precede the real env/wine/proton invocation). Kept as a
+    module-level function here rather than inlined at call sites purely so
+    existing call sites in this file don't need to change.
 
     This value is passed to PlaytimeWatcher so it can choose the correct
-    wait strategy (proc.wait() for Proton, wineserver --wait for Wine).
+    wait strategy (proc.wait() for Proton, wineserver --wait for Wine), and
+    to _maybe_snapshot_before_launch() so Save Backup snapshots/diffs the
+    correct directory (pfx/drive_c for Proton vs. drive_c for plain Wine).
     Never hardcode "wine" here — the binary changes based on what was
     configured at install time.
     """
-    import shlex
-    try:
-        tokens = shlex.split(launch_cmd)
-    except ValueError:
-        # Malformed shell string — fall back to simple split
-        tokens = launch_cmd.split()
-
-    for token in tokens:
-        if token == "env":
-            continue
-        if "=" in token and not token.startswith("/") and not token.startswith('"'):
-            # KEY=VALUE env var — skip
-            continue
-        # First non-env token is the binary
-        return token
-
-    return "wine"  # safe fallback
+    import installer as install_mod
+    return install_mod.parse_wine_bin_from_cmd(launch_cmd)
 
 
 def _file_type_label(file_type: str) -> str:
