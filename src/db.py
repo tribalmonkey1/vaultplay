@@ -161,6 +161,15 @@ def init_db():
                 -- Flow 1 (first play after install) successfully links a save.
                 save_path           TEXT,
                 save_source_path    TEXT,
+                -- Achievements/Stats/Leaderboards Auto-Backup: JSON list of
+                -- [{"source_path": ..., "canonical_path": ...}, ...] for
+                -- files matching save_backup.ALWAYS_BACKUP_FILENAME_RE.
+                -- Separate from save_path/save_source_path above since a
+                -- game can have any number of these (0 or more), unlike
+                -- the single user-picked save folder. See save_backup.py's
+                -- module docstring for why these are tracked independently
+                -- of the "one save folder per game" rule.
+                save_extra_paths     TEXT,
                 -- Launch Options feature: JSON blob of overrides-from-default
                 -- only. NULL = no overrides, use static defaults. See
                 -- launch_options.py and the _migrate_db() comment above.
@@ -483,6 +492,9 @@ def _migrate_db():
         for col, sql in [
             ("save_path",        "ALTER TABLE game_state ADD COLUMN save_path TEXT"),
             ("save_source_path", "ALTER TABLE game_state ADD COLUMN save_source_path TEXT"),
+            # Achievements/Stats/Leaderboards Auto-Backup — see the
+            # CREATE TABLE comment above for the JSON shape.
+            ("save_extra_paths", "ALTER TABLE game_state ADD COLUMN save_extra_paths TEXT"),
             # Launch Options feature — JSON blob of ONLY the overrides that
             # differ from launch_options.py's static defaults. NULL means
             # "no overrides, use all static defaults" — never a full-state
@@ -1355,6 +1367,67 @@ def set_save_paths(game_id: int, save_path: Optional[str] = None,
         conn.execute(
             f"UPDATE game_state SET {', '.join(updates)} WHERE game_id=?",
             params
+        )
+
+
+# ── Achievements/Stats/Leaderboards Auto-Backup helpers ────────────────────
+# Tracks 0-or-more always-backed-up individual files per game (see
+# save_backup.ALWAYS_BACKUP_FILENAME_RE) — separate from save_path/
+# save_source_path above, which track the single user-picked save folder.
+
+def get_save_extra_paths(game_id: int) -> list:
+    """
+    Return the list of {"source_path", "canonical_path"} dicts for
+    always-backed-up extra files (achievements/stats/leaderboards)
+    currently linked for this game. [] if none yet, or if the stored
+    JSON is unparseable (never raises).
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT save_extra_paths FROM game_state WHERE game_id=?", (game_id,)
+        ).fetchone()
+    if not row or not row["save_extra_paths"]:
+        return []
+    try:
+        data = json.loads(row["save_extra_paths"])
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def add_save_extra_path(game_id: int, source_path: str, canonical_path: str):
+    """
+    Record one extra-file link. Upserts in place if source_path is
+    already tracked (re-linking after a repair updates the same entry
+    rather than duplicating it) — keeps repeated calls across sessions
+    idempotent.
+    """
+    existing = get_save_extra_paths(game_id)
+    for entry in existing:
+        if entry.get("source_path") == source_path:
+            entry["canonical_path"] = canonical_path
+            break
+    else:
+        existing.append({"source_path": source_path, "canonical_path": canonical_path})
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO game_state (game_id, save_extra_paths) VALUES (?, ?)
+            ON CONFLICT(game_id) DO UPDATE SET
+                save_extra_paths = excluded.save_extra_paths
+        """, (game_id, json.dumps(existing)))
+
+
+def remove_save_extra_path(game_id: int, source_path: str):
+    """Stop tracking one extra-file link (e.g. its canonical file was
+    deleted by the user and it should no longer be reported)."""
+    existing = get_save_extra_paths(game_id)
+    filtered = [e for e in existing if e.get("source_path") != source_path]
+    if len(filtered) == len(existing):
+        return
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE game_state SET save_extra_paths=? WHERE game_id=?",
+            (json.dumps(filtered), game_id)
         )
 
 

@@ -920,6 +920,16 @@ class CogwheelButton(QPushButton):
         Reuses move_and_link()'s conflict handling so this can never
         silently clobber an existing backup, same guarantee the automatic
         flow gives.
+
+        Also runs the Achievements/Stats/Leaderboards Auto-Backup sync
+        (save_backup.sync_extra_files() — the same shared implementation
+        MainWindow._sync_save_extras() calls after every play session)
+        unconditionally, before the folder picker even opens. "Back Up
+        Save Now" is the one explicit "check my backups" moment for this
+        game — there's no reason to make the user wait for a full play
+        session to end just to pick up an achievements file that's
+        already sitting there. Runs regardless of what happens with the
+        folder picker below, including if the user cancels it.
         """
         game_id = game["id"]
         wine_prefix = (game["wine_prefix"] or "").strip()
@@ -934,9 +944,16 @@ class CogwheelButton(QPushButton):
         start_dir = str(actual_prefix / "drive_c") if (actual_prefix / "drive_c").exists() \
             else str(actual_prefix)
 
+        linked_extras = save_backup.sync_extra_files(game_id)
+
         chosen = QFileDialog.getExistingDirectory(
             self, "Select the folder containing this game's save files", start_dir)
         if not chosen:
+            if linked_extras:
+                names = ", ".join(p.name for p in linked_extras)
+                QMessageBox.information(
+                    self, "Save Files", f"✓ Also auto-backed up: {names}")
+                self.game_changed.emit(game_id)
             return
 
         save_root = Path(db.get_setting(
@@ -964,7 +981,11 @@ class CogwheelButton(QPushButton):
             return
 
         db.set_save_paths(game_id, save_path=str(canonical), save_source_path=str(chosen))
-        QMessageBox.information(self, "Save Files", f"✓ Save backed up to:\n{canonical}")
+        msg = f"✓ Save backed up to:\n{canonical}"
+        if linked_extras:
+            names = ", ".join(p.name for p in linked_extras)
+            msg += f"\n\nAlso auto-backed up: {names}"
+        QMessageBox.information(self, "Save Files", msg)
         self.game_changed.emit(game_id)
 
     def _relink_save(self, game, source_path, save_path):

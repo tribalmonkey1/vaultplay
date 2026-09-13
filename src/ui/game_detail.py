@@ -988,6 +988,32 @@ class GameDetailView(QWidget):
                 save_row = _InfoRow("Save Backup", "Not yet linked")
             self.info_card_layout.addWidget(save_row)
 
+            # Achievements/Stats/Leaderboards Auto-Backup — separate from
+            # the single save folder above; shows how many always-backup
+            # files (see save_backup.ALWAYS_BACKUP_FILENAME_RE) are
+            # currently tracked, and flags it if any of their links are
+            # broken (same ok/broken language as the main Save Backup row).
+            try:
+                extras = db.get_save_extra_paths(game_id)
+            except Exception:
+                extras = []
+            if extras:
+                broken = [
+                    e for e in extras
+                    if save_backup.diagnose_extra_file(
+                        e.get("source_path"), e.get("canonical_path")
+                    ) not in ("ok", "canonical_missing")
+                ]
+                if broken:
+                    extras_row = _InfoRow(
+                        "Achievements",
+                        f"⚠ {len(broken)} of {len(extras)} link(s) broken",
+                        warn=True)
+                else:
+                    names = ", ".join(Path(e["canonical_path"]).name for e in extras)
+                    extras_row = _InfoRow("Achievements", f"{len(extras)} file(s) — {names}")
+                self.info_card_layout.addWidget(extras_row)
+
         # ── Completion Status ──────────────────────────────────────────────────
         # Always last in the info card, per the Game Detail UI Layout spec.
         # Rebuilt every load_game() call (info_card_layout is cleared above),
@@ -1483,6 +1509,8 @@ class GameDetailView(QWidget):
         swallowed, since a missed backup opportunity for one session is
         far better than a broken launch.
         """
+        self._maybe_repair_save_extras()
+
         if db.get_setting("save_backup_enabled", "false") != "true":
             return
         if not wine_prefix:
@@ -1564,6 +1592,33 @@ class GameDetailView(QWidget):
                       game["folder_name"], len(snapshot))
         except Exception as e:
             log.warning("[SAVE BACKUP] Pre-launch check/snapshot failed: %s", e)
+
+    def _maybe_repair_save_extras(self):
+        """
+        Pre-launch check for achievements/stats/leaderboards files already
+        tracked via the Achievements/Stats/Leaderboards Auto-Backup sync
+        (see MainWindow._sync_save_extras) — cheap, since it only
+        re-checks already-known records rather than scanning the prefix.
+        Mirrors the main save's Flow 3 auto-repair: "missing" and
+        "plain_file" are fixed silently before launch so the game writes
+        straight through the symlink from the first moment; a
+        "wrong_symlink" is left alone here too, same caution as the main
+        save's Flow 3 — there's no per-file UI yet to ask about it.
+        """
+        if not self._game_id:
+            return
+        if db.get_setting("save_backup_enabled", "false") != "true":
+            return
+        try:
+            for entry in db.get_save_extra_paths(self._game_id):
+                source    = entry.get("source_path")
+                canonical = entry.get("canonical_path")
+                diag = save_backup.diagnose_extra_file(source, canonical)
+                if diag in ("missing", "plain_file"):
+                    save_backup.repair_extra_file_link(source, canonical)
+        except Exception as e:
+            log.warning("[SAVE BACKUP] Extra-file pre-launch repair failed "
+                       "for game_id=%s: %s", self._game_id, e)
 
     def _warn_broken_save_link(self, game, source_path, save_path):
         """Shared fallback warning: shown when a broken link couldn't be

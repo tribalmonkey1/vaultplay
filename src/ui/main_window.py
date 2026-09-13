@@ -2177,6 +2177,12 @@ class MainWindow(QMainWindow):
             log.info("[PLAYTIME] Session too short, not recorded: game_id=%d",
                      game_id)
 
+        # Achievements/Stats/Leaderboards Auto-Backup — runs independently
+        # of the main Save Backup flow below, and regardless of whether the
+        # main save folder has already been linked (unlike the main flow,
+        # this needs no pre-launch snapshot — see _sync_save_extras()).
+        self._sync_save_extras(game_id)
+
         # Save Backup Flow 1 — run regardless of whether playtime met the
         # minimum threshold to be recorded; even a short session can have
         # written a save. No-ops immediately if the feature is off, the
@@ -2270,6 +2276,16 @@ class MainWindow(QMainWindow):
                 log.debug("[SAVE BACKUP] Filtered %d noise file(s) for game_id=%d: %s",
                           len(filtered), game_id,
                           [str(f) for f in filtered[:20]])
+            # Achievements/stats/leaderboards files are tracked and backed
+            # up automatically and unconditionally (see _sync_save_extras()
+            # below) — excluded here so one no longer shows up as (or gets
+            # folded into) a competing save-folder candidate the user has
+            # to choose between picking and backing up their real save.
+            always_backup, kept = save_backup.partition_always_backup_files(kept)
+            if always_backup:
+                log.debug("[SAVE BACKUP] %d always-backup file(s) excluded from "
+                          "save candidate ranking (handled separately): %s",
+                          len(always_backup), [f.name for f in always_backup])
             candidates = save_backup.rank_candidate_folders(kept, drive_c, title)
 
         if not candidates:
@@ -2295,6 +2311,26 @@ class MainWindow(QMainWindow):
         save_root = db.get_setting(
             "save_backup_root", str(Path.home() / "Documents" / "Game Saves"))
         self._apply_save_backup(game_id, game["folder_name"], Path(chosen), Path(save_root))
+
+    def _sync_save_extras(self, game_id: int):
+        """
+        Achievements/Stats/Leaderboards Auto-Backup — thin UI wrapper
+        around the shared save_backup.sync_extra_files(), which owns the
+        actual scan/link/repair logic. Kept as one shared implementation
+        (rather than duplicated here) so this automatic post-session call
+        site and the Cogwheel's manual "Back Up Save Now" trigger (see
+        CogwheelButton._manual_backup_save) always behave identically —
+        this method only adds the status-bar message on top.
+
+        Runs every session regardless of whether the main save is linked
+        yet, is already linked, or has no pending snapshot at all — the
+        only gate is the save_backup_enabled setting, checked inside
+        sync_extra_files() itself.
+        """
+        linked = save_backup.sync_extra_files(game_id)
+        if linked:
+            names = ", ".join(p.name for p in linked)
+            self.library_view.show_status(f"✓ Auto-backed up: {names}", timeout=4000)
 
     def _apply_save_backup(self, game_id: int, folder_name: str,
                            chosen_folder: Path, save_root: Path):

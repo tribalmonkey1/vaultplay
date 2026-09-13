@@ -221,6 +221,306 @@ def filter_noise(paths: list, drive_c: Path) -> tuple:
     return kept, filtered
 
 
+# ── Always-Backed-Up Files (Achievements & Persistent Progress) ────────────
+# Some files hold progress data that lives OUTSIDE whatever single folder
+# the user picks in Flow 1 — most commonly a Goldberg-emulated Steam
+# crack's achievements/stats/leaderboards files, which routinely sit in
+# their own directory entirely separate from wherever the game's actual
+# save data lands (confirmed real: Vampire Survivors' achievements.ini —
+# see Bug History #21 — and reproduced again during Save Backup testing,
+# where achievements.ini showed up as its own separate ranked candidate
+# with no way to back it up alongside the real save, since the picker is
+# single-select — see "One Save Folder Per Game (PC)" in the spec).
+#
+# Files matching this pattern are pulled OUT of the normal candidate pool
+# before folders are ranked (see partition_always_backup_files()) and are
+# instead detected/linked automatically and unconditionally — see
+# find_extra_files() below — never competing with the main save folder
+# for the single selection slot.
+#
+# Deliberately NOT included: settings.ini (Goldberg's local/hardware
+# config — language, offline name, etc. — not progress data, and
+# re-generated fresh in a new prefix anyway) and DLC/config files that
+# ship with the crack itself (static, never change at runtime, so they'd
+# never show up in a diff regardless).
+ALWAYS_BACKUP_FILENAME_RE = re.compile(
+    r"^(achievements?|stats?|leaderboards?)\.(ini|json|dat|bin)$",
+    re.IGNORECASE
+)
+
+
+def partition_always_backup_files(changed_files: list) -> tuple:
+    """
+    Split a list of changed file Paths into (always_backup_files, remaining)
+    based on ALWAYS_BACKUP_FILENAME_RE matching the filename alone,
+    regardless of which folder it's in. Called BEFORE rank_candidate_folders()
+    so these files never get folded into, or compete as, a normal
+    save-folder candidate — they're handled separately (see
+    find_extra_files() / move_and_link_file() below) and always backed up,
+    not offered as a pick.
+    """
+    always_backup, remaining = [], []
+    for f in changed_files:
+        (always_backup if ALWAYS_BACKUP_FILENAME_RE.match(f.name) else remaining).append(f)
+    return always_backup, remaining
+
+
+def find_extra_files(drive_c: Path) -> list:
+    """
+    Scan drive_c for any file matching ALWAYS_BACKUP_FILENAME_RE, anywhere
+    in the tree — no snapshot/diff needed, since these files are
+    unambiguous by name alone and should be tracked the moment they exist,
+    whether that's session one or session one hundred. This is what lets
+    achievements get linked even for a game whose main save was already
+    linked before this feature existed (Flow 1's one-time diff has already
+    been consumed for the save folder, but this scan needs no diff at all).
+    Cheap relative to a full snapshot diff — just a filtered rglob. Returns
+    absolute Paths; may be empty. Never raises.
+    """
+    found = []
+    if not drive_c.exists():
+        return found
+    try:
+        for f in drive_c.rglob("*"):
+            try:
+                if f.is_file() and ALWAYS_BACKUP_FILENAME_RE.match(f.name):
+                    found.append(f)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return found
+
+
+# ── Move + symlink + diagnose + repair for individual "always backup"
+# files ─────────────────────────────────────────────────────────────────
+# File-level equivalents of move_and_link()/diagnose_source_path()/
+# repair_link() above, since achievements/stats/leaderboards are lone
+# files, not folders. Same cardinal rule: canonical is only ever written
+# to via an explicit move (never silently discarded), and a conflict at
+# the canonical path without confirmation raises rather than overwrites.
+
+def move_and_link_file(source_file: Path, save_root: Path, game_folder_name: str,
+                       drive_c: Path, overwrite_confirmed: bool = False) -> Path:
+    """
+    Move a single always-backup file (e.g. achievements.ini) to
+    <save_root>/PC/<game_folder_name>/_extras/<path relative to drive_c>,
+    then replace it with a symlink so the game keeps reading/writing it
+    from the same place. The relative-to-drive_c path is preserved
+    (rather than flattening to just the filename) so two files that
+    happen to share a name in different subfolders — e.g. one game with
+    both a Goldberg achievements.ini AND an unrelated stats.ini in a
+    different directory — never collide at the canonical path.
+
+    Raises SaveMoveConflict if the canonical file already exists and
+    overwrite_confirmed is False — same guarantee move_and_link() gives
+    for folders.
+    """
+    source_file = Path(source_file)
+    try:
+        rel = source_file.relative_to(drive_c)
+    except ValueError:
+        rel = Path(source_file.name)
+    canonical = Path(save_root) / "PC" / game_folder_name / "_extras" / rel
+
+    if canonical.exists() and not overwrite_confirmed:
+        raise SaveMoveConflict(str(canonical))
+
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+
+    if canonical.exists():
+        # Only reached with overwrite_confirmed=True.
+        canonical.unlink()
+
+    shutil.move(str(source_file), str(canonical))
+
+    if source_file.is_symlink() or source_file.exists():
+        source_file.unlink()
+    source_file.parent.mkdir(parents=True, exist_ok=True)
+    source_file.symlink_to(canonical)
+
+    log.info("[SAVE BACKUP] Extra file moved %s → %s (symlink left behind)",
+             source_file, canonical)
+    return canonical
+
+
+def diagnose_extra_file(source_path, canonical_path) -> str:
+    """
+    File-level equivalent of diagnose_source_path(). Returns one of:
+      "unset"             — source_path/canonical_path not recorded yet.
+      "canonical_missing" — the backed-up file itself is gone (user
+                             deleted it directly) — nothing to restore
+                             from, leave alone.
+      "ok"                — source_path is a symlink correctly pointing
+                             at canonical_path.
+      "missing"            — nothing at all exists at source_path (e.g.
+                             right after a Wine prefix was deleted and
+                             recreated). Safe to auto-repair.
+      "plain_file"         — a real file exists at source_path instead of
+                             a symlink (the game already wrote a fresh
+                             one in the recreated prefix). Safe to
+                             auto-repair — the fresh file is moved over
+                             the canonical copy before symlinking, so
+                             newer progress data is never discarded.
+      "wrong_symlink"      — a symlink exists but resolves somewhere else
+                             (including a dangling target). NOT
+                             auto-repaired.
+    """
+    if not source_path or not canonical_path:
+        return "unset"
+    canonical = Path(canonical_path)
+    if not canonical.exists():
+        return "canonical_missing"
+    source = Path(source_path)
+    if source.is_symlink():
+        try:
+            if source.resolve() == canonical.resolve():
+                return "ok"
+        except OSError:
+            pass
+        return "wrong_symlink"
+    if not source.exists():
+        return "missing"
+    return "plain_file"
+
+
+def repair_extra_file_link(source_path: str, canonical_path: str) -> bool:
+    """
+    File-level equivalent of repair_link(), for the "missing" and
+    "plain_file" diagnose_extra_file() states (call only after explicit
+    user confirmation for "wrong_symlink", same contract as repair_link()).
+
+    "plain_file" is handled by MOVING the fresh file over the canonical
+    copy before symlinking — mirrors Flow 2's "move file to canonical,
+    replace with symlink silently" contract for the main save: newer
+    progress data always wins, nothing is silently discarded. There's no
+    merge step (unlike a save folder) since this is a single file with
+    nothing else to preserve alongside it.
+
+    Returns True on success.
+    """
+    source = Path(source_path)
+    canonical = Path(canonical_path)
+    try:
+        if source.exists() and not source.is_symlink():
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(canonical))
+        elif source.is_symlink():
+            source.unlink()
+        source.parent.mkdir(parents=True, exist_ok=True)
+        if not source.exists() and not source.is_symlink():
+            source.symlink_to(canonical)
+        log.info("[SAVE BACKUP] Extra file relinked %s → %s", source, canonical)
+        return True
+    except Exception as e:
+        log.error("[SAVE BACKUP] repair_extra_file_link failed for %s → %s: %s",
+                  source, canonical, e)
+        return False
+
+
+# ── Shared orchestration: scan + link + repair, one call site ──────────────
+# The actual DB-touching orchestration for Achievements/Stats/Leaderboards
+# Auto-Backup lives HERE (not duplicated in ui/main_window.py and
+# ui/cogwheel_menu.py) specifically so the automatic post-session flow
+# (MainWindow._on_session_ended → _sync_save_extras()) and the manual
+# "Back Up Save Now" trigger (CogwheelButton._manual_backup_save) always
+# behave identically — same detection, same repair rules, same canonical
+# location — no matter which of those two moments triggered it. This is
+# the one function in this module that imports db, since there's no way
+# to track "what's already linked" without it; every other function above
+# stays a pure Path-in/Path-out helper.
+
+def sync_extra_files(game_id: int) -> list:
+    """
+    Scan this game's Wine prefix for achievements/stats/leaderboards files
+    (see find_extra_files()) and link/repair any that aren't already
+    correctly linked. No dialog, no snapshot/diff needed — scans the
+    CURRENT state of drive_c directly, so this also works retroactively
+    for a game whose main save was already linked before this feature
+    existed.
+
+    Returns the list of canonical Paths newly linked by THIS call (empty
+    if nothing new was found, the feature is disabled in Settings, or the
+    prefix can't be resolved). Never raises — callers can call this
+    fire-and-forget from either a background post-session flow or a
+    direct UI button click.
+    """
+    import db
+
+    if db.get_setting("save_backup_enabled", "false") != "true":
+        return []
+
+    game = db.get_game(game_id)
+    if not game:
+        return []
+
+    wine_prefix = (game["wine_prefix"] or "").strip()
+    if not wine_prefix or not Path(wine_prefix).exists():
+        return []
+
+    try:
+        import installer as install_mod
+        wine_bin = install_mod.parse_wine_bin_from_cmd(game["launch_cmd"] or "")
+        actual_prefix = install_mod._resolve_actual_prefix(Path(wine_prefix), wine_bin)
+        drive_c = actual_prefix / "drive_c"
+
+        found = find_extra_files(drive_c)
+        if not found:
+            return []
+
+        existing   = db.get_save_extra_paths(game_id)
+        save_root  = Path(db.get_setting(
+            "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
+        linked_now = []
+
+        for f in found:
+            record = next((e for e in existing if e.get("source_path") == str(f)), None)
+
+            if record:
+                diag = diagnose_extra_file(
+                    record.get("source_path"), record.get("canonical_path"))
+                if diag == "ok":
+                    continue
+                if diag in ("missing", "plain_file"):
+                    if repair_extra_file_link(
+                            record["source_path"], record["canonical_path"]):
+                        continue
+                    # Repair failed — fall through and try a fresh link below.
+                elif diag == "wrong_symlink":
+                    # Surprising enough to leave alone automatically — same
+                    # caution repair_link() uses for the main save's
+                    # folder-level equivalent. No per-file UI exists yet to
+                    # ask the user about it.
+                    continue
+                elif diag == "canonical_missing":
+                    continue  # user deleted their own backup — leave it alone
+
+            # Not tracked yet at all, or its repair above failed — do the
+            # initial move+symlink now.
+            try:
+                canonical = move_and_link_file(f, save_root, game["folder_name"], drive_c)
+                db.add_save_extra_path(game_id, str(f), str(canonical))
+                linked_now.append(canonical)
+            except SaveMoveConflict:
+                log.warning(
+                    "[SAVE BACKUP] Extra file conflict at canonical path for "
+                    "%s (game_id=%d) — leaving unlinked rather than silently "
+                    "overwriting", f, game_id)
+            except Exception as e:
+                log.warning("[SAVE BACKUP] Could not link extra file %s "
+                           "(game_id=%d): %s", f, game_id, e)
+
+        if linked_now:
+            names = ", ".join(p.name for p in linked_now)
+            log.info("[SAVE BACKUP] Auto-linked %d extra file(s) for "
+                     "game_id=%d: %s", len(linked_now), game_id, names)
+        return linked_now
+    except Exception as e:
+        log.warning("[SAVE BACKUP] Extras sync failed for game_id=%d: %s",
+                   game_id, e)
+        return []
+
+
 # ── Known-location fast path ──────────────────────────────────────────────────
 # Checked before falling back to a full diff — if the game's save folder
 # is sitting in one of these conventional spots, there's no need to make
