@@ -31,6 +31,7 @@ if _parent not in _sys.path:
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,15 +43,16 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QRunnable, QThreadPool, pyqtSlot, QObject, QTimer,
-    QStringListModel
+    QStringListModel, QPointF
 )
-from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QLinearGradient
+from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QLinearGradient, QBrush, QPolygonF
 
 import db
 import metadata as meta_mod
 import scanner
 import protondb as protondb_mod
 import save_backup
+import wishlist_store
 from ui.style import COLORS, accent_button_style, card_style
 from ui.install_dialog import InstallDialog
 from ui.cogwheel_menu import CogwheelButton
@@ -90,6 +92,147 @@ class ImageLoader(QRunnable):
         path = meta_mod.download_art(self.url)
         if path:
             self.signals.loaded.emit(self.url, path)
+
+
+class _WishlistArtSignals(QObject):
+    loaded = pyqtSignal(str)   # local_path
+
+
+class _WishlistArtLoader(QRunnable):
+    """
+    Resolves a wishlist item's cover_url the same way wishlist_view.py's
+    own _ThumbLoader does — either a wishlist_art/... path (resolved
+    against this machine's current wishlist_path, no network) or a plain
+    URL (downloaded+cached via metadata.download_art(), same as every
+    other art field in the app). Kept as its own small loader here rather
+    than importing wishlist_view.py's, matching this codebase's existing
+    convention of each file owning its own near-identical loader class.
+    """
+    def __init__(self, cover_value: str):
+        super().__init__()
+        self.cover_value = cover_value
+        self.signals = _WishlistArtSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            if wishlist_store.is_local_art_path(self.cover_value):
+                resolved = wishlist_store.resolve_cover_path(self.cover_value)
+            else:
+                resolved = meta_mod.download_art(self.cover_value)
+            if resolved:
+                self.signals.loaded.emit(resolved)
+        except Exception as e:
+            log.debug("_WishlistArtLoader failed for %s: %s", self.cover_value, e)
+
+
+_YOUTUBE_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([A-Za-z0-9_-]{6,})"
+)
+
+
+def _youtube_thumbnail_url(url: str) -> str | None:
+    """
+    Best-effort thumbnail URL for a YouTube link, using the well-known
+    predictable img.youtube.com pattern — no API call needed, just a
+    regex pull of the video id out of the usual URL shapes. Returns None
+    for anything that doesn't look like a YouTube URL (Steam/GOG videos
+    aren't YouTube-hosted the same way, and a fully generic video page has
+    no thumbnail VaultPlay can derive on its own). This is a stopgap for
+    manually-pasted trailer links only — once automatic Steam/GOG/YouTube
+    detection exists (see trailers.py, planned), that pipeline will supply
+    a real thumbnail URL directly and this heuristic won't be needed for
+    those cases.
+    """
+    if not url:
+        return None
+    m = _YOUTUBE_ID_RE.search(url)
+    if not m:
+        return None
+    return f"https://img.youtube.com/vi/{m.group(1)}/hqdefault.jpg"
+
+
+class TrailerThumbnail(QLabel):
+    """
+    Clickable video thumbnail with a centered play-button overlay —
+    mirrors a Steam store page's trailer tile (thumbnail loads, clicking
+    opens the video). No in-app playback yet: clicking always opens the
+    URL externally via xdg-open, the same thing the wishlist tile's old
+    on-cover trailer badge did. This is the one call site that changes
+    when in-app playback is eventually built — see the Notion Wishlist /
+    Game Detail Redesign pages for that still-open decision.
+
+    Hidden entirely (see set_trailer()) when there's no trailer to show —
+    callers don't need to guard visibility themselves.
+    """
+
+    WIDTH  = 440
+    HEIGHT = 248   # 16:9
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._url = ""
+        self._pix: QPixmap | None = None
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"background: {COLORS['surface2']}; border: 1px solid {COLORS['border']};"
+            " border-radius: 8px;")
+
+    def set_trailer(self, url: str):
+        """Show/hide and reset for a (possibly blank) trailer URL. Caller
+        is responsible for kicking off thumbnail loading separately (see
+        game_detail.py's _load_trailer_thumbnail()) once this returns."""
+        self._url = (url or "").strip()
+        self._pix = None
+        self.setVisible(bool(self._url))
+        self.update()
+
+    def set_thumbnail_pixmap(self, pix: QPixmap):
+        if pix.isNull():
+            return
+        scaled = pix.scaled(
+            self.WIDTH, self.HEIGHT,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation)
+        x = max(0, (scaled.width() - self.WIDTH) // 2)
+        y = max(0, (scaled.height() - self.HEIGHT) // 2)
+        self._pix = scaled.copy(x, y, self.WIDTH, self.HEIGHT)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._pix is not None:
+            painter.drawPixmap(0, 0, self._pix)
+        else:
+            painter.fillRect(self.rect(), QColor(COLORS["surface2"]))
+        # Dark scrim so the play glyph reads clearly over any thumbnail.
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 90))
+
+        cx, cy = self.width() // 2, self.height() // 2
+        r = 30
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        tri = QPolygonF([
+            QPointF(cx - 10, cy - 15),
+            QPointF(cx - 10, cy + 15),
+            QPointF(cx + 16, cy),
+        ])
+        painter.setBrush(QBrush(QColor(COLORS["bg"])))
+        painter.drawPolygon(tri)
+        painter.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._url:
+            try:
+                subprocess.Popen(["xdg-open", self._url])
+            except Exception as e:
+                log.warning("Could not open trailer URL %s: %s", self._url, e)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class HeroBanner(QLabel):
@@ -259,10 +402,26 @@ class GameDetailView(QWidget):
     # (same "something changed elsewhere, refresh" pattern install_finished
     # already establishes for favorite/hide/completion-status changes).
     collections_changed = pyqtSignal()
+    # Wishlist mode — emitted after the Edit Wishlist Item dialog saves, or
+    # after Remove from Wishlist, so MainWindow can refresh the sidebar's
+    # Wishlist count badge (mirrors WishlistView.changed's role for the
+    # Wishlist grid page itself).
+    wishlist_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._game_id = None
+        # Wishlist mode — see load_wishlist_item(). "game" (default) reads
+        # from the games/metadata/installs/game_state tables via db.py as
+        # this class always has; "wishlist" reads from wishlist_store.py
+        # instead and hides every section that has no wishlist-side
+        # equivalent (install/launch, playtime, tags, collections,
+        # completion status, version tracking, ProtonDB). Checked by
+        # _apply_mode_visibility() and the notes-save/back-button-label
+        # branches below rather than threaded through every method
+        # individually.
+        self._mode = "game"                 # "game" | "wishlist"
+        self._wishlist_item_id: str | None = None
         self._pool = QThreadPool.globalInstance()
         self._screenshot_thumbs: list[ScreenshotThumb] = []
         # Currently Playing Indicator — set via set_currently_playing() by
@@ -281,9 +440,9 @@ class GameDetailView(QWidget):
         back_layout = QHBoxLayout(back_bar)
         back_layout.setContentsMargins(20, 0, 20, 0)
 
-        back_btn = QPushButton("← Back to Library")
-        back_btn.setFont(QFont("DM Sans", 11))
-        back_btn.setStyleSheet(f"""
+        self.back_btn = QPushButton("← Back to Library")
+        self.back_btn.setFont(QFont("DM Sans", 11))
+        self.back_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
                 border: none;
@@ -292,8 +451,8 @@ class GameDetailView(QWidget):
             }}
             QPushButton:hover {{ color: {COLORS['text']}; }}
         """)
-        back_btn.clicked.connect(self.back_requested)
-        back_layout.addWidget(back_btn)
+        self.back_btn.clicked.connect(self.back_requested)
+        back_layout.addWidget(self.back_btn)
         back_layout.addStretch()
         root.addWidget(back_bar)
 
@@ -368,7 +527,7 @@ class GameDetailView(QWidget):
         self.left_layout.setContentsMargins(0, 0, 0, 0)
         self.left_layout.setSpacing(0)
 
-        self._section_title(self.left_layout, "About This Game")
+        self._about_title = self._section_title(self.left_layout, "About This Game")
         self.desc_label = QLabel("No description available.")
         self.desc_label.setFont(QFont("DM Sans", 12))
         self.desc_label.setStyleSheet(f"color: {COLORS['text_dim']}; line-height: 1.7;")
@@ -376,7 +535,18 @@ class GameDetailView(QWidget):
         self.left_layout.addWidget(self.desc_label)
         self.left_layout.addSpacing(24)
 
-        self._section_title(self.left_layout, "Screenshots")
+        # Trailer — hidden unless the loaded game/wishlist item has one.
+        # Sits above Screenshots, mirroring a Steam store page's media
+        # order (trailer first, then shots). See TrailerThumbnail's
+        # docstring for the no-in-app-playback-yet contract.
+        self._trailer_title = self._section_title(self.left_layout, "Trailer")
+        self.trailer_thumb = TrailerThumbnail()
+        self.left_layout.addWidget(self.trailer_thumb)
+        self._trailer_title.hide()
+        self.trailer_thumb.hide()
+        self.left_layout.addSpacing(24)
+
+        self._screenshots_title = self._section_title(self.left_layout, "Screenshots")
         self.screenshots_layout = QGridLayout()
         self.screenshots_layout.setSpacing(10)
         self.left_layout.addLayout(self.screenshots_layout)
@@ -406,7 +576,9 @@ class GameDetailView(QWidget):
         self._section_title(self.info_card_layout, "Game Info")
         self.right_layout.addWidget(self.info_card)
 
-        # Library actions card (favorite + hide)
+        # Library actions card (favorite + hide, or — in wishlist mode —
+        # Edit Wishlist Item / Remove from Wishlist; see
+        # _apply_mode_visibility())
         self.library_card = QFrame()
         self.library_card.setStyleSheet(f"""
             QFrame {{
@@ -494,6 +666,49 @@ class GameDetailView(QWidget):
         """)
         self.add_to_collection_btn.clicked.connect(self._on_add_to_collection_clicked)
         library_card_layout.addWidget(self.add_to_collection_btn)
+
+        # ── Wishlist-mode actions — same card, different buttons. Built
+        # here (not lazily) so _apply_mode_visibility() can just toggle
+        # .show()/.hide() like every other mode-gated widget rather than
+        # constructing/destroying widgets on every load.
+        self.wishlist_edit_btn = QPushButton("✏️  Edit Wishlist Item…")
+        self.wishlist_edit_btn.setFont(QFont("DM Sans", 11))
+        self.wishlist_edit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                color: {COLORS['text_muted']};
+                padding: 7px 10px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['text']};
+                background: {COLORS['surface3']};
+            }}
+        """)
+        self.wishlist_edit_btn.clicked.connect(self._on_wishlist_edit_clicked)
+        library_card_layout.addWidget(self.wishlist_edit_btn)
+
+        self.wishlist_remove_btn = QPushButton("✕  Remove from Wishlist")
+        self.wishlist_remove_btn.setFont(QFont("DM Sans", 11))
+        self.wishlist_remove_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: 1px solid rgba(248,113,113,0.3);
+                border-radius: 8px;
+                color: {COLORS['danger']};
+                padding: 7px 10px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background: rgba(248,113,113,0.08);
+                border-color: {COLORS['danger']};
+                color: #fca5a5;
+            }}
+        """)
+        self.wishlist_remove_btn.clicked.connect(self._on_wishlist_remove_clicked)
+        library_card_layout.addWidget(self.wishlist_remove_btn)
 
         self.right_layout.addWidget(self.library_card)
 
@@ -722,11 +937,12 @@ class GameDetailView(QWidget):
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
 
-    def _section_title(self, layout, text: str):
+    def _section_title(self, layout, text: str) -> QLabel:
         lbl = QLabel(text.upper())
         lbl.setFont(QFont("DM Mono", 9, QFont.Weight.DemiBold))
         lbl.setStyleSheet(f"color: {COLORS['text_muted']}; letter-spacing: 2px; padding: 0 0 8px 0;")
         layout.addWidget(lbl)
+        return lbl
 
     def _tag(self, text: str, color: str = None, bg: str = None) -> QLabel:
         tag = QLabel(text)
@@ -741,9 +957,51 @@ class GameDetailView(QWidget):
         )
         return tag
 
+    # ── Mode-gated visibility ─────────────────────────────────────────────
+
+    def _apply_mode_visibility(self):
+        """
+        Show/hide every section that only makes sense for one of the two
+        modes. Called once per load, right after self._mode is set, before
+        either load path populates its own content — keeps "what's visible
+        in this mode" defined in exactly one place instead of scattered
+        across load_game()/load_wishlist_item().
+        """
+        is_game = (self._mode == "game")
+
+        self.back_btn.setText("← Back to Library" if is_game else "← Back to Wishlist")
+
+        # Library card: favorite/hide/track/edit-metadata/add-to-collection
+        # vs. edit-wishlist-item/remove-from-wishlist.
+        self.fav_btn.setVisible(is_game)
+        self.hide_btn.setVisible(is_game)
+        self.track_versions_btn.setVisible(is_game)
+        self.edit_metadata_btn.setVisible(is_game)
+        self.add_to_collection_btn.setVisible(is_game)
+        self.wishlist_edit_btn.setVisible(not is_game)
+        self.wishlist_remove_btn.setVisible(not is_game)
+
+        # Sections with no wishlist-side equivalent at all.
+        self.tags_card.setVisible(is_game)
+        self.install_card.setVisible(is_game)
+        self._about_title.setVisible(is_game)
+        self.desc_label.setVisible(is_game)
+        self._screenshots_title.setVisible(is_game)
+
+        if not is_game:
+            for i in reversed(range(self.screenshots_layout.count())):
+                item = self.screenshots_layout.takeAt(i)
+                if item.widget():
+                    item.widget().deleteLater()
+            self._screenshot_thumbs.clear()
+
     # ── Load game ─────────────────────────────────────────────────────────────
 
     def load_game(self, game_id: int):
+        self._mode = "game"
+        self._wishlist_item_id = None
+        self._apply_mode_visibility()
+
         self._game_id = game_id
         game = db.get_game(game_id)
         if not game:
@@ -1129,6 +1387,15 @@ class GameDetailView(QWidget):
             loader.signals.loaded.connect(self._on_cover_loaded)
             self._pool.start(loader)
 
+        # ── Trailer ───────────────────────────────────────────────────────────
+        # trailer_url/trailer_source don't exist as real metadata columns
+        # yet (planned — see trailers.py); _safe_get() returns None safely
+        # until that lands, so this section simply stays hidden for every
+        # game today and starts working automatically once that column
+        # exists, no further changes needed here.
+        trailer_url = _safe_get(game, "trailer_url")
+        self._load_trailer(trailer_url)
+
         # ── Notes ─────────────────────────────────────────────────────────────
         # Always reset to read-only view mode on load — a fresh page load
         # should never land mid-edit, even if the user had it open for a
@@ -1144,6 +1411,169 @@ class GameDetailView(QWidget):
         # ── Tags ──────────────────────────────────────────────────────────────
         self.tag_input.clear()
         self._refresh_tags_display()
+
+    # ── Load wishlist item ───────────────────────────────────────────────────
+
+    def load_wishlist_item(self, item_id: str):
+        """
+        Wishlist mode — populates the same page shell load_game() uses,
+        from wishlist_store.py instead of db.py, with every section that
+        has no wishlist-side equivalent hidden by _apply_mode_visibility()
+        (called first — see that method's docstring for the full list).
+        """
+        self._mode = "wishlist"
+        self._wishlist_item_id = item_id
+        self._apply_mode_visibility()
+
+        self._game_id = None
+        item = wishlist_store.get_item(item_id)
+        if not item:
+            return
+
+        title = item.get("title") or "(untitled)"
+        self.title_label.setText(title)
+
+        dev_parts = []
+        developer = item.get("developer") or ""
+        publisher = item.get("publisher") or ""
+        if developer:
+            dev_parts.append(f"Developed by {developer}")
+        if publisher and publisher != developer:
+            dev_parts.append(f"Published by {publisher}")
+        self.dev_label.setText(" · ".join(dev_parts) if dev_parts else "")
+
+        # Tags row: genres + release date + a "Wishlist" badge, mirroring
+        # load_game()'s genre/release/status-badge row as closely as a
+        # wishlist item's smaller data set allows.
+        while self.tags_layout.count():
+            titem = self.tags_layout.takeAt(0)
+            if titem.widget():
+                titem.widget().deleteLater()
+
+        for g in (item.get("genres") or [])[:3]:
+            t = self._tag(g, COLORS["accent2"], "rgba(91,141,238,0.08)")
+            self.tags_layout.addWidget(t)
+
+        release_date = (item.get("release_date") or "").strip()
+        if release_date:
+            self.tags_layout.addWidget(self._tag(release_date))
+
+        self.tags_layout.addWidget(
+            self._tag("🌟 Wishlist", COLORS["accent"], "rgba(232,199,106,0.10)"))
+        self.tags_layout.addStretch()
+
+        # ── Info card — just release date + genres (the fields a wishlist
+        # item actually has); everything install/playtime/version/ProtonDB
+        # related has no wishlist-side source and is skipped entirely
+        # rather than shown as a row of "Unknown"s.
+        while self.info_card_layout.count() > 1:
+            citem = self.info_card_layout.takeAt(1)
+            if citem.widget():
+                citem.widget().deleteLater()
+
+        info_rows = [
+            ("Developer",    developer),
+            ("Publisher",    publisher),
+            ("Release Date", release_date),
+            ("Genre",        ", ".join(item.get("genres") or [])),
+        ]
+        for label, value in info_rows:
+            if value:
+                row = _InfoRow(label, value)
+                self.info_card_layout.addWidget(row)
+
+        # ── Cover / hero — a wishlist item only has one image, used for both.
+        self.cover_img.setPixmap(QPixmap())
+        self.cover_img.setStyleSheet(f"""
+            background: {COLORS['surface2']};
+            border: 2px solid rgba(255,255,255,0.12);
+            border-radius: 8px;
+        """)
+        self.hero._bg_pix = None
+        self.hero.update()
+        cover_url = item.get("cover_url") or ""
+        if cover_url:
+            loader = _WishlistArtLoader(cover_url)
+            loader.signals.loaded.connect(self._on_wishlist_art_loaded)
+            self._pool.start(loader)
+
+        # ── Trailer ───────────────────────────────────────────────────────────
+        self._load_trailer(item.get("trailer_url"))
+
+        # ── Notes ─────────────────────────────────────────────────────────────
+        self.notes_edit.setPlainText(item.get("notes") or "")
+        self.notes_edit.setReadOnly(True)
+        self.notes_edit_btn.setText("✎  Edit")
+
+    def _on_wishlist_art_loaded(self, local_path: str):
+        pix = QPixmap(local_path)
+        if pix.isNull():
+            return
+        scaled = pix.scaled(110, 165,
+                            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                            Qt.TransformationMode.SmoothTransformation)
+        self.cover_img.setPixmap(scaled)
+        self.cover_img.setStyleSheet("""
+            border: 2px solid rgba(255,255,255,0.15);
+            border-radius: 8px;
+        """)
+        self.hero.set_image(local_path)
+
+    # ── Trailer (shared between game mode and wishlist mode) ─────────────────
+
+    def _load_trailer(self, trailer_url):
+        trailer_url = (trailer_url or "").strip()
+        self.trailer_thumb.set_trailer(trailer_url)
+        self._trailer_title.setVisible(bool(trailer_url))
+        if not trailer_url:
+            return
+        thumb_url = _youtube_thumbnail_url(trailer_url)
+        if thumb_url:
+            loader = ImageLoader(thumb_url)
+            loader.signals.loaded.connect(self._on_trailer_thumb_loaded)
+            self._pool.start(loader)
+
+    def _on_trailer_thumb_loaded(self, url: str, local_path: str):
+        pix = QPixmap(local_path)
+        if not pix.isNull():
+            self.trailer_thumb.set_thumbnail_pixmap(pix)
+
+    # ── Wishlist mode actions ────────────────────────────────────────────────
+
+    def _on_wishlist_edit_clicked(self):
+        if not self._wishlist_item_id:
+            return
+        item = wishlist_store.get_item(self._wishlist_item_id)
+        if not item:
+            return
+        from ui.wishlist_dialog import WishlistItemDialog
+        dlg = WishlistItemDialog(item=item, parent=self)
+        dlg.saved.connect(self._on_wishlist_item_saved)
+        dlg.exec()
+
+    def _on_wishlist_item_saved(self, item_id: str):
+        self.load_wishlist_item(item_id)
+        self.wishlist_changed.emit()
+
+    def _on_wishlist_remove_clicked(self):
+        if not self._wishlist_item_id:
+            return
+        item = wishlist_store.get_item(self._wishlist_item_id)
+        title = item.get("title") if item else "this item"
+        reply = QMessageBox.question(
+            self, "Remove from Wishlist",
+            f"Remove '{title}' from your wishlist?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        wishlist_store.remove_item(self._wishlist_item_id)
+        self.wishlist_changed.emit()
+        # The item no longer exists to display — same "hand off to
+        # whichever page opened this one" back-routing a normal back-button
+        # click uses (MainWindow._on_detail_back() sends this to the
+        # Wishlist page, which refreshes itself on becoming visible again).
+        self.back_requested.emit()
 
     def _refresh_tags_display(self):
         """Rebuild the tag chip row and the add-tag autocomplete list from
@@ -1200,22 +1630,30 @@ class GameDetailView(QWidget):
     def _on_notes_edit_save_clicked(self):
         """
         Toggle button: Edit switches the notes field to editable; Save
-        persists the current text (empty/whitespace-only saves as NULL —
-        see db.set_notes()) and switches back to read-only.
+        persists the current text and switches back to read-only. Save
+        target depends on mode: a real game writes through db.set_notes()
+        (empty/whitespace-only saves as NULL — see that function); a
+        wishlist item writes through wishlist_store.update_item() instead
+        (empty saves as "" — wishlist_store.py's own convention, see
+        update_item()'s docstring).
         """
         if self.notes_edit.isReadOnly():
             self.notes_edit.setReadOnly(False)
             self.notes_edit.setFocus()
             self.notes_edit_btn.setText("💾  Save")
         else:
-            if self._game_id is not None:
-                db.set_notes(self._game_id, self.notes_edit.toPlainText())
+            text = self.notes_edit.toPlainText()
+            if self._mode == "wishlist" and self._wishlist_item_id:
+                wishlist_store.update_item(self._wishlist_item_id, notes=text)
+                self.wishlist_changed.emit()
+            elif self._mode == "game" and self._game_id is not None:
+                db.set_notes(self._game_id, text)
             self.notes_edit.setReadOnly(True)
             self.notes_edit_btn.setText("✎  Edit")
 
     # ── Currently Playing Indicator ──────────────────────────────────────────
 
-    def set_currently_playing(self, game_id: int | None):
+    def set_currently_playing(self, game_id):
         """
         Called by MainWindow whenever the running-game state changes
         (launch, restart-reattachment, session end, or Force Quit). Only

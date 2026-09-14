@@ -4,9 +4,15 @@ ui/wishlist_dialog.py — Add/Edit Wishlist Item dialog for VaultPlay
 Spec: Notion → Features → Fully Planned → Wishlist.
 
 Modeled on edit_metadata_dialog.py's structure (SectionBox pattern, single
-scrollable QDialog). Fields: Title (required), Release Date (freetext,
-optional), Notes (optional), Cover art (dual URL/Upload, same pattern as
-Edit Metadata's _ArtField, plus a "Browse SteamGridDB…" button reusing
+scrollable QDialog). Fields: Title (required), Developer/Publisher/Genres
+(optional freetext, added so the Game Detail page's wishlist mode has the
+same info-card shape a real game does), Release Date (freetext, optional),
+Notes (optional), Trailer URL (optional — any video page; Steam/GOG/
+YouTube search results will fill this automatically in a future pass, but
+every trailer set from this dialog today is a manual, user-pinned choice —
+see wishlist_store.py's trailer_url/trailer_source/trailer_manual_override
+fields), Cover art (dual URL/Upload, same pattern as Edit Metadata's
+_ArtField, plus a "Browse SteamGridDB…" button reusing
 cover_art_picker_dialog.CoverArtPickerDialog in search-name-only mode).
 
 Unlike Edit Metadata's art fields, an "Upload" pick here is copied into
@@ -370,15 +376,23 @@ class WishlistItemDialog(QDialog):
         self.title_edit.setPlaceholderText("Game title")
         basic_box.add(_field_row("Title", self.title_edit))
 
+        self.developer_edit = QLineEdit(item.get("developer", "") if item else "")
+        self.developer_edit.setPlaceholderText("Optional")
+        basic_box.add(_field_row("Developer", self.developer_edit))
+
+        self.publisher_edit = QLineEdit(item.get("publisher", "") if item else "")
+        self.publisher_edit.setPlaceholderText("Optional")
+        basic_box.add(_field_row("Publisher", self.publisher_edit))
+
         self.release_edit = QLineEdit(item.get("release_date", "") if item else "")
         self.release_edit.setPlaceholderText(
             "e.g. March 2027, or leave blank if already released")
         basic_box.add(_field_row("Release Date", self.release_edit))
 
-        self.youtube_edit = QLineEdit(item.get("youtube_url", "") if item else "")
-        self.youtube_edit.setPlaceholderText(
-            "https://www.youtube.com/watch?v=… (optional)")
-        basic_box.add(_field_row("Trailer (YouTube)", self.youtube_edit))
+        genres_list = (item.get("genres") or []) if item else []
+        self.genres_edit = QLineEdit(", ".join(genres_list))
+        self.genres_edit.setPlaceholderText("Action, RPG, Adventure (optional)")
+        basic_box.add(_field_row("Genres", self.genres_edit))
 
         body_l.addWidget(basic_box)
 
@@ -398,6 +412,22 @@ class WishlistItemDialog(QDialog):
         """)
         notes_box.add(self.notes_edit)
         body_l.addWidget(notes_box)
+
+        # ── Trailer ───────────────────────────────────────────────────────────
+        # Any video page URL — Steam, GOG, YouTube, whatever. Setting this here
+        # always counts as a manual pin (trailer_source="manual",
+        # trailer_manual_override=True — see wishlist_store.py) so a future
+        # automatic-detection pass never silently overwrites it, same "user's
+        # explicit choice always wins" rule install_tag_override and
+        # version_trackers.is_manual already establish elsewhere in this app.
+        trailer_box = SectionBox("Trailer")
+        self.trailer_edit = QLineEdit(item.get("trailer_url", "") if item else "")
+        self.trailer_edit.setFont(QFont("DM Mono", 10))
+        self.trailer_edit.setPlaceholderText(
+            "https://… (Steam, GOG, YouTube, or any video page — optional)")
+        self.trailer_edit.setStyleSheet(f"color: {COLORS['accent2']};")
+        trailer_box.add(self.trailer_edit)
+        body_l.addWidget(trailer_box)
 
         # ── Cover art ─────────────────────────────────────────────────────────
         art_box = SectionBox("Cover Art")
@@ -460,16 +490,28 @@ class WishlistItemDialog(QDialog):
 
         release_date = self.release_edit.text().strip()
         notes = self.notes_edit.toPlainText().strip()
-        youtube_url = self.youtube_edit.text().strip()
+        developer = self.developer_edit.text().strip()
+        publisher = self.publisher_edit.text().strip()
+        genres = [g.strip() for g in self.genres_edit.text().split(",") if g.strip()]
+
+        trailer_url = self.trailer_edit.text().strip()
+        trailer_source = "manual" if trailer_url else ""
+        trailer_manual_override = bool(trailer_url)
 
         if self._item_id:
             ok = wishlist_store.update_item(
                 self._item_id, title=title, release_date=release_date,
-                notes=notes, cover_url=cover_url, youtube_url=youtube_url)
+                notes=notes, cover_url=cover_url,
+                trailer_url=trailer_url, trailer_source=trailer_source,
+                trailer_manual_override=trailer_manual_override,
+                developer=developer, publisher=publisher, genres=genres)
         else:
             new_item = wishlist_store.add_item(
                 title=title, release_date=release_date, notes=notes,
-                cover_url=cover_url, youtube_url=youtube_url)
+                cover_url=cover_url,
+                trailer_url=trailer_url, trailer_source=trailer_source,
+                trailer_manual_override=trailer_manual_override,
+                developer=developer, publisher=publisher, genres=genres)
             ok = new_item is not None
             if ok:
                 self._item_id = new_item["id"]

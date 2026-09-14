@@ -36,9 +36,35 @@ wishlist.json shape:
                                                     # machine may mount the
                                                     # shared folder at a
                                                     # different location
-                "youtube_url":  str,               # optional trailer link,
-                                                    # freetext/unvalidated
-                                                    # like release_date
+                "youtube_url":  str,               # legacy manual trailer
+                                                    # link field — superseded
+                                                    # by trailer_url/
+                                                    # trailer_source/
+                                                    # trailer_manual_override
+                                                    # below; kept only so
+                                                    # existing files still
+                                                    # parse. See load()'s
+                                                    # backfill shim.
+                "trailer_url":              str,   # playable/external video
+                                                     # reference (any source)
+                "trailer_source":           str,   # 'steam' | 'gog' |
+                                                     # 'youtube' | 'manual'
+                "trailer_manual_override":  bool,  # True once the user has
+                                                     # explicitly set/pinned
+                                                     # a trailer — reserved
+                                                     # for when automatic
+                                                     # detection exists for
+                                                     # wishlist items too;
+                                                     # today every trailer on
+                                                     # a wishlist item is
+                                                     # manual, so this is
+                                                     # always True whenever
+                                                     # trailer_url is set.
+                "developer":    str,               # optional, freetext
+                "publisher":    str,               # optional, freetext
+                "genres":       list[str],         # optional, freetext CSV
+                                                    # split into a list at
+                                                    # save time
                 "created_at":   ISO8601 str,
             }
         ],
@@ -161,6 +187,46 @@ def _empty_data() -> dict:
     return {"version": CURRENT_VERSION, "items": [], "ignored_matches": []}
 
 
+def _backfill_item_defaults(item: dict) -> dict:
+    """
+    Normalize a loaded item dict in place (returns it for convenience) so
+    every caller — old files and new alike — can read the same set of
+    keys without needing to know which schema version wrote them.
+
+    Trailer field migration: earlier versions of this file only ever
+    wrote `youtube_url`. Every item is read through here, so a legacy
+    `youtube_url` value is copied into the new trailer_url/trailer_source/
+    trailer_manual_override triplet the first time it's loaded — purely
+    in memory, nothing is rewritten on disk until this item is next
+    explicitly saved. `youtube_url` itself is left untouched (dead key,
+    harmless) rather than deleted, so nothing breaks if an older build of
+    the app ever reads this same file.
+    """
+    item.setdefault("title", "")
+    item.setdefault("sort_order", 0)
+    item.setdefault("release_date", "")
+    item.setdefault("notes", "")
+    item.setdefault("cover_url", "")
+    item.setdefault("youtube_url", "")
+    item.setdefault("developer", "")
+    item.setdefault("publisher", "")
+    item.setdefault("genres", [])
+    if not isinstance(item.get("genres"), list):
+        item["genres"] = []
+    item.setdefault("created_at", "")
+
+    if not item.get("trailer_url") and item.get("youtube_url"):
+        item["trailer_url"] = item["youtube_url"]
+        item.setdefault("trailer_source", "manual")
+        item["trailer_manual_override"] = True
+    else:
+        item.setdefault("trailer_url", "")
+        item.setdefault("trailer_source", "")
+        item.setdefault("trailer_manual_override", False)
+
+    return item
+
+
 def load() -> dict:
     """
     Load wishlist.json fresh from disk. Returns an empty structure if the
@@ -185,6 +251,8 @@ def load() -> dict:
             data["items"] = []
         if not isinstance(data["ignored_matches"], list):
             data["ignored_matches"] = []
+        data["items"] = [_backfill_item_defaults(i) for i in data["items"]
+                          if isinstance(i, dict)]
         return data
     except Exception as e:
         log.warning("wishlist_store: could not load %s: %s", path, e)
@@ -268,16 +336,29 @@ def get_count() -> int:
 
 
 def add_item(title: str, release_date: str = "", notes: str = "",
-            cover_url: str = "", youtube_url: str = "") -> Optional[dict]:
+            cover_url: str = "",
+            trailer_url: str = "", trailer_source: str = "",
+            trailer_manual_override: bool = False,
+            developer: str = "", publisher: str = "",
+            genres: Optional[list] = None) -> Optional[dict]:
     """
     Create a new wishlist item, appended to the bottom of the priority
     list — sort_order = max(existing) + 1, or 0 if the list is empty.
     Same "new items append, never disrupt existing order" convention
     Collections already uses for both new collections and new members.
 
-    youtube_url: optional freetext trailer link (freeform, same
-    unvalidated contract as release_date) — shown as a clickable "watch
-    trailer" chip on the tile when non-blank (see wishlist_view.py).
+    trailer_url / trailer_source / trailer_manual_override: see the
+    module docstring's item shape. Every trailer set through the Add/Edit
+    dialog today is user-entered, so callers should pass
+    trailer_source="manual", trailer_manual_override=True whenever
+    trailer_url is non-blank — this module doesn't assume that for you,
+    since a future automatic-detection pass will want to call add_item()
+    (or update_item()) with a non-manual source.
+
+    developer / publisher: optional freetext, shown on the Game Detail
+    page the same way a real game's info card shows them.
+    genres: optional list of freetext genre strings (already split from
+    the dialog's comma-separated field — this module stores it as-is).
 
     Returns the new item dict on success, or None if the write failed
     (e.g. wishlist_path unset/unreachable — caller should show an error,
@@ -291,7 +372,13 @@ def add_item(title: str, release_date: str = "", notes: str = "",
         "release_date": (release_date or "").strip(),
         "notes":        (notes or "").strip(),
         "cover_url":    cover_url or "",
-        "youtube_url":  (youtube_url or "").strip(),
+        "youtube_url":  trailer_url or "",   # legacy mirror — see module docstring
+        "trailer_url":             trailer_url or "",
+        "trailer_source":          trailer_source or "",
+        "trailer_manual_override": bool(trailer_manual_override),
+        "developer":    (developer or "").strip(),
+        "publisher":    (publisher or "").strip(),
+        "genres":       list(genres) if genres else [],
         "created_at":   datetime.datetime.utcnow().isoformat(),
     }
 
@@ -309,7 +396,12 @@ def update_item(item_id: str, title: Optional[str] = None,
                 release_date: Optional[str] = None,
                 notes: Optional[str] = None,
                 cover_url: Optional[str] = None,
-                youtube_url: Optional[str] = None) -> bool:
+                trailer_url: Optional[str] = None,
+                trailer_source: Optional[str] = None,
+                trailer_manual_override: Optional[bool] = None,
+                developer: Optional[str] = None,
+                publisher: Optional[str] = None,
+                genres: Optional[list] = None) -> bool:
     """
     Partial update — only fields passed as not-None are changed, matching
     the partial-update contract used throughout db.py (e.g.
@@ -329,8 +421,19 @@ def update_item(item_id: str, title: Optional[str] = None,
                     item["notes"] = notes.strip()
                 if cover_url is not None:
                     item["cover_url"] = cover_url
-                if youtube_url is not None:
-                    item["youtube_url"] = youtube_url.strip()
+                if trailer_url is not None:
+                    item["trailer_url"]  = trailer_url
+                    item["youtube_url"]  = trailer_url   # keep legacy mirror in sync
+                if trailer_source is not None:
+                    item["trailer_source"] = trailer_source
+                if trailer_manual_override is not None:
+                    item["trailer_manual_override"] = bool(trailer_manual_override)
+                if developer is not None:
+                    item["developer"] = developer.strip()
+                if publisher is not None:
+                    item["publisher"] = publisher.strip()
+                if genres is not None:
+                    item["genres"] = list(genres)
                 found["ok"] = True
                 break
 

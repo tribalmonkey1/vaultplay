@@ -304,13 +304,26 @@ def move_and_link_file(source_file: Path, save_root: Path, game_folder_name: str
                        drive_c: Path, overwrite_confirmed: bool = False) -> Path:
     """
     Move a single always-backup file (e.g. achievements.ini) to
-    <save_root>/PC/<game_folder_name>/_extras/<path relative to drive_c>,
+    <save_root>/_extras/PC/<game_folder_name>/<path relative to drive_c>,
     then replace it with a symlink so the game keeps reading/writing it
     from the same place. The relative-to-drive_c path is preserved
     (rather than flattening to just the filename) so two files that
     happen to share a name in different subfolders — e.g. one game with
     both a Goldberg achievements.ini AND an unrelated stats.ini in a
     different directory — never collide at the canonical path.
+
+    IMPORTANT: this canonical location lives under its OWN top-level
+    <save_root>/_extras/ tree, deliberately outside
+    <save_root>/PC/<game_folder_name>/ (the main save's own canonical
+    folder — see move_and_link() above). It must never be nested inside
+    the main save's folder: move_and_link()'s conflict check treats ANY
+    existing content under the main save's canonical folder as "a
+    previous save is already backed up here", and its confirmed-overwrite
+    path does a full shutil.rmtree() of that folder — which would have
+    silently destroyed every tracked extra file the first time a user
+    linked their main save after this feature had already backed up
+    their achievements. Fixed 2026-09-13 after exactly that scenario was
+    reported; see the module-level migration note on sync_extra_files().
 
     Raises SaveMoveConflict if the canonical file already exists and
     overwrite_confirmed is False — same guarantee move_and_link() gives
@@ -321,7 +334,7 @@ def move_and_link_file(source_file: Path, save_root: Path, game_folder_name: str
         rel = source_file.relative_to(drive_c)
     except ValueError:
         rel = Path(source_file.name)
-    canonical = Path(save_root) / "PC" / game_folder_name / "_extras" / rel
+    canonical = Path(save_root) / "_extras" / "PC" / game_folder_name / rel
 
     if canonical.exists() and not overwrite_confirmed:
         raise SaveMoveConflict(str(canonical))
@@ -418,6 +431,90 @@ def repair_extra_file_link(source_path: str, canonical_path: str) -> bool:
         return False
 
 
+# ── One-time migration: legacy nested _extras/ location ─────────────────────
+# The very first version of this feature (2026-09-12) put the canonical
+# extras location at <save_root>/PC/<game_folder_name>/_extras/... — NESTED
+# inside the main save's own canonical folder. That was a real bug, not
+# just untidy: move_and_link() (used by the main save flow) treats ANY
+# existing content under <save_root>/PC/<game_folder_name>/ as "a previous
+# save is already backed up here" and raises SaveMoveConflict — so a user
+# who had achievements auto-linked before ever linking their main save
+# would see a false "a backed-up save already exists" warning the first
+# time they tried to. Worse: if they confirmed the overwrite, move_and_link()
+# does a full shutil.rmtree() of that folder, which would have silently
+# destroyed every already-linked achievements/stats/leaderboards file along
+# with it. Reported and fixed 2026-09-13 — see Bug History.
+#
+# Fixed going forward by move_and_link_file() writing to a completely
+# separate <save_root>/_extras/PC/<game_folder_name>/... tree instead (see
+# its docstring). This function transparently relocates anything already
+# linked at the old nested location the first time sync_extra_files() sees
+# it again, so an affected install self-heals on its next play session or
+# manual "Back Up Save Now" click — no separate migration script needed.
+
+def _migrate_legacy_extra_canonical(canonical_path: Path, source_path: str,
+                                    save_root: Path, game_folder_name: str) -> Path:
+    """
+    If canonical_path points at the old, buggy nested location, physically
+    move the file to the new <save_root>/_extras/PC/... location and
+    recreate the in-prefix symlink to point at it (the old symlink would
+    otherwise be left dangling, pointing at a path that no longer exists).
+    Returns the (possibly unchanged) canonical Path the caller should use
+    from here on. Never raises — a failed migration just leaves the entry
+    at its old location for a future attempt, logged as a warning.
+    """
+    old_root = Path(save_root) / "PC" / game_folder_name / "_extras"
+    try:
+        rel = canonical_path.relative_to(old_root)
+    except ValueError:
+        return canonical_path   # already new-style, or something else entirely
+
+    new_canonical = Path(save_root) / "_extras" / "PC" / game_folder_name / rel
+    try:
+        if canonical_path.exists() and not new_canonical.exists():
+            new_canonical.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(canonical_path), str(new_canonical))
+            log.info("[SAVE BACKUP] Migrated legacy extra-file canonical "
+                     "path %s → %s", canonical_path, new_canonical)
+
+        if source_path:
+            source = Path(source_path)
+            if source.is_symlink() or source.exists():
+                source.unlink()
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.symlink_to(new_canonical)
+    except Exception as e:
+        log.warning("[SAVE BACKUP] Legacy extra-file migration failed for "
+                   "%s → %s: %s", canonical_path, new_canonical, e)
+        return canonical_path
+
+    return new_canonical
+
+
+def _cleanup_legacy_extras_root(save_root: Path, game_folder_name: str):
+    """
+    Best-effort removal of the old <save_root>/PC/<game_folder_name>/_extras/
+    directory once every entry that lived under it has been migrated —
+    only removes it if it's now empty of files (a leftover empty directory
+    tree), never a forced/recursive delete of anything unexpected. This is
+    what clears move_and_link()'s false-conflict check for good, rather
+    than just leaving an empty _extras/ folder that still makes
+    `any(canonical.iterdir())` true.
+    """
+    old_root = Path(save_root) / "PC" / game_folder_name / "_extras"
+    if not old_root.exists():
+        return
+    try:
+        if any(p.is_file() for p in old_root.rglob("*")):
+            return   # something un-migrated is still in there — leave it
+        shutil.rmtree(old_root, ignore_errors=True)
+        log.info("[SAVE BACKUP] Cleaned up empty legacy _extras/ folder "
+                 "under %s", old_root.parent)
+    except Exception as e:
+        log.debug("[SAVE BACKUP] Legacy _extras/ cleanup skipped for %s: %s",
+                 old_root, e)
+
+
 # ── Shared orchestration: scan + link + repair, one call site ──────────────
 # The actual DB-touching orchestration for Achievements/Stats/Leaderboards
 # Auto-Backup lives HERE (not duplicated in ui/main_window.py and
@@ -444,6 +541,11 @@ def sync_extra_files(game_id: int) -> list:
     prefix can't be resolved). Never raises — callers can call this
     fire-and-forget from either a background post-session flow or a
     direct UI button click.
+
+    Also transparently migrates any extra file still linked at the old,
+    buggy nested canonical location from before 2026-09-13 (see
+    _migrate_legacy_extra_canonical()) — this runs unconditionally on
+    every call, independent of whether the scan below finds anything new.
     """
     import db
 
@@ -464,13 +566,37 @@ def sync_extra_files(game_id: int) -> list:
         actual_prefix = install_mod._resolve_actual_prefix(Path(wine_prefix), wine_bin)
         drive_c = actual_prefix / "drive_c"
 
+        existing   = db.get_save_extra_paths(game_id)
+        save_root  = Path(db.get_setting(
+            "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
+
+        # One-time migration for anything still linked at the old, buggy
+        # nested location — see _migrate_legacy_extra_canonical()'s
+        # docstring. Runs BEFORE the scan-based early-return below (a
+        # record's symlink target may already be broken at the old
+        # location, in which case find_extra_files() below won't discover
+        # it at all — migration must not depend on that scan succeeding)
+        # and before diagnose_extra_file() further down, so diagnosis is
+        # always checked against the correct, current canonical path.
+        migrated = False
+        for entry in existing:
+            old_canonical = entry.get("canonical_path")
+            if not old_canonical:
+                continue
+            new_canonical = _migrate_legacy_extra_canonical(
+                Path(old_canonical), entry.get("source_path"),
+                save_root, game["folder_name"])
+            if str(new_canonical) != old_canonical:
+                entry["canonical_path"] = str(new_canonical)
+                db.add_save_extra_path(game_id, entry.get("source_path"), str(new_canonical))
+                migrated = True
+        if migrated:
+            _cleanup_legacy_extras_root(save_root, game["folder_name"])
+
         found = find_extra_files(drive_c)
         if not found:
             return []
 
-        existing   = db.get_save_extra_paths(game_id)
-        save_root  = Path(db.get_setting(
-            "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
         linked_now = []
 
         for f in found:

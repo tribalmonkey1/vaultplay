@@ -713,6 +713,22 @@ class Sidebar(QWidget):
         self.items["all"].active = True
         self._current = "all"
 
+    def clear_wishlist_highlight(self):
+        """Deactivate the Wishlist row's highlight without touching any
+        other row. Wishlist is a separate top-level page, not a Library/
+        Category filter, so nothing else in this class's normal branches
+        ever clears its `active` flag on its own — every path that
+        navigates away from the Wishlist page needs to call this
+        explicitly, or the row stays highlighted alongside whatever gets
+        clicked next. Called from every non-wishlist branch of
+        _on_item_clicked()/_on_collection_item_clicked() below, and from
+        MainWindow._show_library() for the "← Back to Library" bar on the
+        Wishlist page, which bypasses this class's click handlers
+        entirely."""
+        wishlist_item = self.items.get("wishlist")
+        if wishlist_item is not None:
+            wishlist_item.active = False
+
     def _add_collapsible_group(self, layout, title: str, setting_key: str,
                                content_widget: QWidget) -> CollapsibleSectionHeader:
         """
@@ -767,6 +783,12 @@ class Sidebar(QWidget):
             self._current = key
             self.wishlist_requested.emit()
             return
+
+        # Any click outside the wishlist branch above is navigation AWAY
+        # from the Wishlist page (even if Wishlist wasn't actually the
+        # page showing) — always safe to clear, and this is the fix for
+        # the Wishlist row staying highlighted after picking e.g. Hidden.
+        self.clear_wishlist_highlight()
 
         was_active = bool(self.items.get(key) and self.items[key].active)
 
@@ -902,6 +924,7 @@ class Sidebar(QWidget):
         Collection rows aren't wired through _on_item_clicked itself since
         they need to emit collection_selected (id + name), not a bare
         filter key string."""
+        self.clear_wishlist_highlight()
         for k, item in self.items.items():
             if k.startswith("cat:") or k.startswith("coll:"):
                 item.active = (k == key)
@@ -1081,9 +1104,17 @@ class MainWindow(QMainWindow):
             self._start_bulk_metadata_refresh)
 
         self.detail_view = GameDetailView()
-        self.detail_view.back_requested.connect(self._show_library)
+        # Shared by both the Library and Wishlist flows (see
+        # load_wishlist_item() on the detail view) — a single
+        # back_requested signal, routed to whichever page it was actually
+        # opened from. See _detail_return_target below and _on_detail_back().
+        self.detail_view.back_requested.connect(self._on_detail_back)
         self.detail_view.install_finished.connect(self._on_install_finished)
         self.detail_view.collections_changed.connect(self._refresh_collections_sidebar)
+        # Wishlist mode's Edit/Remove actions on the detail page change the
+        # shared wishlist file — refresh the sidebar badge the same way
+        # WishlistView.changed already does for its own add/edit/remove/reorder.
+        self.detail_view.wishlist_changed.connect(self._refresh_wishlist_sidebar)
 
         self.settings_view = SettingsView()
         self.settings_view.back_requested.connect(self._show_library)
@@ -1094,6 +1125,10 @@ class MainWindow(QMainWindow):
         self.wishlist_view = WishlistView()
         self.wishlist_view.back_requested.connect(self._show_library)
         self.wishlist_view.changed.connect(self._refresh_wishlist_sidebar)
+        # Plain tile click — open the Game Detail page for this item
+        # instead of the edit dialog (see ui/game_detail.py's
+        # load_wishlist_item() and _show_wishlist_item_detail() below).
+        self.wishlist_view.item_selected.connect(self._show_wishlist_item_detail)
 
         self.stack.addWidget(self.library_view)   # index 0
         self.stack.addWidget(self.detail_view)    # index 1
@@ -1122,6 +1157,15 @@ class MainWindow(QMainWindow):
         # all spec'd around one game at a time — see _set_currently_playing.
         self._currently_playing_game_id: Optional[int] = None
         self._pool = QThreadPool.globalInstance()
+
+        # Detail page back-routing — GameDetailView is shared between the
+        # Library flow (_show_game_detail) and the Wishlist flow
+        # (_show_wishlist_item_detail), but only ever emits ONE
+        # back_requested signal, with no notion of which flow opened it.
+        # This tracks which page to return to when that fires — see
+        # _on_detail_back(). Both entry points set this themselves, so it
+        # only needs a safe default here.
+        self._detail_return_target: str = "library"   # "library" | "wishlist"
 
         # Connect game_launched from detail view
         self.detail_view.game_launched.connect(self._on_game_launched)
@@ -1237,12 +1281,35 @@ class MainWindow(QMainWindow):
             self._start_scan(path, clear_first=True)
 
     def _show_library(self):
+        # See Sidebar.clear_wishlist_highlight()'s docstring — this is the
+        # "← Back to Library" bar on the Wishlist page, which bypasses
+        # Sidebar's own click handlers entirely, so the Wishlist row would
+        # otherwise stay highlighted here with nothing else picked either.
+        self.sidebar.clear_wishlist_highlight()
         self._load_library()
         self.stack.setCurrentIndex(0)
 
     def _show_game_detail(self, game_id: int):
+        self._detail_return_target = "library"
         self.detail_view.load_game(game_id)
         self.stack.setCurrentIndex(1)
+
+    def _show_wishlist_item_detail(self, item_id: str):
+        """WishlistView.item_selected → open the Game Detail page in
+        wishlist mode for this item (see game_detail.py's
+        load_wishlist_item())."""
+        self._detail_return_target = "wishlist"
+        self.detail_view.load_wishlist_item(item_id)
+        self.stack.setCurrentIndex(1)
+
+    def _on_detail_back(self):
+        """GameDetailView.back_requested — routes to whichever page
+        actually opened the detail view, since that single signal carries
+        no context of its own. See _detail_return_target."""
+        if self._detail_return_target == "wishlist":
+            self._show_wishlist()
+        else:
+            self._show_library()
 
     def _show_settings(self):
         self.settings_view.load_settings()
@@ -2264,29 +2331,46 @@ class MainWindow(QMainWindow):
         snapshot      = pending["snapshot"]
         title = game["title"] or game["display_name"] or game["folder_name"]
 
-        # Fast path: known common save locations
+        # Fast path: known common save locations — high-confidence, but
+        # NOT exclusive. A known-location match used to skip the diff
+        # scan entirely; that's what let a fuzzy-matched but WRONG folder
+        # (e.g. a Unity engine's own native save/log folder that happens
+        # to share the game's title) silently hide the game's actual save
+        # data sitting somewhere the known-location patterns don't cover
+        # (a Goldberg/RUNE-style ".../<appid>/remote/savedata" folder,
+        # confirmed real 2026-09-13). Both are now always computed and
+        # merged, known-location matches first (they're the more confident
+        # signal), so the real save folder is never silently excluded from
+        # the picker just because something else matched first.
         known = save_backup.scan_known_locations(actual_prefix, title)
-        if known:
-            candidates = save_backup.candidates_from_known_locations(known)
-        else:
-            changed = save_backup.diff_snapshot(actual_prefix, snapshot)
-            drive_c = actual_prefix / "drive_c"
-            kept, filtered = save_backup.filter_noise(changed, drive_c)
-            if filtered:
-                log.debug("[SAVE BACKUP] Filtered %d noise file(s) for game_id=%d: %s",
-                          len(filtered), game_id,
-                          [str(f) for f in filtered[:20]])
-            # Achievements/stats/leaderboards files are tracked and backed
-            # up automatically and unconditionally (see _sync_save_extras()
-            # below) — excluded here so one no longer shows up as (or gets
-            # folded into) a competing save-folder candidate the user has
-            # to choose between picking and backing up their real save.
-            always_backup, kept = save_backup.partition_always_backup_files(kept)
-            if always_backup:
-                log.debug("[SAVE BACKUP] %d always-backup file(s) excluded from "
-                          "save candidate ranking (handled separately): %s",
-                          len(always_backup), [f.name for f in always_backup])
-            candidates = save_backup.rank_candidate_folders(kept, drive_c, title)
+        known_candidates = save_backup.candidates_from_known_locations(known) if known else []
+
+        changed = save_backup.diff_snapshot(actual_prefix, snapshot)
+        drive_c = actual_prefix / "drive_c"
+        kept, filtered = save_backup.filter_noise(changed, drive_c)
+        if filtered:
+            log.debug("[SAVE BACKUP] Filtered %d noise file(s) for game_id=%d: %s",
+                      len(filtered), game_id,
+                      [str(f) for f in filtered[:20]])
+        # Achievements/stats/leaderboards files are tracked and backed
+        # up automatically and unconditionally (see _sync_save_extras()
+        # below) — excluded here so one no longer shows up as (or gets
+        # folded into) a competing save-folder candidate the user has
+        # to choose between picking and backing up their real save.
+        always_backup, kept = save_backup.partition_always_backup_files(kept)
+        if always_backup:
+            log.debug("[SAVE BACKUP] %d always-backup file(s) excluded from "
+                      "save candidate ranking (handled separately): %s",
+                      len(always_backup), [f.name for f in always_backup])
+        diff_candidates = save_backup.rank_candidate_folders(kept, drive_c, title)
+
+        # Merge, deduping by path — a folder the known-location scan
+        # already surfaced doesn't need to appear twice even if the diff
+        # also picked it up.
+        known_paths = {c["path"] for c in known_candidates}
+        candidates = known_candidates + [
+            c for c in diff_candidates if c["path"] not in known_paths
+        ]
 
         if not candidates:
             log.debug("[SAVE BACKUP] No changed save folders detected for "

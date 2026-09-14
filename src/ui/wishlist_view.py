@@ -23,6 +23,14 @@ Since the backing store is a shared NAS file another machine may also be
 editing (see wishlist_store.py), this view polls wishlist.json's mtime
 every few seconds while it's the visible page and reloads on change —
 not real-time push, just a short poll (see refresh()/_poll_for_changes()).
+
+Tile click behavior: a plain click opens the Game Detail page (see
+ui/game_detail.py's load_wishlist_item()) so a wishlist entry reads the
+same way an owned game does, rather than jumping straight to the edit
+form — the edit form is still one right-click ("Edit…") away, or the
+"✏️ Edit Wishlist Item…" button on the detail page itself. This tile no
+longer shows its own on-cover trailer badge — the trailer, if any, is
+now surfaced on the Game Detail page instead (see TrailerThumbnail there).
 """
 
 # ── AppImage path fix ─────────────────────────────────────────────────────────
@@ -95,59 +103,14 @@ class _ThumbLoader(QRunnable):
             log.debug("_ThumbLoader failed for %s: %s", self.cover_value, e)
 
 
-# ── Trailer badge ──────────────────────────────────────────────────────────
-
-class _TrailerBadge(QLabel):
-    """
-    Small clickable 'watch trailer' chip overlaid on a wishlist tile's
-    cover art — shown only when the item has a YouTube link. Opens the
-    link in the system browser (same xdg-open pattern used everywhere
-    else in this app for external URLs/folders — no in-app player yet).
-    Being a child widget positioned on top of the cover, a click here is
-    delivered to this label rather than the tile underneath, so watching
-    the trailer and opening the Edit dialog (a click anywhere else on
-    the tile) stay two separate actions.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__("▶  Trailer", parent)
-        self._url = ""
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFont(QFont("DM Sans", 8, QFont.Weight.Medium))
-        self.setStyleSheet("""
-            QLabel {
-                background: rgba(13,15,20,0.75);
-                color: #ffffff;
-                border-radius: 4px;
-                padding: 2px 6px;
-            }
-        """)
-        self.setToolTip("Watch trailer on YouTube")
-        self.adjustSize()
-        self.hide()
-
-    def set_url(self, url: str):
-        self._url = (url or "").strip()
-        self.setVisible(bool(self._url))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._url:
-            try:
-                subprocess.Popen(["xdg-open", self._url])
-            except Exception as e:
-                log.warning("Could not open trailer URL %s: %s", self._url, e)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-
 # ── Wishlist tile ──────────────────────────────────────────────────────────────
 
 class WishlistTile(QFrame):
-    # Left-click opens the same Edit dialog the context menu's "Edit…"
-    # does — there's no detail page for a wishlist item to navigate to
-    # (no install/launch/playtime state at all), so a click has nothing
-    # else useful to do.
+    # Left-click opens the Game Detail page (see ui/game_detail.py's
+    # load_wishlist_item()) — a wishlist entry now reads the same way an
+    # owned game does. There's no separate "nothing else useful to do"
+    # rationale needed anymore now that the detail page exists; edit stays
+    # reachable via right-click or the detail page's own Edit button.
     clicked          = pyqtSignal(str)   # item_id
     edit_requested   = pyqtSignal(str)   # item_id
     remove_requested = pyqtSignal(str)   # item_id
@@ -185,9 +148,6 @@ class WishlistTile(QFrame):
         self.cover_label.setStyleSheet(
             f"background: {COLORS['surface2']}; color: {COLORS['text_muted']}; border: none;")
         layout.addWidget(self.cover_label)
-
-        self.trailer_badge = _TrailerBadge(parent=self)
-        self.trailer_badge.move(8, 8)
 
         footer = QWidget()
         footer.setStyleSheet(f"background: {COLORS['surface']}; border: none;")
@@ -239,8 +199,6 @@ class WishlistTile(QFrame):
             self.release_chip.show()
         else:
             self.release_chip.hide()
-
-        self.trailer_badge.set_url(item.get("youtube_url", ""))
 
     def set_cover_pixmap(self, pixmap: QPixmap):
         self.cover_label.setPixmap(pixmap)
@@ -358,6 +316,12 @@ class WishlistView(QWidget):
     # changed elsewhere, refresh" pattern install_finished/
     # collections_changed already establish on the other views.
     changed = pyqtSignal()
+    # Emitted when a tile is plain-clicked — MainWindow opens the Game
+    # Detail page for this item (see ui/game_detail.py's
+    # load_wishlist_item()) rather than this view opening the edit dialog
+    # itself. Right-click "Edit…" still goes straight to the dialog via
+    # _on_tile_edit_requested below.
+    item_selected = pyqtSignal(str)   # item_id
 
     MARGIN_LEFT   = 28
     MARGIN_TOP    = 24
@@ -541,8 +505,8 @@ class WishlistView(QWidget):
 
         for idx, item in enumerate(self._items):
             tile = WishlistTile(item, self.TILE_W, parent=self.canvas)
-            tile.clicked.connect(self._on_tile_clicked)
-            tile.edit_requested.connect(self._on_tile_clicked)
+            tile.clicked.connect(self._on_tile_selected)
+            tile.edit_requested.connect(self._on_tile_edit_requested)
             tile.remove_requested.connect(self._on_remove_requested)
             x, y = self._tile_pos(idx)
             tile.setGeometry(x, y, self.TILE_W, self._tile_h)
@@ -587,14 +551,22 @@ class WishlistView(QWidget):
         if tile is not None:
             tile.set_cover_pixmap(cropped)
 
-    # ── Add / Edit / Remove ────────────────────────────────────────────────
+    # ── Add / Select / Edit / Remove ──────────────────────────────────────
 
     def _on_add_clicked(self):
         dlg = WishlistItemDialog(item=None, parent=self)
         dlg.saved.connect(self._on_item_saved)
         dlg.exec()
 
-    def _on_tile_clicked(self, item_id: str):
+    def _on_tile_selected(self, item_id: str):
+        """Plain left-click on a tile — hand off to MainWindow to open the
+        Game Detail page for this wishlist item."""
+        self.item_selected.emit(item_id)
+
+    def _on_tile_edit_requested(self, item_id: str):
+        """Right-click → 'Edit…' — opens the edit form directly, bypassing
+        the detail page (same dialog the detail page's own Edit button
+        also opens)."""
         item = wishlist_store.get_item(item_id)
         if not item:
             return
