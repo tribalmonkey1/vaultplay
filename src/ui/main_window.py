@@ -2332,21 +2332,29 @@ class MainWindow(QMainWindow):
         title = game["title"] or game["display_name"] or game["folder_name"]
 
         # Fast path: known common save locations — high-confidence, but
-        # NOT exclusive. A known-location match used to skip the diff
-        # scan entirely; that's what let a fuzzy-matched but WRONG folder
-        # (e.g. a Unity engine's own native save/log folder that happens
-        # to share the game's title) silently hide the game's actual save
-        # data sitting somewhere the known-location patterns don't cover
-        # (a Goldberg/RUNE-style ".../<appid>/remote/savedata" folder,
-        # confirmed real 2026-09-13). Both are now always computed and
-        # merged, known-location matches first (they're the more confident
-        # signal), so the real save folder is never silently excluded from
-        # the picker just because something else matched first.
+        # NOT exclusive, and no longer automatically ranked above every
+        # diff candidate regardless of content. A known-location match
+        # used to both skip the diff scan entirely AND get a flat top
+        # score — that's what let a fuzzy-matched but otherwise
+        # signal-free folder (e.g. a Unity engine's own native log
+        # folder, which merely happens to share the game's title) both
+        # hide AND, once that was fixed, still outrank the game's actual
+        # save data sitting somewhere the known-location patterns don't
+        # cover (a Goldberg/RUNE-style ".../<appid>/remote/savedata"
+        # folder, confirmed real 2026-09-13/09-14). Both sources are now
+        # always computed, scored through the same signals (see
+        # save_backup._score_candidate_folder()), and merged into one
+        # list sorted by score — a known-location match only wins when it
+        # actually looks more like a save than the alternatives, not
+        # merely by virtue of being a known-location match.
+        drive_c = actual_prefix / "drive_c"
         known = save_backup.scan_known_locations(actual_prefix, title)
-        known_candidates = save_backup.candidates_from_known_locations(known) if known else []
+        known_candidates = (
+            save_backup.candidates_from_known_locations(known, drive_c, title)
+            if known else []
+        )
 
         changed = save_backup.diff_snapshot(actual_prefix, snapshot)
-        drive_c = actual_prefix / "drive_c"
         kept, filtered = save_backup.filter_noise(changed, drive_c)
         if filtered:
             log.debug("[SAVE BACKUP] Filtered %d noise file(s) for game_id=%d: %s",
@@ -2364,13 +2372,17 @@ class MainWindow(QMainWindow):
                       len(always_backup), [f.name for f in always_backup])
         diff_candidates = save_backup.rank_candidate_folders(kept, drive_c, title)
 
-        # Merge, deduping by path — a folder the known-location scan
+        # Merge, deduping by path (a folder the known-location scan
         # already surfaced doesn't need to appear twice even if the diff
-        # also picked it up.
+        # also picked it up — the known-location entry wins the dedup
+        # since it already carries the extra confidence bonus), then sort
+        # the WHOLE combined list by score so the most save-like folder is
+        # always first regardless of which source found it.
         known_paths = {c["path"] for c in known_candidates}
         candidates = known_candidates + [
             c for c in diff_candidates if c["path"] not in known_paths
         ]
+        candidates.sort(key=lambda c: (-c["score"], -c["file_count"]))
 
         if not candidates:
             log.debug("[SAVE BACKUP] No changed save folders detected for "

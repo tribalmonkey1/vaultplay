@@ -708,55 +708,124 @@ def scan_known_locations(actual_prefix_path: Path, game_display_name: str) -> li
     return unique
 
 
-def candidates_from_known_locations(matches: list) -> list:
-    """Build ranked-dialog-shaped candidate dicts from known-location matches."""
+def candidates_from_known_locations(matches: list, drive_c: Path,
+                                    game_display_name: str) -> list:
+    """
+    Build ranked-dialog-shaped candidate dicts from known-location matches,
+    scored through the SAME _score_candidate_folder() signals the diff
+    path uses (see rank_candidate_folders()) rather than a flat "always
+    highest confidence" score. A known-location match is still a genuinely
+    useful signal — matching against curated, well-known save-adjacent
+    directory patterns — so it gets a modest bonus (_KNOWN_LOCATION_BONUS)
+    on top, but it no longer unconditionally outranks a diff-based
+    candidate that shows much stronger save-specific signals of its own
+    (a literal "savedata" folder, a cracker's cloud-save mirror directory,
+    etc.) — confirmed real: a Unity engine's own native
+    LocalLow/<studio>/<game> log folder (no save-like signals at all
+    beyond matching the game's title) was outranking a Goldberg/RUNE
+    crack's actual ".../<appid>/remote/savedata" folder before this fix.
+    """
     results = []
     for folder in matches:
         try:
             files = [f for f in folder.rglob("*") if f.is_file()]
         except OSError:
             files = []
+        score = _score_candidate_folder(
+            folder, files, drive_c, game_display_name,
+            bonus=_KNOWN_LOCATION_BONUS)
         results.append({
             "path":         folder,
             "file_count":   len(files),
             "sample_files": [f.name for f in files[:5]],
-            "score":        10,   # known-location matches are highest confidence
+            "score":        score,
         })
-    results.sort(key=lambda r: -r["file_count"])
+    results.sort(key=lambda r: (-r["score"], -r["file_count"]))
     return results
 
 
 # ── Ranking (diff fallback path) ──────────────────────────────────────────────
 
-_CRACKER_NAMES   = ("empress", "goldberg", "onlinefix", "hoodlum")
+# Known cracker/emulator names whose own directory structure is a strong
+# signal for "this folder holds save data" — either because the crack
+# names its own folder after itself (EMPRESS, HOODLUM), or because it's a
+# Goldberg-family Steamworks emulator that mirrors Steam Cloud saves under
+# its own directory (Goldberg itself, OnlineFix, RUNE, SmartSteamEmu/SSE).
+# "rune" added 2026-09-14 after a real Vampire Survivors save at
+# ".../Steam/RUNE/<appid>/remote/savedata" scored zero on every signal
+# and got buried behind an unrelated, higher-scored known-location match.
+_CRACKER_NAMES   = ("empress", "goldberg", "onlinefix", "hoodlum", "rune",
+                    "smartsteamemu", "sse")
 _SAVE_EXTENSIONS = (".sav", ".dat", ".bin")
+# Bonus applied on top of the shared scoring signals for a known-location
+# match — reflects that curated location patterns are still a meaningful
+# signal, without letting them categorically outrank a diff candidate with
+# stronger save-specific signals of its own (see candidates_from_known_locations()).
+_KNOWN_LOCATION_BONUS = 3
+
+
+def _score_candidate_folder(folder: Path, files: list, drive_c: Path,
+                            game_display_name: str, bonus: int = 0) -> int:
+    """
+    Shared scoring logic for both candidate sources (known-location and
+    diff-based) — higher score = more likely to be the actual save
+    folder. Signals, each additive:
+      +5  folder path contains the game's own name
+      +4  a PATH COMPONENT (not just a substring of the collapsed path)
+          is itself save-related — matches "save", "saves", "savedata",
+          "savegame", "savegames", "savefile", etc. by checking for the
+          substring "save" in each individual path segment under drive_c,
+          so a segment merely containing "save" as a coincidental
+          substring of an unrelated word still counts (accepted false-
+          positive risk is low and the intent — "things named save,
+          savedata, and the like should rank near the top" — matters more
+          here than precision)
+      +3  a known cracker/emulator name appears in the path (see
+          _CRACKER_NAMES)
+      +2  any file in the group has a save-like extension (.sav/.dat/.bin)
+      +2  any file in the group has "save" in its own filename, regardless
+          of extension (catches e.g. "PlayerSave.json")
+      +bonus  caller-supplied flat addition (see _KNOWN_LOCATION_BONUS)
+    """
+    score = bonus
+    name_key = re.sub(r"[^a-z0-9]", "", (game_display_name or "").lower())
+    folder_key = re.sub(r"[^a-z0-9]", "", str(folder).lower())
+
+    if name_key and name_key in folder_key:
+        score += 5
+    if any(cracker in folder_key for cracker in _CRACKER_NAMES):
+        score += 3
+
+    try:
+        path_parts = [p.lower() for p in folder.relative_to(drive_c).parts]
+    except ValueError:
+        path_parts = [p.lower() for p in folder.parts]
+    if any("save" in part for part in path_parts):
+        score += 4
+
+    if any(f.suffix.lower() in _SAVE_EXTENSIONS for f in files):
+        score += 2
+    if any("save" in f.stem.lower() for f in files):
+        score += 2
+
+    return score
 
 
 def rank_candidate_folders(changed_files: list, drive_c: Path,
                            game_display_name: str) -> list:
     """
-    Group changed files by containing directory and score each group.
-    Higher score = more likely to be the actual save folder. Scoring
-    signals: folder path contains the game's own name, a known cracker
-    name (EMPRESS, Goldberg, OnlineFix, HOODLUM), or the group contains a
-    file with a save-like extension (.sav/.dat/.bin).
-    Returns candidate dicts sorted by score, then file count, descending.
+    Group changed files by containing directory and score each group via
+    _score_candidate_folder() — see that function for the full signal
+    list. Returns candidate dicts sorted by score, then file count,
+    descending.
     """
     groups: dict = {}
     for f in changed_files:
         groups.setdefault(f.parent, []).append(f)
 
-    name_key = re.sub(r"[^a-z0-9]", "", game_display_name.lower())
     results = []
     for folder, files in groups.items():
-        score = 0
-        folder_key = re.sub(r"[^a-z0-9]", "", str(folder).lower())
-        if name_key and name_key in folder_key:
-            score += 5
-        if any(cracker in folder_key for cracker in _CRACKER_NAMES):
-            score += 3
-        if any(f.suffix.lower() in _SAVE_EXTENSIONS for f in files):
-            score += 2
+        score = _score_candidate_folder(folder, files, drive_c, game_display_name)
         results.append({
             "path":         folder,
             "file_count":   len(files),
