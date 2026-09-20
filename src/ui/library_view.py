@@ -752,6 +752,11 @@ class GameTile(QFrame):
         self._long_press_timer.timeout.connect(self._on_long_press_timeout)
         self._long_press_fired = False
 
+        # Controller Support — keyboard/gamepad focus ring. Separate from
+        # :hover (mouse only) and from _selected (multi-select). Driven by
+        # LibraryView.set_focused() calls; see _restyle().
+        self._focused = False
+
         cover_h = int(tile_width * 1.5)
         tile_h  = cover_h + 32   # cover + footer (8px top + ~14px label + 10px bottom)
 
@@ -950,22 +955,35 @@ class GameTile(QFrame):
             return
         self._selected = selected
         self.selection_badge.setVisible(selected)
-        if selected:
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {COLORS['surface']};
-                    border: 2px solid {COLORS['accent']};
-                    border-radius: 10px;
-                }}
-            """)
+        self._restyle()
+
+    def set_focused(self, focused: bool):
+        """
+        Controller Support — show/hide the 2px accent focus ring (with a
+        faint accent tint so it stays distinguishable from a multi-select
+        border, which is the same accent color). No-ops when unchanged so
+        it is cheap to call on every tile rebind.
+        """
+        if self._focused == focused:
+            return
+        self._focused = focused
+        self._restyle()
+
+    def _restyle(self):
+        """Single place that builds this tile's border/background from the
+        combination of selected + focused state."""
+        if self._selected or self._focused:
+            border = f"2px solid {COLORS['accent']}"
         else:
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {COLORS['surface']};
-                    border: 1px solid {COLORS['border']};
-                    border-radius: 10px;
-                }}
-            """)
+            border = f"1px solid {COLORS['border']}"
+        bg = "rgba(232,199,106,0.10)" if self._focused else COLORS['surface']
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {bg};
+                border: {border};
+                border-radius: 10px;
+            }}
+        """)
 
     def set_cover_pixmap(self, pixmap: QPixmap):
         """
@@ -1103,6 +1121,16 @@ class GameTile(QFrame):
             self.bulk_menu_requested.emit(self.game_id, event.globalPos())
             return
 
+        self.show_context_menu(event.globalPos())
+
+    def show_context_menu(self, global_pos):
+        """
+        Build and show this tile's normal per-game menu at global_pos.
+        Split out of contextMenuEvent() (Controller Support) so the Y /
+        Triangle button can open the exact same menu the mouse's
+        right-click does — see LibraryView.controller_context_menu().
+        Multi-select gating stays in contextMenuEvent()/LibraryView, not here.
+        """
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
         menu.setStyleSheet(f"""
@@ -1183,7 +1211,7 @@ class GameTile(QFrame):
         add_to_collection_menu.addSeparator()
         new_collection_action = add_to_collection_menu.addAction("+ New Collection…")
 
-        chosen = menu.exec(event.globalPos())
+        chosen = menu.exec(global_pos)
         if open_install_action is not None and chosen == open_install_action:
             self._open_install_directory()
         elif chosen == open_archive_action:
@@ -1437,6 +1465,14 @@ class LibraryView(QWidget):
         self._autoscroll_timer = QTimer(self)
         self._autoscroll_timer.setInterval(30)
         self._autoscroll_timer.timeout.connect(self._autoscroll_tick)
+
+        # Controller Support — focus is tracked by game_id (not by tile
+        # widget) because the grid is virtualized and tiles are pooled;
+        # the ring is (re)applied whenever a tile is bound. Ring only
+        # shows while MainWindow says the content zone owns controller
+        # focus (set_controller_focus_visible()).
+        self._focused_game_id: Optional[int] = None
+        self._controller_focus_visible: bool = False
 
         self._build_ui()
 
@@ -2289,6 +2325,10 @@ class LibraryView(QWidget):
         """
         self._filtered = self._filtered_games()
 
+        if (self._focused_game_id is not None
+                and not any(g["id"] == self._focused_game_id for g in self._filtered)):
+            self._focused_game_id = None
+
         if not self._filtered:
             self._clear_tiles()
             if self._filter_state.collection is not None:
@@ -2356,6 +2396,12 @@ class LibraryView(QWidget):
             self.scroll.verticalScrollBar().setValue(0)
 
         self._update_visible_tiles()
+        if self._controller_focus_visible and self._focused_game_id is not None:
+            # e.g. returning from the detail page rebuilds the grid and
+            # resets scroll — keep the controller-focused tile on screen.
+            idx = self._focus_index()
+            if idx is not None:
+                self._ensure_index_visible(idx)
         self._unlock_refresh()
         self.trickle_finished.emit()
 
@@ -2373,6 +2419,7 @@ class LibraryView(QWidget):
     def _release_tile(self, tile: "GameTile"):
         """Hide a tile and either pool it for reuse or destroy it if the pool is full."""
         tile.hide()
+        tile.set_focused(False)
         self._tiles_by_game_id.pop(tile.game_id, None)
         if len(self._tile_pool) < self._TILE_POOL_MAX:
             self._tile_pool.append(tile)
@@ -2463,6 +2510,8 @@ class LibraryView(QWidget):
             tile.show()
             self._tiles[idx] = tile
             self._tiles_by_game_id[tile.game_id] = tile
+            tile.set_focused(self._controller_focus_visible
+                             and tile.game_id == self._focused_game_id)
 
             cached_pixmap = self._cover_cache_get(game["id"])
             if cached_pixmap is not None:
@@ -2848,6 +2897,142 @@ class LibraryView(QWidget):
         self.game_state_changed.emit(0)
         if collections_touched:
             self.collections_changed.emit()
+
+    # ── Controller Support (gamepad navigation) ───────────────────────────────
+    # Driven by MainWindow (see its _on_ctrl_* handlers). Focus is a game_id
+    # and grid math runs against self._filtered / self._cols, so it works
+    # for every game in the filtered list — including rows that are
+    # currently virtualized away — and scrolls the target into view.
+
+    def controller_has_targets(self) -> bool:
+        return bool(self._filtered)
+
+    def _focus_index(self) -> Optional[int]:
+        if self._focused_game_id is None:
+            return None
+        for i, g in enumerate(self._filtered):
+            if g["id"] == self._focused_game_id:
+                return i
+        return None
+
+    def _first_visible_index(self) -> int:
+        """Index of the first tile in the top fully-visible row."""
+        if self._row_h <= 0 or self._cols <= 0:
+            return 0
+        top = self.scroll.verticalScrollBar().value()
+        row = max(0, -(-(top - self.MARGIN_TOP) // self._row_h))   # ceil div
+        return min(row * self._cols, max(0, len(self._filtered) - 1))
+
+    def _ensure_index_visible(self, idx: int):
+        if self._cols <= 0 or self._row_h <= 0:
+            return
+        row = idx // self._cols
+        bar = self.scroll.verticalScrollBar()
+        if row == 0:
+            if bar.value() > 0:
+                bar.setValue(0)
+            return
+        pad = self.ROW_SPACING
+        tile_top = self.MARGIN_TOP + row * self._row_h
+        tile_bottom = tile_top + self._tile_h
+        vp_h = self.scroll.viewport().height()
+        top = bar.value()
+        if tile_top - pad < top:
+            bar.setValue(max(0, tile_top - pad))
+        elif tile_bottom + pad > top + vp_h:
+            bar.setValue(tile_bottom + pad - vp_h)
+
+    def _set_focused_index(self, idx: int):
+        if not self._filtered or not (0 <= idx < len(self._filtered)):
+            return
+        new_id = self._filtered[idx]["id"]
+        old_id = self._focused_game_id
+        self._focused_game_id = new_id
+        for gid in (old_id, new_id):
+            tile = self._tiles_by_game_id.get(gid) if gid is not None else None
+            if tile is not None:
+                tile.set_focused(self._controller_focus_visible and gid == new_id)
+        self._ensure_index_visible(idx)
+
+    def set_controller_focus_visible(self, visible: bool):
+        """Show/hide the focus ring (content zone gained/lost controller focus)."""
+        self._controller_focus_visible = visible
+        if self._focused_game_id is not None:
+            tile = self._tiles_by_game_id.get(self._focused_game_id)
+            if tile is not None:
+                tile.set_focused(visible)
+
+    def controller_focus_default(self) -> bool:
+        """Give the grid controller focus: keep the previously focused tile
+        if it's still in the filtered list, else the first visible one."""
+        if not self._filtered:
+            return False
+        self._controller_focus_visible = True
+        idx = self._focus_index()
+        if idx is None:
+            idx = self._first_visible_index()
+        self._set_focused_index(idx)
+        return True
+
+    def controller_move(self, direction: str) -> bool:
+        """Move focus one tile in `direction`. No wrap-around; a move that
+        would leave the grid is ignored. Returns True if focus moved."""
+        if not self._filtered:
+            return False
+        idx = self._focus_index()
+        if idx is None:
+            return self.controller_focus_default()
+        n, cols = len(self._filtered), max(1, self._cols)
+        target = None
+        if direction == "left":
+            if idx % cols > 0:
+                target = idx - 1
+        elif direction == "right":
+            if idx % cols < cols - 1 and idx + 1 < n:
+                target = idx + 1
+        elif direction == "up":
+            if idx - cols >= 0:
+                target = idx - cols
+        elif direction == "down":
+            if idx + cols < n:
+                target = idx + cols
+            elif idx // cols < (n - 1) // cols:
+                target = n - 1   # row below exists but is shorter — clamp to its last tile
+        if target is None:
+            return False
+        self._set_focused_index(target)
+        return True
+
+    def controller_activate(self):
+        """A / Cross — same as clicking the focused tile (opens the detail
+        page, or toggles selection while multi-select is active)."""
+        if self._focused_game_id is None or self._focus_index() is None:
+            return
+        self._on_tile_clicked(self._focused_game_id, Qt.KeyboardModifier.NoModifier)
+
+    def controller_context_menu(self):
+        """Y / Triangle — the focused tile's right-click menu (or the bulk
+        menu, if that tile is part of an active multi-selection)."""
+        gid = self._focused_game_id
+        if gid is None:
+            return
+        tile = self._tiles_by_game_id.get(gid)
+        if tile is None:
+            return
+        pos = tile.mapToGlobal(tile.rect().center())
+        if self._multi_select_active:
+            if gid in self._selected_game_ids:
+                self._show_bulk_menu(pos)
+            return
+        tile.show_context_menu(pos)
+
+    def controller_back(self) -> bool:
+        """B / Circle while on the library page. Clears an active
+        multi-selection; returns True if it consumed the press."""
+        if self._multi_select_active:
+            self._clear_selection()
+            return True
+        return False
 
     # ── Resize handling ───────────────────────────────────────────────────────
 

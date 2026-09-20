@@ -34,10 +34,10 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QSizePolicy,
-    QFrame, QApplication, QMessageBox, QLineEdit
+    QFrame, QApplication, QMessageBox, QLineEdit, QAbstractButton, QDialog
 )
-from PyQt6.QtCore import Qt, QThread, QThreadPool, QTimer, pyqtSignal, QSize
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QColor
+from PyQt6.QtCore import Qt, QThread, QThreadPool, QTimer, pyqtSignal, QSize, QPoint, QEvent
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QColor, QKeyEvent
 
 import db
 import scanner
@@ -349,6 +349,9 @@ class SidebarItem(QWidget):
         super().__init__(parent)
         self.key     = key
         self._active = False
+        self._focused = False   # Controller Support focus ring
+        self.setObjectName("sb_item")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
@@ -381,16 +384,28 @@ class SidebarItem(QWidget):
         self._active = val
         self._update_style()
 
+    def set_focused(self, focused: bool):
+        """Controller Support — 2px accent focus ring on this row only
+        (id-selector, so child labels don't inherit the border)."""
+        if self._focused == focused:
+            return
+        self._focused = focused
+        self._update_style()
+
     def _update_style(self):
+        ring = (f"#sb_item {{ border: 2px solid {COLORS['accent']}; }}"
+                if self._focused else "")
         if self._active:
             self.setStyleSheet(f"""
                 QWidget {{ background: {COLORS['surface3']}; border-radius: 6px; }}
+                {ring}
             """)
             self.label_w.setStyleSheet(f"color: {COLORS['accent']};")
             self.dot.setStyleSheet(f"color: {COLORS['accent']};")
             self.count_w.setStyleSheet(f"color: {COLORS['accent']}; opacity: 0.7;")
         else:
-            self.setStyleSheet("QWidget { background: transparent; border-radius: 6px; }")
+            self.setStyleSheet(
+                f"QWidget {{ background: transparent; border-radius: 6px; }} {ring}")
             self.label_w.setStyleSheet(f"color: {COLORS['text_dim']};")
             self.dot.setStyleSheet(f"color: {COLORS['text_muted']};")
             self.count_w.setStyleSheet(f"color: {COLORS['text_muted']};")
@@ -412,6 +427,9 @@ class TagChipItem(QWidget):
         super().__init__(parent)
         self.tag_id = tag_id
         self._active = False
+        self._focused = False   # Controller Support focus ring
+        self.setObjectName("tag_chip_item")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(8)
@@ -426,12 +444,16 @@ class TagChipItem(QWidget):
         self._update_style()
 
     def _update_style(self):
+        ring = (f"#tag_chip_item {{ border: 2px solid {COLORS['accent']}; }}"
+                if self._focused else "")
         if self._active:
-            self.setStyleSheet(f"background: {COLORS['surface3']}; border-radius: 6px;")
+            self.setStyleSheet(
+                f"QWidget {{ background: {COLORS['surface3']}; border-radius: 6px; }} {ring}")
             self.label_w.setStyleSheet(f"color: {COLORS['accent']};")
             self.count_w.setStyleSheet(f"color: {COLORS['accent']};")
         else:
-            self.setStyleSheet("background: transparent; border-radius: 6px;")
+            self.setStyleSheet(
+                f"QWidget {{ background: transparent; border-radius: 6px; }} {ring}")
             self.label_w.setStyleSheet(f"color: {COLORS['text_dim']};")
             self.count_w.setStyleSheet(f"color: {COLORS['text_muted']};")
 
@@ -439,10 +461,19 @@ class TagChipItem(QWidget):
         self._active = val
         self._update_style()
 
-    def mousePressEvent(self, event):
+    def set_focused(self, focused: bool):
+        if self._focused == focused:
+            return
+        self._focused = focused
+        self._update_style()
+
+    def toggle(self):
         self._active = not self._active
         self._update_style()
         self.toggled.emit(self.tag_id, self._active)
+
+    def mousePressEvent(self, event):
+        self.toggle()
 
 
 class CollapsibleSectionHeader(QWidget):
@@ -459,6 +490,9 @@ class CollapsibleSectionHeader(QWidget):
     def __init__(self, title: str, collapsed: bool = False, parent=None):
         super().__init__(parent)
         self._collapsed = collapsed
+        self._focused = False   # Controller Support focus ring
+        self.setObjectName("ctrl_header")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QHBoxLayout(self)
@@ -482,11 +516,24 @@ class CollapsibleSectionHeader(QWidget):
     def _update_chevron(self):
         self.chevron.setText("›" if self._collapsed else "⌄")
 
+    def toggle(self):
+        self._collapsed = not self._collapsed
+        self._update_chevron()
+        self.toggled.emit(self._collapsed)
+
+    def set_focused(self, focused: bool):
+        """Controller Support — ring so a gamepad user can land on a group
+        header and expand/collapse it with A."""
+        if self._focused == focused:
+            return
+        self._focused = focused
+        self.setStyleSheet(
+            f"#ctrl_header {{ border: 2px solid {COLORS['accent']}; border-radius: 6px; }}"
+            if focused else "")
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._collapsed = not self._collapsed
-            self._update_chevron()
-            self.toggled.emit(self._collapsed)
+            self.toggle()
         super().mousePressEvent(event)
 
 
@@ -713,6 +760,12 @@ class Sidebar(QWidget):
         self.items["all"].active = True
         self._current = "all"
 
+        # Controller Support — focused row is tracked by KEY (not widget),
+        # since category/collection/tag rows are destroyed and rebuilt on
+        # every refresh.
+        self._ctrl_focus_key: Optional[str] = None
+        self._ctrl_focus_visible: bool = False
+
     def clear_wishlist_highlight(self):
         """Deactivate the Wishlist row's highlight without touching any
         other row. Wishlist is a separate top-level page, not a Library/
@@ -818,6 +871,7 @@ class Sidebar(QWidget):
         on every scan/metadata refresh even though the filter itself
         (which lives in LibraryView's FilterState, not here) stays applied.
         """
+        self._schedule_ctrl_focus_apply()
         self.items["all"].update_count(all_count)
         self.items["installed"].update_count(installed)
         self.items["uninstalled"].update_count(uninstalled)
@@ -854,6 +908,96 @@ class Sidebar(QWidget):
         if "wishlist" in self.items:
             self.items["wishlist"].update_count(count)
 
+    # ── Controller Support (gamepad navigation) ───────────────────────────
+    # Focusable rows: SidebarItem (Library/Wishlist/Categories/Collections/
+    # Completion), TagChipItem, and CollapsibleSectionHeader (so a collapsed
+    # group can be expanded). Chain order = visual top-to-bottom; anything
+    # hidden — a collapsed group's rows, tags filtered out by the tag
+    # search box — is skipped automatically via isVisibleTo().
+
+    @staticmethod
+    def _ctrl_key_of(w) -> str:
+        if isinstance(w, SidebarItem):
+            return w.key
+        if isinstance(w, TagChipItem):
+            return f"tag:{w.tag_id}"
+        return f"hdr:{w.title_lbl.text()}"
+
+    def _ctrl_widgets(self) -> list:
+        return self.findChildren((SidebarItem, TagChipItem, CollapsibleSectionHeader))
+
+    def _ctrl_chain(self) -> list:
+        seen, chain = set(), []
+        rows = []
+        for w in self._ctrl_widgets():
+            if not w.isVisibleTo(self):
+                continue
+            rows.append((w.mapTo(self, QPoint(0, 0)).y(), w))
+        rows.sort(key=lambda r: r[0])
+        for _y, w in rows:
+            k = self._ctrl_key_of(w)
+            if k in seen:
+                continue   # transient duplicate while a deleteLater()'d row lingers
+            seen.add(k)
+            chain.append(w)
+        return chain
+
+    def _schedule_ctrl_focus_apply(self):
+        # Rows are rebuilt by update_counts/update_tags/update_collections —
+        # re-apply the ring once the rebuild (and the deferred deletes) settle.
+        QTimer.singleShot(0, self._apply_ctrl_focus)
+
+    def _apply_ctrl_focus(self):
+        widgets = self._ctrl_widgets()
+        keys = {self._ctrl_key_of(w) for w in widgets}
+        if self._ctrl_focus_key not in keys:
+            self._ctrl_focus_key = None
+        for w in widgets:
+            w.set_focused(self._ctrl_focus_visible
+                          and self._ctrl_key_of(w) == self._ctrl_focus_key)
+
+    def controller_set_focus_visible(self, visible: bool):
+        self._ctrl_focus_visible = visible
+        self._apply_ctrl_focus()
+
+    def controller_focus_default(self):
+        """Give the sidebar controller focus: keep the previous row if it's
+        still reachable, else the currently active filter row, else the top."""
+        chain = self._ctrl_chain()
+        if not chain:
+            return
+        keys = [self._ctrl_key_of(w) for w in chain]
+        if self._ctrl_focus_key not in keys:
+            self._ctrl_focus_key = self._current if self._current in keys else keys[0]
+        self._ctrl_focus_visible = True
+        self._apply_ctrl_focus()
+
+    def controller_move(self, direction: str):
+        if direction not in ("up", "down"):
+            return
+        chain = self._ctrl_chain()
+        if not chain:
+            return
+        keys = [self._ctrl_key_of(w) for w in chain]
+        if self._ctrl_focus_key not in keys:
+            self.controller_focus_default()
+            return
+        i = keys.index(self._ctrl_focus_key) + (-1 if direction == "up" else 1)
+        if not (0 <= i < len(keys)):
+            return
+        self._ctrl_focus_key = keys[i]
+        self._apply_ctrl_focus()
+
+    def controller_activate(self):
+        for w in self._ctrl_chain():
+            if self._ctrl_key_of(w) != self._ctrl_focus_key:
+                continue
+            if isinstance(w, SidebarItem):
+                w.clicked.emit(w.key)      # same signal a mouse press emits
+            else:
+                w.toggle()                 # tag chip / group header
+            return
+
     # ── Tags ──────────────────────────────────────────────────────────────
 
     def _on_tags_search_changed(self, text: str):
@@ -863,6 +1007,7 @@ class Sidebar(QWidget):
 
     def update_tags(self, tags: list):
         """tags: list of sqlite3.Row from db.get_all_tags() (id/name/usage_count)."""
+        self._schedule_ctrl_focus_apply()
         for i in reversed(range(self.tags_layout.count())):
             w = self.tags_layout.itemAt(i).widget()
             if w:
@@ -938,6 +1083,7 @@ class Sidebar(QWidget):
         Collections section from scratch — cheap, small list, same
         rebuild-on-every-change approach the Categories section already uses.
         """
+        self._schedule_ctrl_focus_apply()
         for i in reversed(range(self.collections_layout.count())):
             w = self.collections_layout.itemAt(i).widget()
             if w:
@@ -1042,6 +1188,10 @@ def _safe_get(row, key, default=None):
 
 
 class MainWindow(QMainWindow):
+    # Controller Support — emits the connected controller's name, or "" when
+    # none is connected (Settings' status label binds to this).
+    controller_status_changed = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         db.init_db()
@@ -1158,6 +1308,13 @@ class MainWindow(QMainWindow):
         self._currently_playing_game_id: Optional[int] = None
         self._pool = QThreadPool.globalInstance()
 
+        # Controller Support — see the "Controller Support" section at the
+        # bottom of this class. _ctrl_zone: None (rings hidden, until the
+        # first controller input), "sidebar", or "content".
+        self.controller_watcher = None
+        self._ctrl_zone: Optional[str] = None
+        self._controller_name: str = ""
+
         # Detail page back-routing — GameDetailView is shared between the
         # Library flow (_show_game_detail) and the Wishlist flow
         # (_show_wishlist_item_detail), but only ever emits ONE
@@ -1250,6 +1407,10 @@ class MainWindow(QMainWindow):
 
         # AppImage Self-Update Check — silent background check, every launch.
         self._start_update_check()
+
+        # Controller Support — optional; silently does nothing if pysdl2/SDL2
+        # aren't installed or "controller_enabled" is off.
+        self._apply_controller_setting()
 
     def _on_trickle_finished(self):
         """
@@ -2474,3 +2635,221 @@ class MainWindow(QMainWindow):
             f"Could not back up save for {folder_name}: {error}",
             game_id=game_id, dedup=True)
         self.library_view.refresh_notification_badge()
+
+    # ── Controller Support (Phase A: sidebar + library grid) ─────────────────
+    # controller.py's ControllerWatcher thread emits abstract navigation
+    # signals; everything below turns them into focus moves. Scope so far:
+    # sidebar, library grid, back navigation, Start → Settings, Select →
+    # search. Game Detail / Settings-nav focus is Phase B (the "content"
+    # zone is a no-op on those pages for now). Purely additive: with no
+    # controller connected nothing here ever runs.
+
+    def controller_name(self) -> str:
+        return self._controller_name
+
+    def _apply_controller_setting(self):
+        """Start/stop the watcher to match settings key 'controller_enabled'
+        (default on). Safe to call repeatedly — Settings calls this after
+        its toggle changes."""
+        enabled = db.get_setting("controller_enabled", "true") == "true"
+        if enabled and self.controller_watcher is None:
+            self._start_controller()
+        elif not enabled and self.controller_watcher is not None:
+            self._stop_controller()
+
+    def _start_controller(self):
+        try:
+            import controller as controller_mod
+        except Exception as e:
+            log.info("[CONTROLLER] controller module unavailable: %s", e)
+            return
+        if not controller_mod.is_available():
+            log.info("[CONTROLLER] pysdl2 not installed — controller navigation disabled")
+            return
+        w = controller_mod.ControllerWatcher(parent=self)
+        # Bound methods (not lambdas) so PyQt delivers these on the GUI
+        # thread via a queued connection.
+        w.direction.connect(self._on_ctrl_direction)
+        w.activate.connect(self._on_ctrl_activate)
+        w.back.connect(self._on_ctrl_back)
+        w.context_menu.connect(self._on_ctrl_context_menu)
+        w.page_prev.connect(self._on_ctrl_page_prev)
+        w.page_next.connect(self._on_ctrl_page_next)
+        w.open_settings.connect(self._on_ctrl_open_settings)
+        w.focus_search.connect(self._on_ctrl_focus_search)
+        w.controller_connected.connect(self._on_ctrl_connected)
+        w.controller_disconnected.connect(self._on_ctrl_disconnected)
+        self.controller_watcher = w
+        w.start()
+        log.info("[CONTROLLER] ControllerWatcher started")
+
+    def _stop_controller(self):
+        w = self.controller_watcher
+        if w is None:
+            return
+        self.controller_watcher = None
+        w.stop()
+        w.deleteLater()
+        self._ctrl_set_zone(None)
+        if self._controller_name:
+            self._controller_name = ""
+            self.controller_status_changed.emit("")
+
+    def closeEvent(self, event):
+        self._stop_controller()
+        super().closeEvent(event)
+
+    # ── Signal slots (all funnel into _on_ctrl_action) ───────────────────
+
+    def _on_ctrl_direction(self, d: str):    self._on_ctrl_action("direction", d)
+    def _on_ctrl_activate(self):             self._on_ctrl_action("activate")
+    def _on_ctrl_back(self):                 self._on_ctrl_action("back")
+    def _on_ctrl_context_menu(self):         self._on_ctrl_action("context_menu")
+    def _on_ctrl_page_prev(self):            self._on_ctrl_action("page_prev")
+    def _on_ctrl_page_next(self):            self._on_ctrl_action("page_next")
+    def _on_ctrl_open_settings(self):        self._on_ctrl_action("open_settings")
+    def _on_ctrl_focus_search(self):         self._on_ctrl_action("focus_search")
+
+    def _on_ctrl_connected(self, name: str):
+        self._controller_name = name
+        log.info("[CONTROLLER] Connected: %s", name)
+        self.library_view.show_status(f"🎮 Controller connected: {name}", timeout=3000)
+        self.controller_status_changed.emit(name)
+
+    def _on_ctrl_disconnected(self):
+        self._controller_name = ""
+        log.info("[CONTROLLER] Disconnected")
+        self._ctrl_set_zone(None)
+        self.library_view.show_status("🎮 Controller disconnected", timeout=3000)
+        self.controller_status_changed.emit("")
+
+    # ── Dispatch ──────────────────────────────────────────────────────────
+
+    def _on_ctrl_action(self, action: str, arg=None):
+        # Order matters: an open menu/popup or modal dialog must receive
+        # the input, never the window underneath it (otherwise A would
+        # open a game while a context menu is showing).
+        popup = QApplication.activePopupWidget()
+        if popup is not None:
+            self._ctrl_drive_popup(popup, action, arg)
+            return
+        modal = QApplication.activeModalWidget()
+        if modal is not None:
+            self._ctrl_drive_modal(modal, action, arg)
+            return
+        # Ignore input while another window (e.g. a running game) has focus —
+        # SDL reads the pad even when VaultPlay isn't the active window.
+        if not self.isActiveWindow():
+            return
+
+        if action == "open_settings":
+            self._show_settings()
+            return
+        if action == "focus_search":
+            self.stack.setCurrentIndex(0)
+            self._ctrl_set_zone(None)
+            self.library_view.search_box.setFocus()
+            return
+        if action == "back":
+            self._ctrl_back()
+            return
+        if action == "page_prev":
+            self._ctrl_set_zone("sidebar")
+            return
+        if action == "page_next":
+            if self.stack.currentIndex() == 0 and self.library_view.controller_has_targets():
+                self._ctrl_set_zone("content")
+            return
+
+        # direction / activate / context_menu: first input just wakes the
+        # focus ring up (console-style) instead of also acting.
+        if self._ctrl_zone is None:
+            self._ctrl_wake()
+            return
+
+        on_library = self.stack.currentIndex() == 0
+        if action == "direction":
+            if self._ctrl_zone == "sidebar":
+                self.sidebar.controller_move(arg)
+            elif on_library:
+                self.library_view.controller_move(arg)
+        elif action == "activate":
+            if self._ctrl_zone == "sidebar":
+                self.sidebar.controller_activate()
+            elif on_library:
+                self.library_view.controller_activate()
+        elif action == "context_menu":
+            if self._ctrl_zone == "content" and on_library:
+                self.library_view.controller_context_menu()
+
+    def _ctrl_wake(self):
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QLineEdit):
+            fw.clearFocus()   # e.g. leaving the search box after Select
+        on_library = self.stack.currentIndex() == 0
+        if on_library and self.library_view.controller_has_targets():
+            self._ctrl_set_zone("content")
+        else:
+            self._ctrl_set_zone("sidebar")
+
+    def _ctrl_set_zone(self, zone: Optional[str]):
+        self._ctrl_zone = zone
+        if zone == "sidebar":
+            self.sidebar.controller_focus_default()
+        else:
+            self.sidebar.controller_set_focus_visible(False)
+        if zone == "content":
+            if self.stack.currentIndex() == 0:
+                self.library_view.controller_focus_default()
+        else:
+            self.library_view.set_controller_focus_visible(False)
+
+    def _ctrl_back(self):
+        idx = self.stack.currentIndex()
+        if idx == 1:
+            self._on_detail_back()
+            return
+        if idx in (2, 3):
+            self._show_library()
+            return
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QLineEdit):
+            fw.clearFocus()
+            return
+        self.library_view.controller_back()
+
+    # ── Menus / dialogs ───────────────────────────────────────────────────
+
+    def _ctrl_drive_popup(self, popup, action: str, arg):
+        """Route input into an open QMenu / popup panel as key presses."""
+        keys = {"up": Qt.Key.Key_Up, "down": Qt.Key.Key_Down,
+                "left": Qt.Key.Key_Left, "right": Qt.Key.Key_Right}
+        key = None
+        if action == "direction":
+            key = keys.get(arg)
+        elif action == "activate":
+            key = Qt.Key.Key_Return
+        elif action in ("back", "context_menu"):
+            key = Qt.Key.Key_Escape
+        if key is None:
+            return
+        for etype in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            QApplication.sendEvent(
+                popup, QKeyEvent(etype, key, Qt.KeyboardModifier.NoModifier))
+
+    def _ctrl_drive_modal(self, modal, action: str, arg):
+        """Minimal modal-dialog support: B closes, D-pad moves focus, A
+        presses the focused button. Full per-dialog control is Phase-B/v2."""
+        if action == "back":
+            if isinstance(modal, QDialog):
+                modal.reject()
+            return
+        fw = QApplication.focusWidget() or modal
+        if action == "direction":
+            if arg in ("up", "left"):
+                fw.focusPreviousChild()
+            elif arg in ("down", "right"):
+                fw.focusNextChild()
+        elif action == "activate":
+            if isinstance(fw, QAbstractButton):
+                fw.click()
