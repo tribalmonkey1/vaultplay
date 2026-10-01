@@ -575,6 +575,9 @@ class SettingsView(QWidget):
         if hasattr(self, "_ver_sites_container"):
             self._refresh_version_sites()
 
+        # Refresh trailer detection status
+        self._refresh_trailer_stats()
+
         # Refresh AppImage Self-Update Check status
         if hasattr(self, "update_last_checked_lbl"):
             self._refresh_update_status_from_settings()
@@ -2220,6 +2223,65 @@ class SettingsView(QWidget):
         layout.addWidget(meta_row)
         layout.addWidget(self.meta_status_lbl)
 
+        # ── Trailers (Automatic Trailer Detection & Media Gallery) ────────────
+        # Spec: Notion → Features → Fully Planned → Automatic Trailer
+        # Detection & Media Gallery. Mirrors the ProtonDB/Redistributables
+        # self-contained-QThread-in-this-file pattern above rather than the
+        # Metadata section's "delegate to MainWindow via rescan_requested"
+        # pattern, since this doesn't need anything MainWindow owns.
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("Trailers"))
+
+        trailer_explain = QLabel(
+            "Trailers are found automatically after each scan (Steam first, "
+            "then GOG, then a YouTube search) — but only if the "
+            "\"Auto-fetch Trailers\" toggle below is on. Runs in the "
+            "background. A manually-set trailer (Edit Metadata → Browse "
+            "Trailers…, once that picker exists) is never overwritten by "
+            "this pass."
+        )
+        trailer_explain.setFont(QFont("DM Sans", 11))
+        trailer_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 4px;")
+        trailer_explain.setWordWrap(True)
+        layout.addWidget(trailer_explain)
+
+        trailer_auto_toggle = SettingsToggle(
+            db.get_setting("trailer_auto_fetch", "true") == "true")
+        trailer_auto_toggle.changed.connect(
+            lambda v: self._save("trailer_auto_fetch", "true" if v else "false"))
+        self._make_setting_row(layout, "trailer_auto_fetch",
+                               "Auto-fetch Trailers",
+                               "Detect a trailer (Steam \u2192 GOG \u2192 YouTube) after "
+                               "metadata is fetched for each new game.",
+                               trailer_auto_toggle)
+
+        self.trailer_stats_lbl = QLabel("")
+        self.trailer_stats_lbl.setFont(QFont("DM Mono", 9))
+        self.trailer_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._refresh_trailer_stats()
+
+        trailer_stats_row = SettingsRow(
+            "Library Coverage",
+            "How many games in your library have a trailer on record.")
+        trailer_stats_row.add_control(self.trailer_stats_lbl)
+        layout.addWidget(trailer_stats_row)
+
+        trailer_backfill_row = SettingsRow(
+            "Fetch Missing Trailers",
+            "Runs trailer detection for every game that doesn't have one yet "
+            "(and hasn't had one manually pinned) — the one-time catch-up "
+            "for games that were already in your library before this "
+            "feature existed.")
+        self.trailer_backfill_btn = ActionButton("Fetch Now")
+        self.trailer_backfill_btn.clicked.connect(self._trigger_trailer_backfill)
+        trailer_backfill_row.add_control(self.trailer_backfill_btn)
+        layout.addWidget(trailer_backfill_row)
+
+        self.trailer_status_lbl = QLabel("")
+        self.trailer_status_lbl.setFont(QFont("DM Mono", 9))
+        self.trailer_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        layout.addWidget(self.trailer_status_lbl)
+
         layout.addSpacing(24)
         layout.addWidget(SectionHeader("Metadata Cache"))
 
@@ -2276,6 +2338,118 @@ class SettingsView(QWidget):
         self.meta_status_lbl.setText("Starting metadata fetch…")
         self.meta_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
         self.rescan_requested.emit("__metadata__")
+
+    # ── Trailer backfill ──────────────────────────────────────────────────────
+
+    def _refresh_trailer_stats(self):
+        """Live count of games with a trailer on record vs. total library
+        size, for the Library Coverage row. Cheap — a single COUNT query,
+        safe to call from load_settings() every time the page is opened."""
+        if not hasattr(self, "trailer_stats_lbl"):
+            return
+        try:
+            with db.get_connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS total, "
+                    "COUNT(CASE WHEN m.trailer_url IS NOT NULL AND m.trailer_url != '' "
+                    "THEN 1 END) AS with_trailer "
+                    "FROM games g LEFT JOIN metadata m ON m.game_id = g.id"
+                ).fetchone()
+            total = row["total"] or 0
+            with_trailer = row["with_trailer"] or 0
+            if total == 0:
+                self.trailer_stats_lbl.setText("No games scanned yet")
+                self.trailer_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+            else:
+                self.trailer_stats_lbl.setText(f"{with_trailer}/{total} games have a trailer")
+                self.trailer_stats_lbl.setStyleSheet(
+                    "color: #4ade80;" if with_trailer == total
+                    else f"color: {COLORS['text_muted']};")
+        except Exception:
+            self.trailer_stats_lbl.setText("—")
+            self.trailer_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+
+    def _trigger_trailer_backfill(self):
+        """
+        'Fetch Missing Trailers' — same self-contained-QThread-in-this-file
+        shape as _refresh_all_protondb() above (not the Metadata section's
+        delegate-to-MainWindow pattern), since trailer detection needs
+        nothing MainWindow owns. Iterates db.get_games_missing_trailer()
+        (already excludes manually-pinned trailers) and calls
+        trailers.detect_trailer_for_game() per game, same 0.4s-per-request
+        politeness spirit as metadata.py's own batch loop.
+        """
+        from PyQt6.QtCore import QThread, pyqtSignal as _Signal
+
+        class _Worker(QThread):
+            status = _Signal(str)
+            done   = _Signal(int)   # games_updated count
+
+            def run(self):
+                import time as _time
+                try:
+                    import trailers as trailers_mod
+                except Exception as e:
+                    self.status.emit(f"\u2717 Could not load trailers module: {e}")
+                    self.done.emit(0)
+                    return
+
+                try:
+                    games = db.get_games_missing_trailer()
+                except Exception as e:
+                    self.status.emit(f"\u2717 Error: {e}")
+                    self.done.emit(0)
+                    return
+
+                total = len(games)
+                if total == 0:
+                    self.done.emit(0)
+                    return
+
+                count = 0
+                for i, g in enumerate(games):
+                    title = _safe_get(g, "title") or _safe_get(g, "display_name") or ""
+                    self.status.emit(f"Fetching\u2026 {i + 1}/{total} \u2014 {title}")
+                    try:
+                        result = trailers_mod.detect_trailer_for_game(
+                            _safe_get(g, "steam_app_id"),
+                            title,
+                            _safe_get(g, "developer") or "",
+                            _safe_get(g, "publisher") or "",
+                        )
+                        if result:
+                            db.set_trailer(g["id"], result["url"], result["source"],
+                                           manual_override=False)
+                            count += 1
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "Trailer backfill failed for game %s: %s", title, e)
+                    _time.sleep(0.4)
+
+                self.done.emit(count)
+
+        self.trailer_backfill_btn.setEnabled(False)
+        self.trailer_backfill_btn.setText("Fetching\u2026")
+        self.trailer_status_lbl.setText("Starting\u2026")
+        self.trailer_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+
+        self._trailer_worker = _Worker()
+        self._trailer_worker.status.connect(self.trailer_status_lbl.setText)
+        self._trailer_worker.done.connect(self._on_trailer_backfill_done)
+        self._trailer_worker.start()
+
+    def _on_trailer_backfill_done(self, count: int):
+        self.trailer_backfill_btn.setEnabled(True)
+        self.trailer_backfill_btn.setText("Fetch Now")
+        if count:
+            self.trailer_status_lbl.setText(f"\u2713 Done \u2014 {count} game(s) got a trailer")
+            self.trailer_status_lbl.setStyleSheet("color: #4ade80;")
+        else:
+            self.trailer_status_lbl.setText(
+                "Done \u2014 no trailers found for the games checked")
+            self.trailer_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._refresh_trailer_stats()
 
     def _clear_database(self):
         from PyQt6.QtWidgets import QMessageBox

@@ -621,6 +621,38 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
             except Exception as e:
                 log.warning("ProtonDB fetch failed for game %d: %s", game_id, e)
 
+    # ── Automatic Trailer Detection ──────────────────────────────────────────
+    # See trailers.py / Notion → Features → Fully Planned → Automatic
+    # Trailer Detection & Media Gallery. Chained in right after ProtonDB —
+    # same "per-game, once the rest of metadata is in hand" spot that
+    # fetch was already chained into, so this runs automatically on the
+    # existing Scan → Metadata → ProtonDB pipeline with no separate trigger.
+    # steam_app_id may be None here (unlike ProtonDB, GOG/YouTube detection
+    # can still work from title alone) — detect_trailer_for_game() handles
+    # that itself.
+    #
+    # Manual overrides are respected here, not inside trailers.py: this is
+    # the one and only place in the normal pipeline that could clobber a
+    # user's explicit pick, so the check belongs at this call site — same
+    # division of responsibility db.set_trailer()'s docstring describes.
+    if db.get_setting("trailer_auto_fetch", "true") == "true":
+        try:
+            existing_trailer = db.get_trailer(game_id)
+            if not existing_trailer["manual_override"]:
+                import trailers as trailers_mod
+                trailer_result = trailers_mod.detect_trailer_for_game(
+                    steam_app_id,
+                    metadata.get("title") or search_name,
+                    metadata.get("developer") or "",
+                    metadata.get("publisher") or "",
+                )
+                if trailer_result:
+                    db.set_trailer(
+                        game_id, trailer_result["url"], trailer_result["source"],
+                        manual_override=False)
+        except Exception as e:
+            log.warning("Trailer detection failed for game %d: %s", game_id, e)
+
     return True
 
 
@@ -676,16 +708,16 @@ def fetch_all_missing(progress_callback=None, game_done_callback=None) -> int:
             _ms = (time.monotonic() - _t0) * 1000
             if ok:
                 count += 1
-                log.debug("[METADATA] %-40s  ✓ %.0f ms", display[:40], _ms)
+                log.debug("[METADATA] %-40s  \u2713 %.0f ms", display[:40], _ms)
                 if game_done_callback:
                     try:
                         game_done_callback(game["id"])
                     except Exception:
                         pass
             else:
-                log.debug("[METADATA] %-40s  – no data (%.0f ms)", display[:40], _ms)
+                log.debug("[METADATA] %-40s  \u2013 no data (%.0f ms)", display[:40], _ms)
         except Exception as e:
-            log.error("[METADATA] %-40s  ✗ %s", display[:40], e)
+            log.error("[METADATA] %-40s  \u2717 %s", display[:40], e)
 
         # Rate limiting: be polite to APIs and allow file descriptors to close
         time.sleep(0.4)

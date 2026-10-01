@@ -161,15 +161,6 @@ def init_db():
                 -- Flow 1 (first play after install) successfully links a save.
                 save_path           TEXT,
                 save_source_path    TEXT,
-                -- Achievements/Stats/Leaderboards Auto-Backup: JSON list of
-                -- [{"source_path": ..., "canonical_path": ...}, ...] for
-                -- files matching save_backup.ALWAYS_BACKUP_FILENAME_RE.
-                -- Separate from save_path/save_source_path above since a
-                -- game can have any number of these (0 or more), unlike
-                -- the single user-picked save folder. See save_backup.py's
-                -- module docstring for why these are tracked independently
-                -- of the "one save folder per game" rule.
-                save_extra_paths     TEXT,
                 -- Launch Options feature: JSON blob of overrides-from-default
                 -- only. NULL = no overrides, use static defaults. See
                 -- launch_options.py and the _migrate_db() comment above.
@@ -394,6 +385,11 @@ def _init_default_settings():
         "sidebar_categories_collapsed": "false",
         "sidebar_tags_collapsed":       "false",
         "sidebar_completion_collapsed": "false",
+        # Automatic Trailer Detection — see trailers.py. Gates the
+        # metadata-pipeline hook only; the Settings backfill action (not
+        # yet built) and any future wishlist-side detection pass will read
+        # this same setting.
+        "trailer_auto_fetch":           "true",
     }
     with get_connection() as conn:
         for key, value in defaults.items():
@@ -427,6 +423,20 @@ def _migrate_db():
             ("current_version_dotted",  "ALTER TABLE metadata ADD COLUMN current_version_dotted TEXT"),
             ("current_version_plain",   "ALTER TABLE metadata ADD COLUMN current_version_plain TEXT"),
             ("current_version_date",    "ALTER TABLE metadata ADD COLUMN current_version_date TEXT"),
+            # Automatic Trailer Detection & Media Gallery (Fully Planned,
+            # see trailers.py) — trailer_url/trailer_source mirror the
+            # shape wishlist_store.py already shipped 2026-09-13 for
+            # wishlist items, so the Game Detail page's trailer-reading
+            # code works identically for both. trailer_manual_override
+            # plays the same "never let auto-detection silently overwrite
+            # an explicit user choice" role games.install_tag_override and
+            # version_trackers.is_manual already play elsewhere. media_gallery
+            # is the ordered {type,url,thumbnail_url,source,label} list for
+            # the planned Steam-style carousel — NULL/empty until that ships.
+            ("trailer_url",             "ALTER TABLE metadata ADD COLUMN trailer_url TEXT"),
+            ("trailer_source",          "ALTER TABLE metadata ADD COLUMN trailer_source TEXT"),
+            ("trailer_manual_override", "ALTER TABLE metadata ADD COLUMN trailer_manual_override INTEGER DEFAULT 0"),
+            ("media_gallery",           "ALTER TABLE metadata ADD COLUMN media_gallery TEXT"),
         ]:
             if col not in meta_cols:
                 conn.execute(sql)
@@ -492,9 +502,6 @@ def _migrate_db():
         for col, sql in [
             ("save_path",        "ALTER TABLE game_state ADD COLUMN save_path TEXT"),
             ("save_source_path", "ALTER TABLE game_state ADD COLUMN save_source_path TEXT"),
-            # Achievements/Stats/Leaderboards Auto-Backup — see the
-            # CREATE TABLE comment above for the JSON shape.
-            ("save_extra_paths", "ALTER TABLE game_state ADD COLUMN save_extra_paths TEXT"),
             # Launch Options feature — JSON blob of ONLY the overrides that
             # differ from launch_options.py's static defaults. NULL means
             # "no overrides, use all static defaults" — never a full-state
@@ -647,6 +654,116 @@ def get_games_missing_protondb() -> list:
             WHERE m.steam_app_id IS NOT NULL
               AND m.protondb_tier IS NULL
         """).fetchall()
+
+
+# ── Automatic Trailer Detection & Media Gallery (Fully Planned) ──────────────
+# Mirrors update_protondb()/get_games_missing_protondb() immediately above —
+# same shape, same "store the fetch result, expose a missing-data query for
+# the metadata pipeline and a future Settings backfill action" pattern. See
+# trailers.py for the actual Steam/GOG/YouTube detection logic; nothing here
+# talks to the network.
+
+def set_trailer(game_id: int, url: Optional[str], source: Optional[str],
+                manual_override: bool = False):
+    """
+    Store the resolved trailer for a game. Creates the metadata row if one
+    doesn't exist yet (e.g. called before SGDB/IGDB metadata has ever been
+    fetched), same defensive pattern set_nas_version() already uses.
+
+    manual_override: True once the user has explicitly picked/pinned a
+    trailer (direct paste or the future picker dialog) — callers (the
+    metadata pipeline hook, the Settings backfill action) MUST check
+    get_trailer(game_id)["manual_override"] before calling this with an
+    automatically-detected result, the same "never silently overwrite an
+    explicit user choice" rule install_tag_override and
+    version_trackers.is_manual already enforce elsewhere in this file.
+    This function itself does not enforce that — it just stores whatever
+    it's given, same division of responsibility update_protondb() has with
+    its callers.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO metadata (game_id, trailer_url, trailer_source, trailer_manual_override)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(game_id) DO UPDATE SET
+                trailer_url             = excluded.trailer_url,
+                trailer_source          = excluded.trailer_source,
+                trailer_manual_override = excluded.trailer_manual_override
+        """, (game_id, url, source, 1 if manual_override else 0))
+
+
+def get_trailer(game_id: int) -> dict:
+    """
+    Return {"url": str|None, "source": str|None, "manual_override": bool}
+    for a game. All-None/False if never set (e.g. detection hasn't run
+    yet, or found nothing) — never raises.
+    """
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT trailer_url, trailer_source, trailer_manual_override
+            FROM metadata WHERE game_id=?
+        """, (game_id,)).fetchone()
+    if not row:
+        return {"url": None, "source": None, "manual_override": False}
+    return {
+        "url":             row["trailer_url"],
+        "source":          row["trailer_source"],
+        "manual_override": bool(row["trailer_manual_override"]),
+    }
+
+
+def get_games_missing_trailer() -> list:
+    """
+    Games with no trailer_url set yet, for the metadata-pipeline hook
+    (per-game, gated on trailer_auto_fetch) and the planned Settings
+    "Fetch Missing Trailers" backfill action (bulk, for games that already
+    had metadata fetched before this feature existed). Excludes nothing
+    else — unlike get_games_missing_protondb(), a game doesn't need a
+    steam_app_id to be a candidate, since GOG/YouTube detection work from
+    the title alone.
+    """
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT g.*, m.steam_app_id, m.developer, m.publisher,
+                   COALESCE(m.title, g.display_name, g.folder_name) AS title
+            FROM games g
+            LEFT JOIN metadata m ON m.game_id = g.id
+            WHERE (m.trailer_url IS NULL OR m.trailer_url = '')
+              AND (m.trailer_manual_override IS NULL OR m.trailer_manual_override = 0)
+        """).fetchall()
+
+
+def set_media_gallery(game_id: int, items: list):
+    """
+    Store the ordered media-gallery list for a game (planned Steam-style
+    carousel — see trailers.py / the Automatic Trailer Detection & Media
+    Gallery spec). items: list of {"type": "video"|"image", "url",
+    "thumbnail_url", "source", "label"} dicts, already in display order.
+    Creates the metadata row if one doesn't exist yet.
+    """
+    payload = json.dumps(items) if items else None
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO metadata (game_id, media_gallery) VALUES (?, ?)
+            ON CONFLICT(game_id) DO UPDATE SET
+                media_gallery = excluded.media_gallery
+        """, (game_id, payload))
+
+
+def get_media_gallery(game_id: int) -> list:
+    """Return the stored media-gallery list for a game, or [] if never
+    set / unparseable. Never raises."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT media_gallery FROM metadata WHERE game_id=?", (game_id,)
+        ).fetchone()
+    if not row or not row["media_gallery"]:
+        return []
+    try:
+        data = json.loads(row["media_gallery"])
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -850,6 +967,7 @@ def get_all_games() -> list:
                    m.hero_url, m.logo_url, m.screenshots, m.sgdb_id, m.igdb_id,
                    m.steam_app_id, m.protondb_tier, m.protondb_reports,
                    m.recommended_proton, m.protondb_version_counts,
+                   m.trailer_url, m.trailer_source, m.trailer_manual_override,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    i.game_path, i.launcher_type, i.desktop_path, i.script_path,
                    i.launch_cmd, i.launch_cwd, i.launch_icon,
@@ -918,6 +1036,8 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
                    m.hero_url, m.logo_url, m.screenshots, m.sgdb_id, m.igdb_id,
                    m.steam_app_id, m.protondb_tier, m.protondb_reports,
                    m.recommended_proton, m.protondb_version_counts,
+                   m.trailer_url, m.trailer_source, m.trailer_manual_override,
+                   m.media_gallery,
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    i.game_path, i.launcher_type, i.desktop_path, i.script_path,
                    i.launch_cmd, i.launch_cwd, i.launch_icon,
@@ -1367,67 +1487,6 @@ def set_save_paths(game_id: int, save_path: Optional[str] = None,
         conn.execute(
             f"UPDATE game_state SET {', '.join(updates)} WHERE game_id=?",
             params
-        )
-
-
-# ── Achievements/Stats/Leaderboards Auto-Backup helpers ────────────────────
-# Tracks 0-or-more always-backed-up individual files per game (see
-# save_backup.ALWAYS_BACKUP_FILENAME_RE) — separate from save_path/
-# save_source_path above, which track the single user-picked save folder.
-
-def get_save_extra_paths(game_id: int) -> list:
-    """
-    Return the list of {"source_path", "canonical_path"} dicts for
-    always-backed-up extra files (achievements/stats/leaderboards)
-    currently linked for this game. [] if none yet, or if the stored
-    JSON is unparseable (never raises).
-    """
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT save_extra_paths FROM game_state WHERE game_id=?", (game_id,)
-        ).fetchone()
-    if not row or not row["save_extra_paths"]:
-        return []
-    try:
-        data = json.loads(row["save_extra_paths"])
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, TypeError):
-        return []
-
-
-def add_save_extra_path(game_id: int, source_path: str, canonical_path: str):
-    """
-    Record one extra-file link. Upserts in place if source_path is
-    already tracked (re-linking after a repair updates the same entry
-    rather than duplicating it) — keeps repeated calls across sessions
-    idempotent.
-    """
-    existing = get_save_extra_paths(game_id)
-    for entry in existing:
-        if entry.get("source_path") == source_path:
-            entry["canonical_path"] = canonical_path
-            break
-    else:
-        existing.append({"source_path": source_path, "canonical_path": canonical_path})
-    with get_connection() as conn:
-        conn.execute("""
-            INSERT INTO game_state (game_id, save_extra_paths) VALUES (?, ?)
-            ON CONFLICT(game_id) DO UPDATE SET
-                save_extra_paths = excluded.save_extra_paths
-        """, (game_id, json.dumps(existing)))
-
-
-def remove_save_extra_path(game_id: int, source_path: str):
-    """Stop tracking one extra-file link (e.g. its canonical file was
-    deleted by the user and it should no longer be reported)."""
-    existing = get_save_extra_paths(game_id)
-    filtered = [e for e in existing if e.get("source_path") != source_path]
-    if len(filtered) == len(existing):
-        return
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE game_state SET save_extra_paths=? WHERE game_id=?",
-            (json.dumps(filtered), game_id)
         )
 
 
