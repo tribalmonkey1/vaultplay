@@ -2421,6 +2421,21 @@ class SettingsView(QWidget):
                             db.set_trailer(g["id"], result["url"], result["source"],
                                            manual_override=False)
                             count += 1
+
+                        # Media gallery too — built whether or not a trailer
+                        # was found, since Steam screenshots (or the existing
+                        # IGDB ones) are still worth showing in the carousel.
+                        import json as _json
+                        try:
+                            igdb_shots = _json.loads(_safe_get(g, "screenshots") or "[]")
+                            if not isinstance(igdb_shots, list):
+                                igdb_shots = []
+                        except (TypeError, ValueError):
+                            igdb_shots = []
+                        gallery = trailers_mod.build_media_gallery(
+                            _safe_get(g, "steam_app_id"), igdb_shots, result)
+                        if gallery:
+                            db.set_media_gallery(g["id"], gallery)
                     except Exception as e:
                         import logging
                         logging.getLogger(__name__).warning(

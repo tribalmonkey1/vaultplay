@@ -589,6 +589,10 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
     # Captured before the json.dumps below overwrites metadata["genres"]
     # with a serialized string — sync_tags_from_genres() needs the list.
     genres_for_tags = metadata["genres"] if isinstance(metadata["genres"], list) else []
+    # Same reason for screenshots — the media gallery's IGDB fallback needs
+    # the raw URL list, not the JSON string metadata["screenshots"] becomes.
+    screenshots_for_gallery = (metadata["screenshots"]
+                               if isinstance(metadata["screenshots"], list) else [])
 
     # Convert lists to JSON strings for storage
     if isinstance(metadata.get("genres"), list):
@@ -637,9 +641,10 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
     # division of responsibility db.set_trailer()'s docstring describes.
     if db.get_setting("trailer_auto_fetch", "true") == "true":
         try:
+            import trailers as trailers_mod
             existing_trailer = db.get_trailer(game_id)
+            trailer_result = None
             if not existing_trailer["manual_override"]:
-                import trailers as trailers_mod
                 trailer_result = trailers_mod.detect_trailer_for_game(
                     steam_app_id,
                     metadata.get("title") or search_name,
@@ -650,8 +655,22 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
                     db.set_trailer(
                         game_id, trailer_result["url"], trailer_result["source"],
                         manual_override=False)
+
+            # Media gallery — built whether or not the primary trailer slot
+            # above was skipped for a manual pin: a pin only protects that
+            # one video slot, not the rest of the gallery (Steam's other
+            # movies and screenshots still populate around it).
+            effective_trailer = trailer_result
+            if not effective_trailer and existing_trailer["url"]:
+                effective_trailer = {"url": existing_trailer["url"],
+                                     "source": existing_trailer["source"]}
+            gallery = trailers_mod.build_media_gallery(
+                steam_app_id, screenshots_for_gallery, effective_trailer)
+            if gallery:
+                db.set_media_gallery(game_id, gallery)
         except Exception as e:
-            log.warning("Trailer detection failed for game %d: %s", game_id, e)
+            log.warning("Trailer/media gallery detection failed for game %d: %s",
+                        game_id, e)
 
     return True
 

@@ -43,9 +43,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QRunnable, QThreadPool, pyqtSlot, QObject, QTimer,
-    QStringListModel, QPointF
+    QStringListModel, QPointF, QRectF
 )
-from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QLinearGradient, QBrush, QPolygonF
+from PyQt6.QtGui import (
+    QPixmap, QFont, QColor, QPainter, QLinearGradient, QBrush, QPolygonF,
+    QPainterPath, QPen
+)
 
 import db
 import metadata as meta_mod
@@ -275,28 +278,360 @@ class HeroBanner(QLabel):
         painter.end()
 
 
-class ScreenshotThumb(QLabel):
+# ── Media gallery (Automatic Trailer Detection & Media Gallery) ──────────────
+# Spec: Notion → Features → Fully Planned → Automatic Trailer Detection &
+# Media Gallery. Replaces the old plain Screenshots grid for real library
+# games: one Steam-store-style carousel — a big preview area on top, a
+# horizontally scrollable thumbnail strip underneath mixing trailers and
+# screenshots, click a thumbnail to swap the preview.
+#
+# Items come from db.get_media_gallery() (see trailers.build_media_gallery()):
+#   {"type": "video"|"image", "url", "thumbnail_url", "source", "label"}
+# Clicking a VIDEO item's big preview opens it with xdg-open, exactly like
+# TrailerThumbnail does for wishlist items — no in-app playback yet. Wishlist
+# mode keeps the single TrailerThumbnail and never shows this widget.
+
+_GALLERY_SOURCE_LABELS = {
+    "steam": "Steam", "gog": "GOG", "youtube": "YouTube",
+    "manual": "Pinned", "igdb": "IGDB",
+}
+
+
+def _cover_crop(pix: QPixmap, w: int, h: int) -> QPixmap:
+    """Scale pix to fill w×h (keeping aspect ratio) and center-crop the overflow."""
+    scaled = pix.scaled(
+        max(1, w), max(1, h),
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation)
+    x = max(0, (scaled.width() - w) // 2)
+    y = max(0, (scaled.height() - h) // 2)
+    return scaled.copy(x, y, w, h)
+
+
+def _paint_play_button(p: QPainter, w: int, h: int, radius: int = 34):
+    """Dim overlay + white circle + dark triangle, centered on a w×h area —
+    same look TrailerThumbnail paints, as a plain helper so the gallery
+    preview doesn't need to embed that widget."""
+    p.fillRect(0, 0, w, h, QColor(0, 0, 0, 70))
+    cx, cy = w / 2, h / 2
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(255, 255, 255, 235)))
+    p.drawEllipse(QPointF(cx, cy), radius, radius)
+    p.setBrush(QBrush(QColor(13, 15, 20, 230)))
+    t = radius * 0.5
+    p.drawPolygon(QPolygonF([
+        QPointF(cx - t * 0.45, cy - t),
+        QPointF(cx - t * 0.45, cy + t),
+        QPointF(cx + t * 0.95, cy),
+    ]))
+
+
+class _GalleryPreview(QWidget):
+    """The big preview area. Fixed height, flexible width — the image is
+    scaled to fill and center-cropped on paint (same approach HeroBanner
+    uses), so it tracks the left column's width as the window resizes."""
+    clicked = pyqtSignal()
+    HEIGHT = 330
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(200, 113)
-        self.setStyleSheet(
-            f"background: {COLORS['surface2']}; border: 1px solid {COLORS['border']}; border-radius: 6px;"
-        )
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setText("⬛")
+        self.setFixedHeight(self.HEIGHT)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._pix: QPixmap | None = None
+        self._is_video = False
+        self._scaled: QPixmap | None = None
+        self._scaled_key = None
 
-    def set_image(self, local_path: str):
+    def set_content(self, pix, is_video: bool):
+        self._pix = pix
+        self._is_video = is_video
+        self._scaled_key = None
+        self.setCursor(Qt.CursorShape.PointingHandCursor if is_video
+                       else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, w, h), 10, 10)
+        p.setClipPath(clip)
+        p.fillRect(self.rect(), QColor(COLORS["surface2"]))
+
+        if self._pix is not None and not self._pix.isNull():
+            key = (self._pix.cacheKey(), w, h)
+            if key != self._scaled_key:
+                # Scaling a 1080p screenshot is not free — only redo it when
+                # the image or the widget size actually changed, not on every
+                # repaint (hover, scroll, etc.).
+                self._scaled = _cover_crop(self._pix, w, h)
+                self._scaled_key = key
+            p.drawPixmap(0, 0, self._scaled)
+        elif not self._is_video:
+            p.setPen(QColor(COLORS["text_muted"]))
+            p.setFont(QFont("DM Mono", 9))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Loading…")
+
+        if self._is_video:
+            _paint_play_button(p, w, h)
+
+        p.setClipping(False)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 10, 10)
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._is_video:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class _GalleryThumb(QWidget):
+    """One thumbnail in the strip. Video items get a small corner TRAILER
+    badge so they're distinguishable from screenshots at a glance; unselected
+    thumbnails are slightly dimmed, the selected one gets an accent border."""
+    clicked = pyqtSignal(int)   # index into the gallery's item list
+    W, H = 160, 90
+
+    def __init__(self, index: int, is_video: bool, parent=None):
+        super().__init__(parent)
+        self._index = index
+        self._is_video = is_video
+        self._pix: QPixmap | None = None
+        self._selected = False
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_image(self, pix: QPixmap):
+        self._pix = _cover_crop(pix, self.W, self.H)
+        self.update()
+
+    def set_selected(self, selected: bool):
+        if self._selected != selected:
+            self._selected = selected
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(0, 0, self.W, self.H), 6, 6)
+        p.setClipPath(clip)
+
+        p.fillRect(self.rect(), QColor(COLORS["surface2"]))
+        if self._pix is not None:
+            p.drawPixmap(0, 0, self._pix)
+        if not self._selected:
+            p.fillRect(self.rect(), QColor(13, 15, 20, 95))
+
+        if self._is_video:
+            p.setFont(QFont("DM Mono", 7, QFont.Weight.DemiBold))
+            text = "▶ TRAILER"
+            tw = p.fontMetrics().horizontalAdvance(text) + 10
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(13, 15, 20, 200)))
+            p.drawRoundedRect(QRectF(5, 5, tw, 15), 4, 4)
+            p.setPen(QColor(255, 255, 255, 235))
+            p.drawText(QRectF(5, 5, tw, 15), Qt.AlignmentFlag.AlignCenter, text)
+
+        p.setClipping(False)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if self._selected:
+            p.setPen(QPen(QColor(COLORS["accent"]), 2))
+            p.drawRoundedRect(QRectF(1, 1, self.W - 2, self.H - 2), 6, 6)
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+            p.drawRoundedRect(QRectF(0.5, 0.5, self.W - 1, self.H - 1), 6, 6)
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._index)
+        super().mousePressEvent(event)
+
+
+class _HorizontalScrollArea(QScrollArea):
+    """A QScrollArea whose mouse wheel scrolls HORIZONTALLY — the thumbnail
+    strip has no vertical content, so a plain wheel over it should move
+    through the strip rather than being swallowed. Falls through to normal
+    (page) scrolling when the strip has nothing to scroll."""
+
+    def wheelEvent(self, event):
+        bar = self.horizontalScrollBar()
+        if bar.maximum() > 0:
+            bar.setValue(bar.value() - event.angleDelta().y())
+            event.accept()
+        else:
+            event.ignore()
+
+
+class MediaGalleryWidget(QWidget):
+    """
+    Steam-style media gallery: big preview + scrollable thumbnail strip.
+    Self-contained — call set_items() with the gallery list and it handles
+    its own async image loading, selection, and click-to-open. Hides itself
+    when there's nothing to show.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: list = []
+        self._thumbs: list = []
+        self._pix_cache: dict = {}      # url -> raw loaded QPixmap
+        self._requested: set = set()    # urls with a load already in flight/done
+        self._current = -1
+        self._pool = QThreadPool.globalInstance()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        self.preview = _GalleryPreview()
+        self.preview.clicked.connect(self._on_preview_clicked)
+        root.addWidget(self.preview)
+
+        self.strip_scroll = _HorizontalScrollArea()
+        self.strip_scroll.setWidgetResizable(True)
+        self.strip_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.strip_scroll.setFixedHeight(_GalleryThumb.H + 16)
+        self.strip_scroll.setMinimumWidth(0)
+        self.strip_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.strip_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.strip_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.strip_scroll.setStyleSheet("background: transparent; border: none;")
+
+        self.strip_body = QWidget()
+        self.strip_body.setStyleSheet("background: transparent;")
+        self.strip_layout = QHBoxLayout(self.strip_body)
+        self.strip_layout.setContentsMargins(0, 0, 0, 6)
+        self.strip_layout.setSpacing(8)
+        self.strip_layout.addStretch()
+        self.strip_scroll.setWidget(self.strip_body)
+        root.addWidget(self.strip_scroll)
+
+        self.caption = QLabel("")
+        self.caption.setFont(QFont("DM Mono", 9))
+        self.caption.setStyleSheet(
+            f"color: {COLORS['text_muted']}; background: transparent;")
+        root.addWidget(self.caption)
+
+        self.hide()
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def has_items(self) -> bool:
+        return bool(self._items)
+
+    def clear(self):
+        for t in self._thumbs:
+            self.strip_layout.removeWidget(t)
+            t.deleteLater()
+        self._thumbs = []
+        self._items = []
+        self._pix_cache.clear()
+        self._requested.clear()
+        self._current = -1
+        self.preview.set_content(None, False)
+        self.caption.setText("")
+        self.hide()
+
+    def set_items(self, items: list):
+        self.clear()
+        valid = [i for i in (items or []) if isinstance(i, dict) and i.get("url")]
+        if not valid:
+            return
+        self._items = valid
+        for idx, item in enumerate(valid):
+            thumb = _GalleryThumb(idx, item.get("type") == "video")
+            thumb.clicked.connect(self._select)
+            self._thumbs.append(thumb)
+            self.strip_layout.insertWidget(idx, thumb)
+            self._request(self._thumb_url(item))
+        self.show()
+        self._select(0)
+
+    # ── Internals ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _thumb_url(item: dict):
+        """URL to use for an item's thumbnail: its own thumbnail_url, else
+        (videos) a YouTube-derived thumbnail when the video URL is a YouTube
+        one, else (images) the image itself. None when nothing's available —
+        the thumb just keeps its plain placeholder."""
+        t = item.get("thumbnail_url")
+        if t:
+            return t
+        if item.get("type") == "video":
+            return _youtube_thumbnail_url(item.get("url") or "")
+        return item.get("url")
+
+    def _request(self, url):
+        if not url or url in self._pix_cache or url in self._requested:
+            return
+        self._requested.add(url)
+        loader = ImageLoader(url)
+        loader.signals.loaded.connect(self._on_loaded)
+        self._pool.start(loader)
+
+    def _on_loaded(self, url: str, local_path: str):
         pix = QPixmap(local_path)
-        if not pix.isNull():
-            scaled = pix.scaled(200, 113,
-                                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                Qt.TransformationMode.SmoothTransformation)
-            cropped = scaled.copy((scaled.width()-200)//2, (scaled.height()-113)//2, 200, 113)
-            self.setPixmap(cropped)
-            self.setStyleSheet(
-                "border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;"
-            )
+        if pix.isNull():
+            return
+        self._pix_cache[url] = pix
+        for idx, item in enumerate(self._items):
+            if self._thumb_url(item) == url and idx < len(self._thumbs):
+                self._thumbs[idx].set_image(pix)
+        if 0 <= self._current < len(self._items):
+            self._refresh_preview()
+
+    def _select(self, index: int):
+        if not (0 <= index < len(self._items)):
+            return
+        self._current = index
+        for i, t in enumerate(self._thumbs):
+            t.set_selected(i == index)
+        item = self._items[index]
+        if item.get("type") != "video":
+            # Full-size image is loaded lazily, only for the one being
+            # viewed — the strip itself only ever downloads thumbnails.
+            self._request(item.get("url"))
+        self._refresh_preview()
+        self.strip_scroll.ensureWidgetVisible(self._thumbs[index], 40, 0)
+
+        label = item.get("label") or ("Trailer" if item.get("type") == "video"
+                                      else "Screenshot")
+        source = _GALLERY_SOURCE_LABELS.get(item.get("source") or "", "")
+        text = f"{label}   ·   {source}" if source else label
+        if item.get("type") == "video":
+            text += "   ·   click to watch"
+        self.caption.setText(text)
+
+    def _refresh_preview(self):
+        item = self._items[self._current]
+        if item.get("type") == "video":
+            pix = self._pix_cache.get(self._thumb_url(item))
+            self.preview.set_content(pix, True)
+        else:
+            pix = (self._pix_cache.get(item.get("url"))
+                   or self._pix_cache.get(self._thumb_url(item)))
+            self.preview.set_content(pix, False)
+
+    def _on_preview_clicked(self):
+        if not (0 <= self._current < len(self._items)):
+            return
+        item = self._items[self._current]
+        if item.get("type") != "video":
+            return
+        try:
+            subprocess.Popen(["xdg-open", item["url"]])
+        except Exception as e:
+            log.warning("Could not open trailer URL %s: %s", item.get("url"), e)
 
 
 class InfoRow(QWidget):
@@ -423,7 +758,6 @@ class GameDetailView(QWidget):
         self._mode = "game"                 # "game" | "wishlist"
         self._wishlist_item_id: str | None = None
         self._pool = QThreadPool.globalInstance()
-        self._screenshot_thumbs: list[ScreenshotThumb] = []
         # Currently Playing Indicator — set via set_currently_playing() by
         # MainWindow, which owns the actual PlaytimeWatcher/running state.
         # None = no game currently running (the common case).
@@ -546,10 +880,14 @@ class GameDetailView(QWidget):
         self.trailer_thumb.hide()
         self.left_layout.addSpacing(24)
 
-        self._screenshots_title = self._section_title(self.left_layout, "Screenshots")
-        self.screenshots_layout = QGridLayout()
-        self.screenshots_layout.setSpacing(10)
-        self.left_layout.addLayout(self.screenshots_layout)
+        # Real-game mode only — trailers + screenshots in one carousel (see
+        # MediaGalleryWidget). Wishlist mode keeps the standalone Trailer
+        # section above and never shows this. The attribute keeps its old
+        # _screenshots_title name so _apply_mode_visibility()'s existing
+        # toggling still applies; the label text is what changed.
+        self._screenshots_title = self._section_title(self.left_layout, "Media")
+        self.media_gallery = MediaGalleryWidget()
+        self.left_layout.addWidget(self.media_gallery)
         self.left_layout.addStretch()
 
         # Right column
@@ -989,11 +1327,7 @@ class GameDetailView(QWidget):
         self._screenshots_title.setVisible(is_game)
 
         if not is_game:
-            for i in reversed(range(self.screenshots_layout.count())):
-                item = self.screenshots_layout.takeAt(i)
-                if item.widget():
-                    item.widget().deleteLater()
-            self._screenshot_thumbs.clear()
+            self.media_gallery.clear()
 
     # ── Load game ─────────────────────────────────────────────────────────────
 
@@ -1246,32 +1580,6 @@ class GameDetailView(QWidget):
                 save_row = _InfoRow("Save Backup", "Not yet linked")
             self.info_card_layout.addWidget(save_row)
 
-            # Achievements/Stats/Leaderboards Auto-Backup — separate from
-            # the single save folder above; shows how many always-backup
-            # files (see save_backup.ALWAYS_BACKUP_FILENAME_RE) are
-            # currently tracked, and flags it if any of their links are
-            # broken (same ok/broken language as the main Save Backup row).
-            try:
-                extras = db.get_save_extra_paths(game_id)
-            except Exception:
-                extras = []
-            if extras:
-                broken = [
-                    e for e in extras
-                    if save_backup.diagnose_extra_file(
-                        e.get("source_path"), e.get("canonical_path")
-                    ) not in ("ok", "canonical_missing")
-                ]
-                if broken:
-                    extras_row = _InfoRow(
-                        "Achievements",
-                        f"⚠ {len(broken)} of {len(extras)} link(s) broken",
-                        warn=True)
-                else:
-                    names = ", ".join(Path(e["canonical_path"]).name for e in extras)
-                    extras_row = _InfoRow("Achievements", f"{len(extras)} file(s) — {names}")
-                self.info_card_layout.addWidget(extras_row)
-
         # ── Completion Status ──────────────────────────────────────────────────
         # Always last in the info card, per the Game Detail UI Layout spec.
         # Rebuilt every load_game() call (info_card_layout is cleared above),
@@ -1356,25 +1664,11 @@ class GameDetailView(QWidget):
         # Update library action buttons (favorite / hide)
         self._update_library_buttons(game)
 
-        # Screenshots
-        for i in reversed(range(self.screenshots_layout.count())):
-            item = self.screenshots_layout.takeAt(i)
-            if item.widget():
-                item.widget().deleteLater()
-        self._screenshot_thumbs.clear()
-
-        if game["screenshots"]:
-            try:
-                urls = json.loads(game["screenshots"]) if isinstance(game["screenshots"], str) else game["screenshots"]
-                for i, url in enumerate(urls[:6]):
-                    thumb = ScreenshotThumb()
-                    self._screenshot_thumbs.append(thumb)
-                    self.screenshots_layout.addWidget(thumb, i // 3, i % 3)
-                    loader = ImageLoader(url)
-                    loader.signals.loaded.connect(self._on_screenshot_loaded)
-                    self._pool.start(loader)
-            except Exception:
-                pass
+        # Media gallery — trailers + screenshots in one carousel. The title
+        # is hidden outright when there's nothing to show (a game with no
+        # trailer AND no screenshots), rather than leaving an empty section.
+        self.media_gallery.set_items(self._build_gallery_items(game))
+        self._screenshots_title.setVisible(self.media_gallery.has_items())
 
         # Async load hero + cover
         if game["hero_url"]:
@@ -1388,13 +1682,14 @@ class GameDetailView(QWidget):
             self._pool.start(loader)
 
         # ── Trailer ───────────────────────────────────────────────────────────
-        # trailer_url/trailer_source don't exist as real metadata columns
-        # yet (planned — see trailers.py); _safe_get() returns None safely
-        # until that lands, so this section simply stays hidden for every
-        # game today and starts working automatically once that column
-        # exists, no further changes needed here.
-        trailer_url = _safe_get(game, "trailer_url")
-        self._load_trailer(trailer_url)
+        # Real-game mode no longer uses the standalone Trailer section — the
+        # primary trailer is the first video in the media gallery above (see
+        # _build_gallery_items()). Explicitly hidden here, rather than just
+        # not shown, because this widget is reused across games AND modes: a
+        # wishlist item viewed just before this game would otherwise leave
+        # its Trailer section visible. Wishlist mode (load_wishlist_item)
+        # still calls _load_trailer() with the item's own URL.
+        self._load_trailer(None)
 
         # ── Notes ─────────────────────────────────────────────────────────────
         # Always reset to read-only view mode on load — a fresh page load
@@ -1705,19 +2000,62 @@ class GameDetailView(QWidget):
                 border-radius: 8px;
             """)
 
-    def _on_screenshot_loaded(self, url: str, local_path: str):
-        # Find which thumb is waiting for this URL — we use insertion order
-        game = db.get_game(self._game_id)
-        if not game or not game["screenshots"]:
-            return
-        try:
-            urls = json.loads(game["screenshots"]) if isinstance(game["screenshots"], str) else game["screenshots"]
-            if url in urls:
-                idx = urls.index(url)
-                if idx < len(self._screenshot_thumbs):
-                    self._screenshot_thumbs[idx].set_image(local_path)
-        except Exception:
-            pass
+    def _build_gallery_items(self, game) -> list:
+        """
+        Resolve the media gallery list for a real game:
+          1. The stored media_gallery JSON (Steam movies + screenshots, or
+             whatever trailers.build_media_gallery() produced), if any.
+          2. The primary trailer_url is always forced to the FRONT as the
+             first video — covers a manual pin made after the gallery was
+             last built, and games that got a trailer from before a gallery
+             existed for them.
+          3. If there are no images at all, fall back to the game's IGDB
+             screenshots (the old Screenshots grid's data source), so every
+             game that used to show screenshots still does.
+        """
+        items: list = []
+        raw = _safe_get(game, "media_gallery")
+        if raw:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, list):
+                    items = [dict(i) for i in parsed
+                             if isinstance(i, dict) and i.get("url")]
+            except (TypeError, ValueError):
+                items = []
+
+        trailer_url = (_safe_get(game, "trailer_url") or "").strip()
+        if trailer_url:
+            existing = next((i for i in items if i.get("url") == trailer_url), None)
+            if existing is not None:
+                items.remove(existing)
+                primary = existing
+            else:
+                primary = {
+                    "type": "video", "url": trailer_url, "thumbnail_url": None,
+                    "source": _safe_get(game, "trailer_source") or "manual",
+                    "label": "Trailer",
+                }
+            primary["type"] = "video"
+            items.insert(0, primary)
+
+        if not any(i.get("type") == "image" for i in items):
+            raw_shots = _safe_get(game, "screenshots")
+            try:
+                shots = (json.loads(raw_shots)
+                         if isinstance(raw_shots, str)
+                         else (raw_shots or []))
+                if not isinstance(shots, list):
+                    shots = []
+            except (TypeError, ValueError):
+                shots = []
+            for n, url in enumerate(shots[:12]):
+                if url:
+                    items.append({
+                        "type": "image", "url": url, "thumbnail_url": url,
+                        "source": "igdb", "label": f"Screenshot {n + 1}",
+                    })
+        return items
 
     def _update_library_buttons(self, game):
         """Sync fav_btn and hide_btn labels/styles with current game_state."""
@@ -1947,8 +2285,6 @@ class GameDetailView(QWidget):
         swallowed, since a missed backup opportunity for one session is
         far better than a broken launch.
         """
-        self._maybe_repair_save_extras()
-
         if db.get_setting("save_backup_enabled", "false") != "true":
             return
         if not wine_prefix:
@@ -2030,33 +2366,6 @@ class GameDetailView(QWidget):
                       game["folder_name"], len(snapshot))
         except Exception as e:
             log.warning("[SAVE BACKUP] Pre-launch check/snapshot failed: %s", e)
-
-    def _maybe_repair_save_extras(self):
-        """
-        Pre-launch check for achievements/stats/leaderboards files already
-        tracked via the Achievements/Stats/Leaderboards Auto-Backup sync
-        (see MainWindow._sync_save_extras) — cheap, since it only
-        re-checks already-known records rather than scanning the prefix.
-        Mirrors the main save's Flow 3 auto-repair: "missing" and
-        "plain_file" are fixed silently before launch so the game writes
-        straight through the symlink from the first moment; a
-        "wrong_symlink" is left alone here too, same caution as the main
-        save's Flow 3 — there's no per-file UI yet to ask about it.
-        """
-        if not self._game_id:
-            return
-        if db.get_setting("save_backup_enabled", "false") != "true":
-            return
-        try:
-            for entry in db.get_save_extra_paths(self._game_id):
-                source    = entry.get("source_path")
-                canonical = entry.get("canonical_path")
-                diag = save_backup.diagnose_extra_file(source, canonical)
-                if diag in ("missing", "plain_file"):
-                    save_backup.repair_extra_file_link(source, canonical)
-        except Exception as e:
-            log.warning("[SAVE BACKUP] Extra-file pre-launch repair failed "
-                       "for game_id=%s: %s", self._game_id, e)
 
     def _warn_broken_save_link(self, game, source_path, save_path):
         """Shared fallback warning: shown when a broken link couldn't be

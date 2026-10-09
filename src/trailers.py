@@ -137,12 +137,14 @@ def fetch_steam_trailer(steam_app_id: int) -> Optional[dict]:
     return {"url": url, "thumbnail": movie.get("thumbnail"), "source": "steam"}
 
 
-def fetch_steam_screenshots(steam_app_id: int) -> list:
+def fetch_steam_movies(steam_app_id: int) -> list:
     """
-    Full-size screenshot URLs from the same appdetails response, for the
-    planned media gallery (Steam-sourced screenshots take priority over the
-    existing IGDB-screenshots path when available). Returns [] on any
-    failure or if the game has none. Never raises.
+    EVERY trailer/movie for a Steam app id, in Steam's own listed order —
+    for the media gallery's video slots. (fetch_steam_trailer() above only
+    returns the single best one, for the primary trailer_url column.)
+
+    Returns a list of {"url", "thumbnail"} dicts, [] on any failure or if
+    the game has no movies. Never raises.
     """
     if not steam_app_id:
         return []
@@ -154,13 +156,114 @@ def fetch_steam_screenshots(steam_app_id: int) -> list:
         return []
     if not details:
         return []
-    shots = details.get("screenshots") or []
-    urls = []
-    for shot in shots:
-        url = shot.get("path_full") or shot.get("path_thumbnail")
+    results = []
+    for movie in (details.get("movies") or []):
+        mp4 = movie.get("mp4") or {}
+        url = mp4.get("max") or mp4.get("480")
+        if not url:
+            webm = movie.get("webm") or {}
+            url = webm.get("max") or webm.get("480")
         if url:
-            urls.append(url)
-    return urls
+            results.append({"url": url, "thumbnail": movie.get("thumbnail")})
+    return results
+
+
+def fetch_steam_screenshots(steam_app_id: int) -> list:
+    """
+    EVERY screenshot from the same appdetails response, for the media
+    gallery (Steam-sourced screenshots take priority over the IGDB
+    screenshots path when available).
+
+    Returns a list of {"url", "thumbnail"} dicts — "url" is the full-size
+    image (shown in the gallery's big preview), "thumbnail" is Steam's own
+    much smaller path_thumbnail (used for the thumbnail strip, so the strip
+    doesn't have to download every full-size 1080p image up front). [] on
+    any failure or if the game has none. Never raises.
+    """
+    if not steam_app_id:
+        return []
+    try:
+        details = steamdb.fetch_app_details(steam_app_id)
+    except Exception as e:
+        log.debug("trailers: steamdb.fetch_app_details failed for app_id=%s: %s",
+                  steam_app_id, e)
+        return []
+    if not details:
+        return []
+    results = []
+    for shot in (details.get("screenshots") or []):
+        full = shot.get("path_full") or shot.get("path_thumbnail")
+        if full:
+            results.append({"url": full,
+                            "thumbnail": shot.get("path_thumbnail") or full})
+    return results
+
+
+def build_media_gallery(steam_app_id: Optional[int], igdb_screenshots: list,
+                        primary_trailer: Optional[dict]) -> list:
+    """
+    Build the ordered media-gallery list stored by db.set_media_gallery()
+    and rendered by game_detail.py's MediaGalleryWidget — a list of
+    {"type": "video"|"image", "url", "thumbnail_url", "source", "label"}.
+
+    Steam data wins when there is any: every Steam movie first (Steam's own
+    order), then every Steam screenshot. A manually-pinned or GOG/YouTube
+    primary trailer is NOT dropped in that case — it is inserted ahead of
+    Steam's movies if it isn't one of them already, so a pin always shows
+    up as the first video.
+
+    Without Steam data: the video slot is the primary trailer (if any) and
+    the image slots are the existing IGDB screenshots, unchanged.
+
+    primary_trailer: {"url", "source", optional "thumbnail"} or None.
+    igdb_screenshots: list of plain image URLs (may be empty).
+    Never raises; returns [] if there is nothing to show at all.
+    """
+    gallery: list = []
+
+    steam_movies = fetch_steam_movies(steam_app_id) if steam_app_id else []
+    steam_shots  = fetch_steam_screenshots(steam_app_id) if steam_app_id else []
+
+    if steam_movies or steam_shots:
+        steam_movie_urls = {m["url"] for m in steam_movies}
+        if primary_trailer and primary_trailer.get("url") not in steam_movie_urls:
+            gallery.append({
+                "type": "video", "url": primary_trailer["url"],
+                "thumbnail_url": primary_trailer.get("thumbnail"),
+                "source": primary_trailer.get("source") or "youtube",
+                "label": "Trailer",
+            })
+        for m in steam_movies:
+            n_videos = sum(1 for g in gallery if g["type"] == "video") + 1
+            gallery.append({
+                "type": "video", "url": m["url"],
+                "thumbnail_url": m.get("thumbnail"), "source": "steam",
+                "label": "Trailer" if n_videos == 1 else f"Trailer {n_videos}",
+            })
+        for i, s in enumerate(steam_shots):
+            gallery.append({
+                "type": "image", "url": s["url"],
+                "thumbnail_url": s["thumbnail"], "source": "steam",
+                "label": f"Screenshot {i + 1}",
+            })
+        return gallery
+
+    if primary_trailer and primary_trailer.get("url"):
+        gallery.append({
+            "type": "video", "url": primary_trailer["url"],
+            "thumbnail_url": primary_trailer.get("thumbnail"),
+            "source": primary_trailer.get("source") or "youtube",
+            "label": "Trailer",
+        })
+
+    for i, url in enumerate(igdb_screenshots or []):
+        if url:
+            gallery.append({
+                "type": "image", "url": url, "thumbnail_url": url,
+                "source": "igdb", "label": f"Screenshot {i + 1}",
+            })
+
+    return gallery
 
 
 # ── GOG ───────────────────────────────────────────────────────────────────

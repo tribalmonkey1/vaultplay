@@ -724,7 +724,7 @@ def get_games_missing_trailer() -> list:
     """
     with get_connection() as conn:
         return conn.execute("""
-            SELECT g.*, m.steam_app_id, m.developer, m.publisher,
+            SELECT g.*, m.steam_app_id, m.developer, m.publisher, m.screenshots,
                    COALESCE(m.title, g.display_name, g.folder_name) AS title
             FROM games g
             LEFT JOIN metadata m ON m.game_id = g.id

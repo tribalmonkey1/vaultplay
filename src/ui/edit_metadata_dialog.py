@@ -794,6 +794,19 @@ class EditMetadataDialog(QDialog):
         self._original_steam_app_id = game["steam_app_id"]
         self._refetch_worker: Optional[_RefetchWorker] = None
 
+        # Automatic Trailer Detection & Media Gallery (Fully Planned) — see
+        # trailers.py / ui/trailer_picker_dialog.py. Seeded from whatever's
+        # already stored (auto-detected or previously pinned); only
+        # overwritten in-memory if the user actually opens the picker and
+        # chooses something this session (_on_browse_trailers below) — a
+        # save where the user never touches this section must leave
+        # whatever's in the DB exactly as-is, auto-detected or not.
+        self._original_trailer   = db.get_trailer(game_id)
+        self._trailer_url        = self._original_trailer["url"]
+        self._trailer_source     = self._original_trailer["source"]
+        self._trailer_manual     = self._original_trailer["manual_override"]
+        self._trailer_touched    = False   # True only once the picker is used this session
+
         self.setWindowTitle(f"Edit Metadata — {self._original_title}")
         self.setModal(True)
         self.setMinimumWidth(600)
@@ -934,6 +947,32 @@ class EditMetadataDialog(QDialog):
         steam_box.add(steam_note)
         body_l.addWidget(steam_box)
 
+        # ── Trailer ───────────────────────────────────────────────────────────
+        # Automatic Trailer Detection & Media Gallery (Fully Planned) — see
+        # trailers.py / ui/trailer_picker_dialog.py. Picking a trailer here
+        # ALWAYS counts as a manual pin (same as pasting a URL directly into
+        # the picker's own manual field) — see TrailerPickerDialog's
+        # selected_source() docstring for why an automatically-sourced pick
+        # still needs to stick the way a hand-typed URL would.
+        trailer_box = SectionBox("Trailer")
+        trailer_row = QWidget()
+        trailer_row.setStyleSheet("background: transparent;")
+        trailer_row_l = QHBoxLayout(trailer_row)
+        trailer_row_l.setContentsMargins(0, 0, 0, 0)
+        trailer_row_l.setSpacing(8)
+
+        self.trailer_status_lbl = QLabel()
+        self.trailer_status_lbl.setFont(QFont("DM Mono", 9))
+        self.trailer_status_lbl.setWordWrap(True)
+        trailer_row_l.addWidget(self.trailer_status_lbl, 1)
+
+        trailer_browse_btn = QPushButton("Browse Trailers…")
+        trailer_browse_btn.clicked.connect(self._on_browse_trailers)
+        trailer_row_l.addWidget(trailer_browse_btn)
+        trailer_box.add(trailer_row)
+        body_l.addWidget(trailer_box)
+        self._refresh_trailer_status_label()
+
         self._status_lbl = QLabel("")
         self._status_lbl.setFont(QFont("DM Sans", 10))
         self._status_lbl.setWordWrap(True)
@@ -958,6 +997,47 @@ class EditMetadataDialog(QDialog):
         self.save_btn.clicked.connect(self._on_save)
         foot_l.addWidget(self.save_btn)
         root.addWidget(footer)
+
+    # ── Trailer ───────────────────────────────────────────────────────────────
+
+    def _refresh_trailer_status_label(self):
+        source_label = {
+            "steam": "Steam", "gog": "GOG", "youtube": "YouTube", "manual": "Manual",
+        }.get(self._trailer_source or "", "")
+        if self._trailer_url:
+            pin = "  (pinned — won't be auto-replaced)" if self._trailer_manual else ""
+            text = f"{source_label or 'Trailer'}{pin}\n{self._trailer_url}"
+            color = COLORS["accent2"]
+        else:
+            text = "No trailer set yet."
+            color = COLORS["text_muted"]
+        self.trailer_status_lbl.setText(text)
+        self.trailer_status_lbl.setStyleSheet(f"color: {color}; {_LABEL_BASE}")
+
+    def _on_browse_trailers(self):
+        from ui.trailer_picker_dialog import TrailerPickerDialog
+        # Lazy context_provider — read lazily, same contract as _ArtField's
+        # context_provider above, so the picker always searches with
+        # whatever the Title/Steam ID/Developer/Publisher fields currently
+        # hold, including edits made this session but not yet saved.
+        ctx = lambda: {
+            "steam_app_id": (int(self.steam_id_edit.text().strip())
+                              if self.steam_id_edit.text().strip().isdigit()
+                              else None),
+            "title":     self.title_edit.text().strip() or self._original_title,
+            "developer": self.developer_edit.text().strip(),
+            "publisher": self.publisher_edit.text().strip(),
+        }
+        dlg = TrailerPickerDialog(context_provider=ctx, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            url = dlg.selected_url()
+            source = dlg.selected_source()
+            if url:
+                self._trailer_url     = url
+                self._trailer_source  = source
+                self._trailer_manual  = True
+                self._trailer_touched = True
+                self._refresh_trailer_status_label()
 
     # ── Steam picker ──────────────────────────────────────────────────────────
 
@@ -1002,6 +1082,16 @@ class EditMetadataDialog(QDialog):
             if reply != QMessageBox.StandardButton.Yes:
                 return
             db.set_sort_name(self._game_id, sort_name)
+            # A trailer picked THIS session must survive the refetch below —
+            # fetch_metadata_for_game()'s trailer-detection hook already
+            # checks trailer_manual_override and skips auto-detection when
+            # it's set, but only if that flag is actually persisted before
+            # the refetch worker starts (same reasoning as saving sort_name
+            # immediately above, which is independent of game identity the
+            # same way this is).
+            if self._trailer_touched and self._trailer_manual:
+                db.set_trailer(self._game_id, self._trailer_url,
+                               self._trailer_source, manual_override=True)
             self._start_refetch(new_steam_app_id)
             return
 
@@ -1038,6 +1128,13 @@ class EditMetadataDialog(QDialog):
         }
         db.upsert_metadata(self._game_id, metadata_dict)
         db.set_sort_name(self._game_id, sort_name)
+        # Only write the trailer back if the user actually touched the
+        # picker this session — a save where this section was never opened
+        # must leave whatever's already stored exactly as it was, whether
+        # that's an auto-detected value, a previous manual pin, or nothing.
+        if self._trailer_touched:
+            db.set_trailer(self._game_id, self._trailer_url,
+                           self._trailer_source, manual_override=self._trailer_manual)
         self._finish_save()
 
     def _start_refetch(self, new_app_id: int):
