@@ -15,7 +15,7 @@ Sources
 -------
 Steam: reuses steamdb.fetch_app_details() (already called there for
 redistributable detection — no extra HTTP request beyond what that module
-already makes) and reads its 'movies' array: direct mp4/webm CDN URLs, the
+already makes) and reads its 'movies' array: HLS/DASH stream URLs (formerly direct mp4/webm), the
 only source here that yields a genuinely playable file rather than a
 webpage/embed reference. That distinction matters for a future in-app
 player — see the Notion page's "Designing for future in-app playback"
@@ -64,7 +64,12 @@ if _parent not in _sys.path:
     _sys.path.insert(0, _parent)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import json
 import logging
+import os
+import re
+import shutil
+import subprocess
 import time
 from typing import Optional
 
@@ -102,7 +107,103 @@ PLATFORM_YOUTUBE_CHANNELS = {
 }
 
 
+# ── Diagnostics ────────────────────────────────────────────────────────────
+# Why did a lookup find nothing? Silent debug logging made "0 trailers"
+# impossible to tell apart from "yt-dlp missing" / "GOG blocked" / "GOG has
+# no videos". Every tier bumps a counter here; the Settings backfill shows
+# diagnostics_summary() after a run. last_errors keeps the most recent
+# failure message per tier so a real error string can be shown/logged.
+
+import collections as _collections
+
+_DIAG = _collections.Counter()
+_GOG_MISMATCH_SAMPLES: list = []
+_LAST_ERR: dict = {}
+
+
+def _note(key: str, err=None):
+    _DIAG[key] += 1
+    if err is not None:
+        first = key not in _LAST_ERR
+        _LAST_ERR[key] = str(err)[:200]
+        if first:
+            log.warning("trailers: %s — %s", key, _LAST_ERR[key])
+
+
+def reset_diagnostics():
+    _DIAG.clear()
+    _LAST_ERR.clear()
+    _GOG_MISMATCH_SAMPLES.clear()
+
+
+def diagnostics_summary() -> str:
+    """One-line human summary of how each tier did since reset_diagnostics()."""
+    d = _DIAG
+    parts = [f"Steam {d['steam_hit']}"]
+    gog = f"GOG {d['gog_hit']}"
+    gog_bits = []
+    if d["gog_error"]:
+        gog_bits.append(f"{d['gog_error']} request errors")
+    if d["gog_no_results"]:
+        gog_bits.append(f"{d['gog_no_results']} not on GOG")
+    if d["gog_mismatch"]:
+        gog_bits.append(f"{d['gog_mismatch']} search results didn't match the title")
+    if d["gog_no_videos"]:
+        gog_bits.append(f"{d['gog_no_videos']} listed w/o videos")
+    if d["gog_unparsed"]:
+        gog_bits.append(f"{d['gog_unparsed']} unrecognized video shape")
+    if gog_bits:
+        gog += " (" + ", ".join(gog_bits) + ")"
+    parts.append(gog)
+    if d["yt_missing"]:
+        parts.append("YouTube skipped (yt-dlp not installed)")
+    else:
+        yt = f"YouTube {d['yt_hit']}"
+        yt_bits = []
+        if d["yt_error"]:
+            yt_bits.append(f"{d['yt_error']} search errors")
+        if d["yt_empty"]:
+            yt_bits.append(f"{d['yt_empty']} empty")
+        if yt_bits:
+            yt += " (" + ", ".join(yt_bits) + ")"
+        parts.append(yt)
+    out = " · ".join(parts)
+    if _GOG_MISMATCH_SAMPLES:
+        ex = "; ".join(f"'{t}' → {got}" for t, got in _GOG_MISMATCH_SAMPLES[:3])
+        out += f"  —  GOG title-mismatch examples: {ex}"
+    errs = [f"{k}: {v}" for k, v in _LAST_ERR.items()]
+    if errs:
+        out += "  —  last errors: " + "; ".join(errs)
+    return out
+
+
 # ── Steam ──────────────────────────────────────────────────────────────────
+
+def _movie_url(movie: dict) -> Optional[str]:
+    """
+    Best playable URL from one Steam appdetails 'movies' entry.
+
+    Steam dropped the old direct 'mp4'/'webm' links from appdetails (observed
+    2026-10-09: entries now carry only 'dash_av1', 'dash_h264', 'hls_h264' and
+    a thumbnail). Legacy mp4/webm are still honoured first in case an old or
+    cached response has them, then the adaptive-stream URLs. hls_h264 (a single
+    .m3u8 master playlist) is preferred — mpv, VLC and ffmpeg-backed Qt
+    playback all handle it, and it's one self-contained URL.
+    """
+    for key in ("mp4", "webm"):
+        d = movie.get(key)
+        if isinstance(d, dict):
+            u = d.get("max") or d.get("480")
+            if u:
+                return u
+        elif isinstance(d, str) and d:
+            return d
+    for key in ("hls_h264", "dash_h264", "dash_av1"):
+        u = movie.get(key)
+        if u and isinstance(u, str):
+            return u
+    return None
+
 
 def fetch_steam_trailer(steam_app_id: int) -> Optional[dict]:
     """
@@ -126,15 +227,15 @@ def fetch_steam_trailer(steam_app_id: int) -> Optional[dict]:
     movies = details.get("movies") or []
     if not movies:
         return None
-    movie = movies[0]
-    mp4 = movie.get("mp4") or {}
-    url = mp4.get("max") or mp4.get("480")
-    if not url:
-        webm = movie.get("webm") or {}
-        url = webm.get("max") or webm.get("480")
-    if not url:
-        return None
-    return {"url": url, "thumbnail": movie.get("thumbnail"), "source": "steam"}
+    # Prefer the entry Steam flags as the highlight (its main trailer), else
+    # the first one that yields a usable URL.
+    ordered = sorted(movies, key=lambda m: not m.get("highlight"))
+    for movie in ordered:
+        url = _movie_url(movie)
+        if url:
+            return {"url": url, "thumbnail": movie.get("thumbnail"),
+                    "source": "steam"}
+    return None
 
 
 def fetch_steam_movies(steam_app_id: int) -> list:
@@ -158,11 +259,7 @@ def fetch_steam_movies(steam_app_id: int) -> list:
         return []
     results = []
     for movie in (details.get("movies") or []):
-        mp4 = movie.get("mp4") or {}
-        url = mp4.get("max") or mp4.get("480")
-        if not url:
-            webm = movie.get("webm") or {}
-            url = webm.get("max") or webm.get("480")
+        url = _movie_url(movie)
         if url:
             results.append({"url": url, "thumbnail": movie.get("thumbnail")})
     return results
@@ -268,6 +365,27 @@ def build_media_gallery(steam_app_id: Optional[int], igdb_screenshots: list,
 
 # ── GOG ───────────────────────────────────────────────────────────────────
 
+_EDITION_WORDS = {
+    "edition", "goty", "remastered", "remaster", "definitive", "complete",
+    "deluxe", "ultimate", "enhanced", "gold", "anniversary", "hd",
+}
+
+
+def _norm_title(t: str) -> str:
+    """Loose comparison key: lowercase, drop (..)/[..] tags (scene/version
+    junk), '&'→'and', punctuation out, leading 'the' and edition words
+    ('GOTY', 'Remastered', 'Definitive'...) out."""
+    t = (t or "").lower()
+    t = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", t)
+    t = t.replace("&", " and ")
+    t = t.replace("game of the year", " ")
+    t = re.sub(r"[^a-z0-9]+", " ", t).strip()
+    words = [w for w in t.split() if w not in _EDITION_WORDS]
+    if words and words[0] == "the":
+        words = words[1:]
+    return " ".join(words)
+
+
 def _gog_search_product_id(title: str) -> Optional[int]:
     try:
         resp = SESSION.get(GOG_SEARCH_URL,
@@ -276,13 +394,32 @@ def _gog_search_product_id(title: str) -> Optional[int]:
         resp.raise_for_status()
         data = resp.json()
         resp.close()
-        products = data.get("products") or []
-        if not products:
-            return None
-        return products[0].get("id")
     except Exception as e:
-        log.debug("trailers: GOG search failed for '%s': %s", title, e)
+        _note("gog_error", e)
         return None
+    products = data.get("products") or []
+    if not products:
+        _DIAG["gog_no_results"] += 1
+        return None
+    want = _norm_title(title)
+    # Only accept a product whose title actually matches ours — GOG's search
+    # is fuzzy, and taking products[0] blindly would attach another game's
+    # trailer. Exact normalized match first, then a prefix match either way.
+    best = None
+    for prod in products:
+        got = _norm_title(prod.get("title"))
+        if got == want:
+            best = prod
+            break
+        if best is None and want and got and (got.startswith(want) or want.startswith(got)):
+            best = prod
+    if not best:
+        _DIAG["gog_mismatch"] += 1
+        if len(_GOG_MISMATCH_SAMPLES) < 4:
+            _GOG_MISMATCH_SAMPLES.append(
+                (title, [str(p.get("title")) for p in products[:3]]))
+        return None
+    return best.get("id")
 
 
 def _parse_gog_video(entry: dict) -> Optional[dict]:
@@ -297,8 +434,8 @@ def _parse_gog_video(entry: dict) -> Optional[dict]:
     if not url and entry.get("youtube_id"):
         url = f"https://www.youtube.com/watch?v={entry['youtube_id']}"
     if not url:
-        log.debug("trailers: unrecognized GOG video entry shape, keys=%s",
-                  list(entry.keys()))
+        log.warning("trailers: unrecognized GOG video entry shape, keys=%s "
+                    "(please report — parser needs updating)", list(entry.keys()))
         return None
     thumbnail = entry.get("thumbnail_url") or entry.get("thumbnail") or entry.get("image")
     return {"url": url, "thumbnail": thumbnail, "source": "gog"}
@@ -323,14 +460,18 @@ def fetch_gog_trailer(title: str) -> Optional[dict]:
         data = resp.json()
         resp.close()
     except Exception as e:
-        log.debug("trailers: GOG product fetch failed for id=%s ('%s'): %s",
-                  product_id, title, e)
+        _note("gog_error", e)
         return None
     videos = data.get("videos") or []
+    if not videos:
+        _DIAG["gog_no_videos"] += 1
+        return None
     for entry in videos:
         parsed = _parse_gog_video(entry)
         if parsed:
+            _DIAG["gog_hit"] += 1
             return parsed
+    _DIAG["gog_unparsed"] += 1
     return None
 
 
@@ -343,36 +484,105 @@ def _youtube_thumbnail(video_id: str) -> str:
 _ytdlp_missing_logged = False
 
 
+def _find_ytdlp_cli() -> Optional[str]:
+    """Path to a yt-dlp executable. Many setups (Arch's /usr/local/bin/yt-dlp,
+    a standalone release binary, pipx) have the CLI but NOT an importable
+    Python module in VaultPlay's own interpreter — so the CLI counts too.
+    Also checks the usual bin dirs explicitly, since an AppImage launched
+    from a desktop entry can have a trimmed PATH."""
+    extra = ["/usr/local/bin", "/usr/bin", "/bin",
+             os.path.expanduser("~/.local/bin")]
+    path = os.pathsep.join([os.environ.get("PATH", "")] + extra)
+    return shutil.which("yt-dlp", path=path)
+
+
+def _clean_subprocess_env() -> dict:
+    """Environment for running the system yt-dlp from inside an AppImage:
+    the AppImage's bundled Python/libs (PYTHONHOME, LD_LIBRARY_PATH, ...)
+    must not leak into the user's own yt-dlp script."""
+    env = dict(os.environ)
+    if env.get("APPDIR"):
+        for k in ("PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH", "LD_PRELOAD"):
+            env.pop(k, None)
+    return env
+
+
+def _ytdlp_cli_search(exe: str, query: str, n: int = 5) -> list:
+    """Run `yt-dlp --flat-playlist -j ytsearchN:query`, return entry dicts.
+    Raises RuntimeError with stderr's tail if it fails and printed nothing."""
+    proc = subprocess.run(
+        [exe, "--flat-playlist", "-j", "--no-warnings", "--skip-download",
+         f"ytsearch{n}:{query}"],
+        capture_output=True, text=True, timeout=60,
+        env=_clean_subprocess_env())
+    entries = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+    if not entries and proc.returncode != 0:
+        err_lines = (proc.stderr or "").strip().splitlines()
+        raise RuntimeError(err_lines[-1] if err_lines
+                           else f"yt-dlp exited {proc.returncode}")
+    return entries
+
+
+def ytdlp_available() -> bool:
+    """True if yt-dlp is usable either as an importable module or as an
+    executable on the system (the YouTube fallback tier needs one)."""
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except ImportError:
+        return _find_ytdlp_cli() is not None
+
+
 def search_youtube_candidates(title: str, developer: str = "",
                               publisher: str = "") -> list:
     """
-    yt-dlp-backed search. Returns a ranked list of
+    yt-dlp-backed search (Python module if importable, otherwise the
+    yt-dlp executable). Returns a ranked list of
     {"url", "thumbnail", "title", "channel", "source": "youtube", "score"}
-    dicts, highest score first — the full list is what a future manual
-    picker dialog would show; fetch_youtube_trailer() below just takes the
-    top one.
+    dicts, highest score first — the full list is what the manual picker
+    dialog shows; fetch_youtube_trailer() below just takes the top one.
 
-    Never raises. yt-dlp not being installed, or every search failing, both
-    just mean an empty list — caller treats that the same as "no YouTube
-    candidates found" either way.
+    Never raises. yt-dlp not being available, or every search failing, both
+    just mean an empty list.
     """
     global _ytdlp_missing_logged
+    ydl = None
+    exe = None
     try:
         import yt_dlp
+        ydl = yt_dlp.YoutubeDL({
+            "quiet": True, "no_warnings": True, "extract_flat": True,
+            "skip_download": True,
+        })
     except ImportError:
+        exe = _find_ytdlp_cli()
+    except Exception as e:
+        _note("yt_error", e)
+        return []
+
+    if ydl is None and exe is None:
+        _DIAG["yt_missing"] += 1
         if not _ytdlp_missing_logged:
-            log.info("trailers: yt-dlp not installed — skipping YouTube "
-                     "fallback (pip install yt-dlp --break-system-packages)")
+            log.info("trailers: yt-dlp not found (neither Python module nor "
+                     "executable) — skipping YouTube fallback")
             _ytdlp_missing_logged = True
         return []
 
     if not title:
         return []
 
-    ydl_opts = {
-        "quiet": True, "no_warnings": True, "extract_flat": True,
-        "skip_download": True, "default_search": "ytsearch5",
-    }
+    def run_search(query: str) -> list:
+        if ydl is not None:
+            result = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            return (result or {}).get("entries") or []
+        return _ytdlp_cli_search(exe, query, 5)
 
     queries = [f"{title} official trailer"]
     if publisher:
@@ -385,46 +595,49 @@ def search_youtube_candidates(title: str, developer: str = "",
     candidates: list = []
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            for i, query in enumerate(queries):
-                try:
-                    result = ydl.extract_info(query, download=False)
-                except Exception as e:
-                    log.debug("trailers: yt-dlp search failed for %r: %s", query, e)
+        for i, query in enumerate(queries):
+            try:
+                entries = run_search(query)
+            except Exception as e:
+                _note("yt_error", e)
+                continue
+            for entry in entries:
+                if not entry:
                     continue
-                for entry in ((result or {}).get("entries") or []):
-                    if not entry:
-                        continue
-                    video_id = entry.get("id")
-                    if not video_id or video_id in seen_ids:
-                        continue
-                    seen_ids.add(video_id)
-                    vtitle = entry.get("title") or ""
-                    channel_id = entry.get("channel_id") or ""
+                video_id = entry.get("id")
+                if not video_id or video_id in seen_ids:
+                    continue
+                seen_ids.add(video_id)
+                vtitle = entry.get("title") or ""
+                channel_id = entry.get("channel_id") or ""
 
-                    score = 0
-                    if channel_id in known_channel_ids:
-                        score += 30
-                    if "official trailer" in vtitle.lower():
-                        score += 10
+                score = 0
+                if channel_id in known_channel_ids:
+                    score += 30
+                if "official trailer" in vtitle.lower():
+                    score += 10
 
-                    candidates.append({
-                        "url":       f"https://www.youtube.com/watch?v={video_id}",
-                        "thumbnail": _youtube_thumbnail(video_id),
-                        "title":     vtitle,
-                        "channel":   entry.get("channel") or "",
-                        "source":    "youtube",
-                        "score":     score,
-                    })
-                # Same politeness spirit as metadata.py's 0.4s inter-request
-                # sleep — this is several searches per game, not one.
-                if i < len(queries) - 1:
-                    time.sleep(0.3)
+                candidates.append({
+                    "url":       f"https://www.youtube.com/watch?v={video_id}",
+                    "thumbnail": _youtube_thumbnail(video_id),
+                    "title":     vtitle,
+                    "channel":   entry.get("channel") or entry.get("uploader") or "",
+                    "source":    "youtube",
+                    "score":     score,
+                })
+            # Same politeness spirit as metadata.py's 0.4s inter-request
+            # sleep — this is several searches per game, not one.
+            if i < len(queries) - 1:
+                time.sleep(0.3)
     except Exception as e:
-        log.warning("trailers: yt-dlp search failed entirely for '%s': %s", title, e)
+        _note("yt_error", e)
         return []
 
     candidates.sort(key=lambda c: -c["score"])
+    if candidates:
+        _DIAG["yt_hit"] += 1
+    else:
+        _DIAG["yt_empty"] += 1
     return candidates
 
 
@@ -451,6 +664,7 @@ def detect_trailer_for_game(steam_app_id: Optional[int], title: str,
     if steam_app_id:
         result = fetch_steam_trailer(steam_app_id)
         if result:
+            _DIAG["steam_hit"] += 1
             log.info("trailers: '%s' (app %s) \u2192 Steam trailer", title, steam_app_id)
             return result
 

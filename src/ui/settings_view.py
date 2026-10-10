@@ -2237,8 +2237,7 @@ class SettingsView(QWidget):
             "then GOG, then a YouTube search) — but only if the "
             "\"Auto-fetch Trailers\" toggle below is on. Runs in the "
             "background. A manually-set trailer (Edit Metadata → Browse "
-            "Trailers…, once that picker exists) is never overwritten by "
-            "this pass."
+            "Trailers…) is never overwritten by this pass."
         )
         trailer_explain.setFont(QFont("DM Sans", 11))
         trailer_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 4px;")
@@ -2383,6 +2382,7 @@ class SettingsView(QWidget):
 
         class _Worker(QThread):
             status = _Signal(str)
+            found  = _Signal()      # one game just got a trailer (live coverage refresh)
             done   = _Signal(int)   # games_updated count
 
             def run(self):
@@ -2406,6 +2406,7 @@ class SettingsView(QWidget):
                     self.done.emit(0)
                     return
 
+                trailers_mod.reset_diagnostics()
                 count = 0
                 for i, g in enumerate(games):
                     title = _safe_get(g, "title") or _safe_get(g, "display_name") or ""
@@ -2421,6 +2422,7 @@ class SettingsView(QWidget):
                             db.set_trailer(g["id"], result["url"], result["source"],
                                            manual_override=False)
                             count += 1
+                            self.found.emit()
 
                         # Media gallery too — built whether or not a trailer
                         # was found, since Steam screenshots (or the existing
@@ -2451,19 +2453,29 @@ class SettingsView(QWidget):
 
         self._trailer_worker = _Worker()
         self._trailer_worker.status.connect(self.trailer_status_lbl.setText)
+        # Library Coverage ticks up live as trailers are found, instead of
+        # only refreshing when the page is reopened.
+        self._trailer_worker.found.connect(self._refresh_trailer_stats)
         self._trailer_worker.done.connect(self._on_trailer_backfill_done)
         self._trailer_worker.start()
 
     def _on_trailer_backfill_done(self, count: int):
         self.trailer_backfill_btn.setEnabled(True)
         self.trailer_backfill_btn.setText("Fetch Now")
+        try:
+            import trailers as _tr
+            detail = _tr.diagnostics_summary()
+        except Exception:
+            detail = ""
         if count:
-            self.trailer_status_lbl.setText(f"\u2713 Done \u2014 {count} game(s) got a trailer")
+            self.trailer_status_lbl.setText(
+                f"\u2713 Done \u2014 {count} game(s) got a trailer.  {detail}")
             self.trailer_status_lbl.setStyleSheet("color: #4ade80;")
         else:
             self.trailer_status_lbl.setText(
-                "Done \u2014 no trailers found for the games checked")
+                "Done \u2014 no trailers found for the games checked.  " + detail)
             self.trailer_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self.trailer_status_lbl.setWordWrap(True)
         self._refresh_trailer_stats()
 
     def _clear_database(self):

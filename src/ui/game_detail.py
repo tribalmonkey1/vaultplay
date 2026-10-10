@@ -229,10 +229,7 @@ class TrailerThumbnail(QLabel):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._url:
-            try:
-                subprocess.Popen(["xdg-open", self._url])
-            except Exception as e:
-                log.warning("Could not open trailer URL %s: %s", self._url, e)
+            _open_video(self._url)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -297,6 +294,38 @@ _GALLERY_SOURCE_LABELS = {
 }
 
 
+def _open_video(url: str):
+    """
+    Open a trailer URL externally. Steam trailers are now HLS (.m3u8) / DASH
+    (.mpd) streams, which a browser won't play and xdg-open often has no
+    handler for — so try a real media player first, then fall back to the
+    Steam store page (parsed from the CDN path), then plain xdg-open.
+    """
+    url = url or ""
+    base = url.split("?", 1)[0].lower()
+    if base.endswith((".m3u8", ".mpd")):
+        for player in ("mpv", "vlc", "celluloid", "haruna", "smplayer", "ffplay"):
+            exe = shutil.which(player)
+            if not exe:
+                continue
+            try:
+                args = [exe, url]
+                if player == "ffplay":
+                    args = [exe, "-autoexit", url]
+                subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                return
+            except Exception as e:
+                log.debug("Player %s failed for %s: %s", player, url, e)
+        m = re.search(r"/store_trailers/(\d+)/", url)
+        if m:
+            url = f"https://store.steampowered.com/app/{m.group(1)}"
+    try:
+        subprocess.Popen(["xdg-open", url])
+    except Exception as e:
+        log.warning("Could not open trailer URL %s: %s", url, e)
+
+
 def _cover_crop(pix: QPixmap, w: int, h: int) -> QPixmap:
     """Scale pix to fill w×h (keeping aspect ratio) and center-crop the overflow."""
     scaled = pix.scaled(
@@ -327,15 +356,17 @@ def _paint_play_button(p: QPainter, w: int, h: int, radius: int = 34):
 
 
 class _GalleryPreview(QWidget):
-    """The big preview area. Fixed height, flexible width — the image is
-    scaled to fill and center-cropped on paint (same approach HeroBanner
-    uses), so it tracks the left column's width as the window resizes."""
+    """The big preview area. Height follows the width at 16:9 (capped), and
+    the image is scaled to FIT inside it with its aspect ratio preserved —
+    never stretched or cropped — centered on a dark panel, like Steam's own
+    media viewer."""
     clicked = pyqtSignal()
-    HEIGHT = 330
+    MAX_HEIGHT = 480
+    MIN_HEIGHT = 220
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(self.HEIGHT)
+        self.setFixedHeight(self.MAX_HEIGHT)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._pix: QPixmap | None = None
@@ -351,6 +382,22 @@ class _GalleryPreview(QWidget):
                        else Qt.CursorShape.ArrowCursor)
         self.update()
 
+    def resizeEvent(self, event):
+        h = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, int(event.size().width() * 9 / 16)))
+        if h != self.height():
+            self.setFixedHeight(h)
+        super().resizeEvent(event)
+
+    def _image_rect(self):
+        """Where the (aspect-preserving) image sits inside the widget."""
+        w, h = self.width(), self.height()
+        if self._pix is None or self._pix.isNull():
+            return QRectF(0, 0, w, h)
+        pw, ph = self._pix.width(), self._pix.height()
+        scale = min(w / pw, h / ph)
+        iw, ih = pw * scale, ph * scale
+        return QRectF((w - iw) / 2, (h - ih) / 2, iw, ih)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -361,14 +408,17 @@ class _GalleryPreview(QWidget):
         p.fillRect(self.rect(), QColor(COLORS["surface2"]))
 
         if self._pix is not None and not self._pix.isNull():
-            key = (self._pix.cacheKey(), w, h)
+            r = self._image_rect()
+            tw, th = max(1, round(r.width())), max(1, round(r.height()))
+            key = (self._pix.cacheKey(), tw, th)
             if key != self._scaled_key:
                 # Scaling a 1080p screenshot is not free — only redo it when
-                # the image or the widget size actually changed, not on every
-                # repaint (hover, scroll, etc.).
-                self._scaled = _cover_crop(self._pix, w, h)
+                # the image or the widget size actually changed.
+                self._scaled = self._pix.scaled(
+                    tw, th, Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
                 self._scaled_key = key
-            p.drawPixmap(0, 0, self._scaled)
+            p.drawPixmap(round(r.x()), round(r.y()), self._scaled)
         elif not self._is_video:
             p.setPen(QColor(COLORS["text_muted"]))
             p.setFont(QFont("DM Mono", 9))
@@ -476,8 +526,16 @@ class MediaGalleryWidget(QWidget):
     when there's nothing to show.
     """
 
+    # Preview tops out at 480px tall at 16:9 = ~854 wide; the whole widget
+    # (preview + thumbnail strip + caption) is capped to that width so the
+    # strip scrolls instead of the section stretching across the page with
+    # empty bars either side of the image.
+    MAX_WIDTH = 854
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setMaximumWidth(self.MAX_WIDTH)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._items: list = []
         self._thumbs: list = []
         self._pix_cache: dict = {}      # url -> raw loaded QPixmap
@@ -628,10 +686,7 @@ class MediaGalleryWidget(QWidget):
         item = self._items[self._current]
         if item.get("type") != "video":
             return
-        try:
-            subprocess.Popen(["xdg-open", item["url"]])
-        except Exception as e:
-            log.warning("Could not open trailer URL %s: %s", item.get("url"), e)
+        _open_video(item["url"])
 
 
 class InfoRow(QWidget):
@@ -887,7 +942,15 @@ class GameDetailView(QWidget):
         # toggling still applies; the label text is what changed.
         self._screenshots_title = self._section_title(self.left_layout, "Media")
         self.media_gallery = MediaGalleryWidget()
-        self.left_layout.addWidget(self.media_gallery)
+        # Left-aligned and capped at MediaGalleryWidget.MAX_WIDTH: the row's
+        # trailing stretch soaks up whatever the gallery can't use.
+        self._gallery_row = QWidget()
+        _gallery_row_lay = QHBoxLayout(self._gallery_row)
+        _gallery_row_lay.setContentsMargins(0, 0, 0, 0)
+        _gallery_row_lay.setSpacing(0)
+        _gallery_row_lay.addWidget(self.media_gallery, 1)
+        _gallery_row_lay.addStretch(0)
+        self.left_layout.addWidget(self._gallery_row)
         self.left_layout.addStretch()
 
         # Right column
