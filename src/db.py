@@ -390,6 +390,7 @@ def _init_default_settings():
         # yet built) and any future wishlist-side detection pass will read
         # this same setting.
         "trailer_auto_fetch":           "true",
+        "steam_store_auto_fill":        "true",
     }
     with get_connection() as conn:
         for key, value in defaults.items():
@@ -731,6 +732,64 @@ def get_games_missing_trailer() -> list:
             WHERE (m.trailer_url IS NULL OR m.trailer_url = '')
               AND (m.trailer_manual_override IS NULL OR m.trailer_manual_override = 0)
         """).fetchall()
+
+
+_DETAIL_FIELDS = ("description", "developer", "publisher", "release_date", "genres")
+
+
+def get_games_missing_steam_details() -> list:
+    """
+    Games that have a Steam App ID but are still missing at least one of
+    description / developer / publisher / release date / genres — the
+    candidates for the Settings "Fill Missing Details from Steam" backfill
+    (and the count shown beside it). Games with no Steam ID can't be
+    filled from Steam and are not listed.
+    """
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT g.id,
+                   COALESCE(m.title, g.display_name, g.folder_name) AS title,
+                   m.steam_app_id
+            FROM games g
+            JOIN metadata m ON m.game_id = g.id
+            WHERE m.steam_app_id IS NOT NULL AND m.steam_app_id != 0
+              AND (   m.description  IS NULL OR TRIM(m.description)  = ''
+                   OR m.developer    IS NULL OR TRIM(m.developer)    = ''
+                   OR m.publisher    IS NULL OR TRIM(m.publisher)    = ''
+                   OR m.release_date IS NULL OR TRIM(m.release_date) = ''
+                   OR m.genres       IS NULL OR TRIM(m.genres) IN ('', '[]'))
+        """).fetchall()
+
+
+def fill_metadata_gaps(game_id: int, fields: dict) -> list:
+    """
+    Fill ONLY the empty description/developer/publisher/ip_holder/
+    release_date/genres columns for a game from `fields`; anything that
+    already has a value is untouched (unlike upsert_metadata(), which
+    rewrites every column). Returns the list of column names written.
+    """
+    wanted = _DETAIL_FIELDS + ("ip_holder",)
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT description, developer, publisher, ip_holder, "
+            "release_date, genres FROM metadata WHERE game_id = ?",
+            (game_id,)).fetchone()
+        if not row:
+            return []
+        updates = {}
+        for col in wanted:
+            new = fields.get(col)
+            if not new:
+                continue
+            cur = row[col]
+            if cur is None or str(cur).strip() in ("", "[]"):
+                updates[col] = json.dumps(new) if col == "genres" and \
+                    not isinstance(new, str) else new
+        if updates:
+            sets = ", ".join(f"{c} = ?" for c in updates)
+            conn.execute(f"UPDATE metadata SET {sets} WHERE game_id = ?",
+                         (*updates.values(), game_id))
+        return list(updates)
 
 
 def set_media_gallery(game_id: int, items: list):

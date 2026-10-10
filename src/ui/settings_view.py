@@ -576,6 +576,7 @@ class SettingsView(QWidget):
             self._refresh_version_sites()
 
         # Refresh trailer detection status
+        self._refresh_steam_fill_stats()
         self._refresh_trailer_stats()
 
         # Refresh AppImage Self-Update Check status
@@ -2281,6 +2282,59 @@ class SettingsView(QWidget):
         self.trailer_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
         layout.addWidget(self.trailer_status_lbl)
 
+        # ── Steam Store Data (fills gaps IGDB left) ───────────────────────────
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("Steam Store Data"))
+
+        steam_explain = QLabel(
+            "Games with a Steam App ID get any missing description, developer, "
+            "publisher, release date and genres filled in from their Steam "
+            "store page. It only fills EMPTY fields — nothing IGDB (or you) "
+            "already set is ever overwritten."
+        )
+        steam_explain.setFont(QFont("DM Sans", 11))
+        steam_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 4px;")
+        steam_explain.setWordWrap(True)
+        layout.addWidget(steam_explain)
+
+        steam_fill_toggle = SettingsToggle(
+            db.get_setting("steam_store_auto_fill", "true") == "true")
+        steam_fill_toggle.changed.connect(
+            lambda v: self._save("steam_store_auto_fill", "true" if v else "false"))
+        self._make_setting_row(layout, "steam_store_auto_fill",
+                               "Auto-fill from Steam",
+                               "Fill empty details from the Steam store page "
+                               "whenever metadata is fetched for a game.",
+                               steam_fill_toggle)
+
+        self.steam_fill_stats_lbl = QLabel("")
+        self.steam_fill_stats_lbl.setFont(QFont("DM Mono", 9))
+        self.steam_fill_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._refresh_steam_fill_stats()
+
+        steam_fill_stats_row = SettingsRow(
+            "Missing Details",
+            "Steam-linked games still missing a description, developer, "
+            "publisher, release date or genres.")
+        steam_fill_stats_row.add_control(self.steam_fill_stats_lbl)
+        layout.addWidget(steam_fill_stats_row)
+
+        steam_fill_row = SettingsRow(
+            "Fill Missing Details from Steam",
+            "One-time catch-up for games already in your library: checks "
+            "each Steam-linked game and fills only its empty fields. Some "
+            "games (older or delisted) may have nothing on Steam to add.")
+        self.steam_fill_btn = ActionButton("Fill Now")
+        self.steam_fill_btn.clicked.connect(self._trigger_steam_fill)
+        steam_fill_row.add_control(self.steam_fill_btn)
+        layout.addWidget(steam_fill_row)
+
+        self.steam_fill_status_lbl = QLabel("")
+        self.steam_fill_status_lbl.setFont(QFont("DM Mono", 9))
+        self.steam_fill_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self.steam_fill_status_lbl.setWordWrap(True)
+        layout.addWidget(self.steam_fill_status_lbl)
+
         layout.addSpacing(24)
         layout.addWidget(SectionHeader("Metadata Cache"))
 
@@ -2367,6 +2421,82 @@ class SettingsView(QWidget):
         except Exception:
             self.trailer_stats_lbl.setText("—")
             self.trailer_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+
+    def _refresh_steam_fill_stats(self):
+        """How many Steam-linked games still have an empty detail field.
+        Cheap single query; called on page load and live during the backfill."""
+        if not hasattr(self, "steam_fill_stats_lbl"):
+            return
+        try:
+            n = len(db.get_games_missing_steam_details())
+        except Exception:
+            self.steam_fill_stats_lbl.setText("")
+            return
+        self.steam_fill_stats_lbl.setText(
+            f"{n} game(s) missing details" if n else "All Steam-linked games complete")
+        self.steam_fill_stats_lbl.setStyleSheet(
+            f"color: {COLORS['text_muted']};" if n else "color: #4ade80;")
+
+    def _trigger_steam_fill(self):
+        """'Fill Missing Details from Steam' — same self-contained-QThread
+        shape as the trailer backfill below. One cached Steam request per
+        game (steam_store.get_app_details()), 0.5s apart to stay well under
+        Steam's appdetails rate limit."""
+        from PyQt6.QtCore import QThread, pyqtSignal as _Signal
+
+        class _Worker(QThread):
+            status = _Signal(str)
+            found  = _Signal()
+            done   = _Signal(int, int, int)   # games_updated, fields_filled, checked
+
+            def run(self):
+                import time as _time
+                try:
+                    import metadata as meta_mod
+                    games = db.get_games_missing_steam_details()
+                except Exception as e:
+                    self.status.emit(f"\u2717 Error: {e}")
+                    self.done.emit(0, 0, 0)
+                    return
+                total = len(games)
+                games_updated = fields_filled = 0
+                for i, g in enumerate(games):
+                    title = _safe_get(g, "title") or ""
+                    self.status.emit(f"Filling\u2026 {i + 1}/{total} \u2014 {title}")
+                    filled = meta_mod.fill_missing_from_steam(
+                        g["id"], g["steam_app_id"])
+                    if filled:
+                        games_updated += 1
+                        fields_filled += len(filled)
+                        self.found.emit()
+                    _time.sleep(0.5)
+                self.done.emit(games_updated, fields_filled, total)
+
+        self.steam_fill_btn.setEnabled(False)
+        self.steam_fill_btn.setText("Working\u2026")
+        self.steam_fill_status_lbl.setText("Starting\u2026")
+        self.steam_fill_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._steam_fill_worker = _Worker()
+        self._steam_fill_worker.status.connect(self.steam_fill_status_lbl.setText)
+        self._steam_fill_worker.found.connect(self._refresh_steam_fill_stats)
+        self._steam_fill_worker.done.connect(self._on_steam_fill_done)
+        self._steam_fill_worker.start()
+
+    def _on_steam_fill_done(self, games_updated: int, fields_filled: int, checked: int):
+        self.steam_fill_btn.setEnabled(True)
+        self.steam_fill_btn.setText("Fill Now")
+        if checked == 0:
+            self.steam_fill_status_lbl.setText("Nothing to do \u2014 no Steam-linked game is missing details.")
+        elif games_updated:
+            self.steam_fill_status_lbl.setText(
+                f"\u2713 Done \u2014 filled {fields_filled} field(s) across "
+                f"{games_updated} of {checked} game(s) checked.")
+            self.steam_fill_status_lbl.setStyleSheet("color: #4ade80;")
+        else:
+            self.steam_fill_status_lbl.setText(
+                f"Done \u2014 checked {checked} game(s); Steam had nothing new to add "
+                "(or couldn't be reached \u2014 check your connection).")
+        self._refresh_steam_fill_stats()
 
     def _trigger_trailer_backfill(self):
         """

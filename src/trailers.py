@@ -13,9 +13,10 @@ it's given, with no notion of "should I even be running right now."
 
 Sources
 -------
-Steam: reuses steamdb.fetch_app_details() (already called there for
-redistributable detection — no extra HTTP request beyond what that module
-already makes) and reads its 'movies' array: HLS/DASH stream URLs (formerly direct mp4/webm), the
+Steam: reads the 'movies' array of Steam's appdetails response via
+steam_store.get_app_details() — a shared, cached call, so trailer + every
+movie + every screenshot (+ the Steam description/date fill) cost ONE
+request per game instead of one each: HLS/DASH stream URLs (formerly direct mp4/webm), the
 only source here that yields a genuinely playable file rather than a
 webpage/embed reference. That distinction matters for a future in-app
 player — see the Notion page's "Designing for future in-app playback"
@@ -76,7 +77,7 @@ from typing import Optional
 import requests
 import requests.adapters
 
-import steamdb
+import steam_store
 
 log = logging.getLogger(__name__)
 
@@ -208,7 +209,7 @@ def _movie_url(movie: dict) -> Optional[str]:
 def fetch_steam_trailer(steam_app_id: int) -> Optional[dict]:
     """
     Best trailer for a Steam app id, straight from the 'movies' array in
-    Steam's public appdetails response (via steamdb.fetch_app_details(),
+    Steam's public appdetails response (via steam_store.get_app_details(),
     already called elsewhere for redistributable detection).
 
     Returns {"url", "thumbnail", "source": "steam"} or None if the game has
@@ -217,9 +218,9 @@ def fetch_steam_trailer(steam_app_id: int) -> Optional[dict]:
     if not steam_app_id:
         return None
     try:
-        details = steamdb.fetch_app_details(steam_app_id)
+        details = steam_store.get_app_details(steam_app_id)
     except Exception as e:
-        log.debug("trailers: steamdb.fetch_app_details failed for app_id=%s: %s",
+        log.debug("trailers: steam_store.get_app_details failed for app_id=%s: %s",
                   steam_app_id, e)
         return None
     if not details:
@@ -250,9 +251,9 @@ def fetch_steam_movies(steam_app_id: int) -> list:
     if not steam_app_id:
         return []
     try:
-        details = steamdb.fetch_app_details(steam_app_id)
+        details = steam_store.get_app_details(steam_app_id)
     except Exception as e:
-        log.debug("trailers: steamdb.fetch_app_details failed for app_id=%s: %s",
+        log.debug("trailers: steam_store.get_app_details failed for app_id=%s: %s",
                   steam_app_id, e)
         return []
     if not details:
@@ -280,9 +281,9 @@ def fetch_steam_screenshots(steam_app_id: int) -> list:
     if not steam_app_id:
         return []
     try:
-        details = steamdb.fetch_app_details(steam_app_id)
+        details = steam_store.get_app_details(steam_app_id)
     except Exception as e:
-        log.debug("trailers: steamdb.fetch_app_details failed for app_id=%s: %s",
+        log.debug("trailers: steam_store.get_app_details failed for app_id=%s: %s",
                   steam_app_id, e)
         return []
     if not details:

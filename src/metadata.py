@@ -569,6 +569,23 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
         else:
             log.info("No IGDB match for '%s'", search_name)
 
+    # ── Steam store data (fills gaps only) ────────────────────────────────────
+    # IGDB is the primary source; Steam's own store page fills whatever it
+    # left empty (description / developer / publisher / release date /
+    # genres) — never overwrites a value that's already there. Runs for
+    # any game with a Steam App ID, however it was discovered (SGDB search,
+    # IGDB external_games, or pinned via force_steam_app_id).
+    _steam_id_now = force_steam_app_id or metadata.get("steam_app_id")
+    if _steam_id_now and db.get_setting("steam_store_auto_fill", "true") == "true":
+        try:
+            import steam_store
+            _filled = steam_store.fill_gaps(metadata, _steam_id_now)
+            if _filled:
+                log.info("Steam store data filled %s for '%s'",
+                         ", ".join(_filled), search_name)
+        except Exception as e:
+            log.warning("Steam store fill failed for '%s': %s", search_name, e)
+
     if not metadata:
         return False
 
@@ -673,6 +690,32 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
                         game_id, e)
 
     return True
+
+
+def fill_missing_from_steam(game_id: int, steam_app_id: int) -> list:
+    """
+    Backfill for ONE already-scanned game: pull description / developer /
+    publisher / release date / genres from Steam's store data and write only
+    the columns that are currently empty (db.fill_metadata_gaps()). Newly
+    filled genres also feed the auto-tag sync, same as a normal fetch.
+    Returns the list of columns filled ([] if nothing new / Steam had
+    nothing / request failed). Never raises.
+    """
+    try:
+        import steam_store
+        fields = steam_store.fetch_fields(steam_app_id)
+        if not fields:
+            return []
+        filled = db.fill_metadata_gaps(game_id, fields)
+        if "genres" in filled:
+            try:
+                sync_tags_from_genres(game_id, fields.get("genres") or [])
+            except Exception as e:
+                log.debug("tag sync after Steam fill failed for %d: %s", game_id, e)
+        return filled
+    except Exception as e:
+        log.warning("Steam store backfill failed for game %s: %s", game_id, e)
+        return []
 
 
 def fetch_all_missing(progress_callback=None, game_done_callback=None) -> int:

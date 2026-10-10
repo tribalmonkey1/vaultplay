@@ -554,7 +554,7 @@ class MediaGalleryWidget(QWidget):
         self.strip_scroll = _HorizontalScrollArea()
         self.strip_scroll.setWidgetResizable(True)
         self.strip_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.strip_scroll.setFixedHeight(_GalleryThumb.H + 16)
+        self.strip_scroll.setFixedHeight(_GalleryThumb.H + 34)
         self.strip_scroll.setMinimumWidth(0)
         self.strip_scroll.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -562,7 +562,27 @@ class MediaGalleryWidget(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.strip_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.strip_scroll.setStyleSheet("background: transparent; border: none;")
+        # Chunky horizontal scrollbar (easy to grab and drag) — the default
+        # one was only a few px tall and hard to hit.
+        self.strip_scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:horizontal {
+                height: 16px; margin: 4px 0 0 0;
+                background: rgba(255,255,255,0.06); border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                min-width: 48px; background: rgba(255,255,255,0.30);
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal:hover { background: rgba(255,255,255,0.50); }
+            QScrollBar::handle:horizontal:pressed { background: rgba(255,255,255,0.65); }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0; height: 0; background: none; border: none;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none;
+            }
+        """)
 
         self.strip_body = QWidget()
         self.strip_body.setStyleSheet("background: transparent;")
@@ -916,14 +936,6 @@ class GameDetailView(QWidget):
         self.left_layout.setContentsMargins(0, 0, 0, 0)
         self.left_layout.setSpacing(0)
 
-        self._about_title = self._section_title(self.left_layout, "About This Game")
-        self.desc_label = QLabel("No description available.")
-        self.desc_label.setFont(QFont("DM Sans", 12))
-        self.desc_label.setStyleSheet(f"color: {COLORS['text_dim']}; line-height: 1.7;")
-        self.desc_label.setWordWrap(True)
-        self.left_layout.addWidget(self.desc_label)
-        self.left_layout.addSpacing(24)
-
         # Trailer — hidden unless the loaded game/wishlist item has one.
         # Sits above Screenshots, mirroring a Steam store page's media
         # order (trailer first, then shots). See TrailerThumbnail's
@@ -951,6 +963,17 @@ class GameDetailView(QWidget):
         _gallery_row_lay.addWidget(self.media_gallery, 1)
         _gallery_row_lay.addStretch(0)
         self.left_layout.addWidget(self._gallery_row)
+        self.left_layout.addSpacing(28)
+
+        # About This Game sits BELOW the media carousel (real-game mode only;
+        # hidden in wishlist mode by _apply_mode_visibility()).
+        self._about_title = self._section_title(self.left_layout, "About This Game")
+        self.desc_label = QLabel("No description available.")
+        self.desc_label.setFont(QFont("DM Sans", 12))
+        self.desc_label.setStyleSheet(f"color: {COLORS['text_dim']}; line-height: 1.7;")
+        self.desc_label.setWordWrap(True)
+        self.left_layout.addWidget(self.desc_label)
+        self.left_layout.addSpacing(24)
         self.left_layout.addStretch()
 
         # Right column
