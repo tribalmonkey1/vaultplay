@@ -577,6 +577,7 @@ class SettingsView(QWidget):
 
         # Refresh trailer detection status
         self._refresh_steam_fill_stats()
+        self._refresh_rawg_stats()
         self._refresh_trailer_stats()
 
         # Refresh AppImage Self-Update Check status
@@ -1335,6 +1336,14 @@ class SettingsView(QWidget):
         self._api_key_row(layout, "igdb_client_secret",
                           "Client Secret",
                           "Required alongside Client ID", secret=True)
+
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("RAWG  (optional — fills descriptions, dates, genres IGDB lacks)"))
+        self._api_key_row(layout, "rawg_api_key",
+                          "API Key",
+                          "Free key from rawg.io/apidocs (\u201cGet API Key\u201d) — "
+                          "personal/hobby use, 20,000 requests/month. "
+                          "Nothing to submit or get approved.", secret=True)
 
         layout.addStretch()
         return scroll
@@ -2335,6 +2344,74 @@ class SettingsView(QWidget):
         self.steam_fill_status_lbl.setWordWrap(True)
         layout.addWidget(self.steam_fill_status_lbl)
 
+        # ── More Metadata Sources (IGDB platform matching + RAWG) ─────────────
+        layout.addSpacing(24)
+        layout.addWidget(SectionHeader("More Metadata Sources"))
+
+        more_explain = QLabel(
+            "Order of use for each game: IGDB first, then Steam (PC games with "
+            "a Steam ID), then RAWG for anything still empty. Each source only "
+            "fills EMPTY fields, so turning one off just means fewer gaps get "
+            "filled — nothing already set is ever overwritten. RAWG needs a "
+            "free API key (Settings \u2192 API Keys)."
+        )
+        more_explain.setFont(QFont("DM Sans", 11))
+        more_explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 4px;")
+        more_explain.setWordWrap(True)
+        layout.addWidget(more_explain)
+
+        igdb_plat_toggle = SettingsToggle(
+            db.get_setting("igdb_platform_filter", "true") == "true")
+        igdb_plat_toggle.changed.connect(
+            lambda v: self._save("igdb_platform_filter", "true" if v else "false"))
+        self._make_setting_row(layout, "igdb_platform_filter",
+                               "Match IGDB by platform",
+                               "For console games, search IGDB only within the game's "
+                               "own platform (from its library category folder, e.g. "
+                               "PS2, Switch, 3ds) so it doesn't match a different "
+                               "release. Falls back to an unfiltered search if nothing "
+                               "is found. Applies the next time metadata is fetched.",
+                               igdb_plat_toggle)
+
+        rawg_toggle = SettingsToggle(
+            db.get_setting("rawg_auto_fill", "true") == "true")
+        rawg_toggle.changed.connect(
+            lambda v: self._save("rawg_auto_fill", "true" if v else "false"))
+        self._make_setting_row(layout, "rawg_auto_fill",
+                               "Auto-fill from RAWG",
+                               "Fill still-empty details from RAWG whenever metadata is "
+                               "fetched (only when a RAWG API key is set).",
+                               rawg_toggle)
+
+        self.rawg_stats_lbl = QLabel("")
+        self.rawg_stats_lbl.setFont(QFont("DM Mono", 9))
+        self.rawg_stats_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._refresh_rawg_stats()
+
+        rawg_stats_row = SettingsRow(
+            "Missing Details (all games)",
+            "Games in your library still missing a description, developer, "
+            "publisher, release date or genres, from any source.")
+        rawg_stats_row.add_control(self.rawg_stats_lbl)
+        layout.addWidget(rawg_stats_row)
+
+        rawg_fill_row = SettingsRow(
+            "Fill Missing Details from RAWG",
+            "One-time catch-up: looks up each game with missing details on RAWG "
+            "(matching its title, and its platform for console games) and fills "
+            "only the empty fields. Skips a game when RAWG has no exact "
+            "title match rather than guessing.")
+        self.rawg_fill_btn = ActionButton("Fill Now")
+        self.rawg_fill_btn.clicked.connect(self._trigger_rawg_fill)
+        rawg_fill_row.add_control(self.rawg_fill_btn)
+        layout.addWidget(rawg_fill_row)
+
+        self.rawg_fill_status_lbl = QLabel("")
+        self.rawg_fill_status_lbl.setFont(QFont("DM Mono", 9))
+        self.rawg_fill_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self.rawg_fill_status_lbl.setWordWrap(True)
+        layout.addWidget(self.rawg_fill_status_lbl)
+
         layout.addSpacing(24)
         layout.addWidget(SectionHeader("Metadata Cache"))
 
@@ -2436,6 +2513,97 @@ class SettingsView(QWidget):
             f"{n} game(s) missing details" if n else "All Steam-linked games complete")
         self.steam_fill_stats_lbl.setStyleSheet(
             f"color: {COLORS['text_muted']};" if n else "color: #4ade80;")
+
+    def _refresh_rawg_stats(self):
+        """Games (any source) still missing a detail field — updated live
+        during the RAWG backfill and on page load."""
+        if not hasattr(self, "rawg_stats_lbl"):
+            return
+        try:
+            n = len(db.get_games_missing_details())
+        except Exception:
+            self.rawg_stats_lbl.setText("")
+            return
+        self.rawg_stats_lbl.setText(
+            f"{n} game(s) missing details" if n else "No games missing details")
+        self.rawg_stats_lbl.setStyleSheet(
+            f"color: {COLORS['text_muted']};" if n else "color: #4ade80;")
+
+    def _trigger_rawg_fill(self):
+        """'Fill Missing Details from RAWG' — same self-contained-QThread
+        shape as the Steam/trailer backfills. ~2 RAWG requests per game
+        (search + detail), 0.3s apart; stops early on a rejected key."""
+        from PyQt6.QtCore import QThread, pyqtSignal as _Signal
+
+        key = db.get_setting("rawg_api_key", "").strip()
+        if not key:
+            self.rawg_fill_status_lbl.setText(
+                "Add your RAWG API key first (Settings \u2192 API Keys \u2192 RAWG).")
+            return
+
+        class _Worker(QThread):
+            status = _Signal(str)
+            found  = _Signal()
+            done   = _Signal(int, int, int, str)  # games_updated, fields, checked, error
+
+            def run(self):
+                import time as _time
+                try:
+                    import metadata as meta_mod
+                    import rawg
+                    games = db.get_games_missing_details()
+                except Exception as e:
+                    self.done.emit(0, 0, 0, str(e))
+                    return
+                total = len(games)
+                games_updated = fields_filled = checked = 0
+                for i, g in enumerate(games):
+                    title = _safe_get(g, "title") or ""
+                    self.status.emit(f"Looking up\u2026 {i + 1}/{total} \u2014 {title}")
+                    try:
+                        filled = meta_mod.fill_missing_from_rawg(
+                            g["id"], title, _safe_get(g, "category"), key)
+                    except rawg.RawgAuthError as e:
+                        self.done.emit(games_updated, fields_filled, checked, str(e))
+                        return
+                    checked += 1
+                    if filled:
+                        games_updated += 1
+                        fields_filled += len(filled)
+                        self.found.emit()
+                    _time.sleep(0.3)
+                self.done.emit(games_updated, fields_filled, checked, "")
+
+        self.rawg_fill_btn.setEnabled(False)
+        self.rawg_fill_btn.setText("Working\u2026")
+        self.rawg_fill_status_lbl.setText("Starting\u2026")
+        self.rawg_fill_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self._rawg_fill_worker = _Worker()
+        self._rawg_fill_worker.status.connect(self.rawg_fill_status_lbl.setText)
+        self._rawg_fill_worker.found.connect(self._refresh_rawg_stats)
+        self._rawg_fill_worker.done.connect(self._on_rawg_fill_done)
+        self._rawg_fill_worker.start()
+
+    def _on_rawg_fill_done(self, games_updated: int, fields_filled: int,
+                           checked: int, error: str):
+        self.rawg_fill_btn.setEnabled(True)
+        self.rawg_fill_btn.setText("Fill Now")
+        if error:
+            self.rawg_fill_status_lbl.setText(
+                f"\u2717 Stopped after {checked} game(s): {error}")
+            self.rawg_fill_status_lbl.setStyleSheet("color: #f87171;")
+        elif checked == 0:
+            self.rawg_fill_status_lbl.setText("Nothing to do \u2014 no game is missing details.")
+        elif games_updated:
+            self.rawg_fill_status_lbl.setText(
+                f"\u2713 Done \u2014 filled {fields_filled} field(s) across "
+                f"{games_updated} of {checked} game(s) checked.")
+            self.rawg_fill_status_lbl.setStyleSheet("color: #4ade80;")
+        else:
+            self.rawg_fill_status_lbl.setText(
+                f"Done \u2014 checked {checked} game(s); RAWG had no exact title match "
+                "or nothing new to add.")
+        self._refresh_rawg_stats()
 
     def _trigger_steam_fill(self):
         """'Fill Missing Details from Steam' — same self-contained-QThread

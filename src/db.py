@@ -391,6 +391,11 @@ def _init_default_settings():
         # this same setting.
         "trailer_auto_fetch":           "true",
         "steam_store_auto_fill":        "true",
+        # More metadata sources — see rawg.py / gamematch.py. rawg_api_key is
+        # a free key from rawg.io; RAWG only runs when one is set.
+        "rawg_api_key":                 "",
+        "rawg_auto_fill":               "true",
+        "igdb_platform_filter":         "true",
     }
     with get_connection() as conn:
         for key, value in defaults.items():
@@ -753,6 +758,29 @@ def get_games_missing_steam_details() -> list:
             FROM games g
             JOIN metadata m ON m.game_id = g.id
             WHERE m.steam_app_id IS NOT NULL AND m.steam_app_id != 0
+              AND (   m.description  IS NULL OR TRIM(m.description)  = ''
+                   OR m.developer    IS NULL OR TRIM(m.developer)    = ''
+                   OR m.publisher    IS NULL OR TRIM(m.publisher)    = ''
+                   OR m.release_date IS NULL OR TRIM(m.release_date) = ''
+                   OR m.genres       IS NULL OR TRIM(m.genres) IN ('', '[]'))
+        """).fetchall()
+
+
+def get_games_missing_details() -> list:
+    """
+    EVERY game (Steam-linked or not) still missing at least one of
+    description / developer / publisher / release date / genres — the
+    candidates for the RAWG "Fill Now" backfill. Includes category so the
+    lookup can match on the game's platform.
+    """
+    with get_connection() as conn:
+        return conn.execute("""
+            SELECT g.id, g.category,
+                   COALESCE(m.title, g.display_name, g.folder_name) AS title,
+                   g.folder_name, m.steam_app_id
+            FROM games g
+            LEFT JOIN metadata m ON m.game_id = g.id
+            WHERE m.game_id IS NOT NULL
               AND (   m.description  IS NULL OR TRIM(m.description)  = ''
                    OR m.developer    IS NULL OR TRIM(m.developer)    = ''
                    OR m.publisher    IS NULL OR TRIM(m.publisher)    = ''

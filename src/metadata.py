@@ -416,7 +416,35 @@ def _igdb_token(client_id: str, client_secret: str) -> Optional[str]:
     return None
 
 
-def igdb_search(name: str, client_id: str, client_secret: str) -> Optional[dict]:
+def _igdb_query(name: str, headers: dict, platform_id: Optional[int]) -> list:
+    safe = (name or "").replace("\\", " ").replace('"', " ")
+    where = f"where platforms = ({platform_id}); " if platform_id else ""
+    query = (
+        f'search "{safe}"; '
+        f'fields name,summary,first_release_date,involved_companies.company.name,'
+        f'involved_companies.developer,involved_companies.publisher,'
+        f'genres.name,screenshots.url,external_games.uid,external_games.category; '
+        f'{where}limit 5;'
+    )
+    resp = SESSION.post(f"{IGDB_BASE}/games", headers=headers,
+                        data=query, timeout=15)
+    resp.raise_for_status()
+    results = resp.json()
+    resp.close()
+    return results or []
+
+
+def igdb_search(name: str, client_id: str, client_secret: str,
+                platform_id: Optional[int] = None) -> Optional[dict]:
+    """
+    platform_id: IGDB platform id (see gamematch.igdb_platform_id()) — when
+    given, the search is restricted to that platform first (so a PS2 game
+    doesn't match its PC port or a different release), falling back to an
+    unfiltered search if that finds nothing, so a wrong/unknown platform id
+    can never make a game that used to match stop matching.
+    Among up to 5 results an exact normalised-title match wins; otherwise the
+    top-ranked result is used, same as before.
+    """
     token = _igdb_token(client_id, client_secret)
     if not token:
         return None
@@ -425,21 +453,18 @@ def igdb_search(name: str, client_id: str, client_secret: str) -> Optional[dict]
         "Authorization": f"Bearer {token}",
         "Content-Type": "text/plain",
     }
-    query = (
-        f'search "{name}"; '
-        f'fields name,summary,first_release_date,involved_companies.company.name,'
-        f'involved_companies.developer,involved_companies.publisher,'
-        f'genres.name,screenshots.url,external_games.uid,external_games.category; limit 1;'
-    )
     try:
-        resp = SESSION.post(f"{IGDB_BASE}/games", headers=headers,
-                            data=query, timeout=15)
-        resp.raise_for_status()
-        results = resp.json()
-        resp.close()
+        results = []
+        if platform_id:
+            results = _igdb_query(name, headers, platform_id)
+        if not results:
+            results = _igdb_query(name, headers, None)
         if not results:
             return None
-        game = results[0]
+        import gamematch
+        want = gamematch.norm_title(name)
+        game = next((r for r in results
+                     if gamematch.norm_title(r.get("name")) == want), results[0])
         developer = publisher = None
         for ic in game.get("involved_companies", []):
             cname = ic.get("company", {}).get("name", "")
@@ -556,7 +581,15 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
 
     # ── IGDB ──────────────────────────────────────────────────────────────────
     if igdb_id_key and igdb_secret:
-        igdb_data = igdb_search(search_name, igdb_id_key, igdb_secret)
+        _platform_id = None
+        try:
+            if db.get_setting("igdb_platform_filter", "true") == "true":
+                import gamematch
+                _platform_id = gamematch.igdb_platform_id(
+                    game["category"] if "category" in game.keys() else None)
+        except Exception as e:
+            log.debug("IGDB platform lookup failed: %s", e)
+        igdb_data = igdb_search(search_name, igdb_id_key, igdb_secret, _platform_id)
         if igdb_data:
             for k, v in igdb_data.items():
                 if v is not None and k not in ("cover_url", "hero_url", "logo_url"):
@@ -585,6 +618,21 @@ def fetch_metadata_for_game(game_id: int, sgdb_key: str, igdb_id_key: str,
                          ", ".join(_filled), search_name)
         except Exception as e:
             log.warning("Steam store fill failed for '%s': %s", search_name, e)
+
+    # ── RAWG (fills remaining gaps, only if a key is configured) ──────────────
+    # Runs last, after IGDB and Steam, and — like Steam — only fills fields
+    # that are still empty. No key / toggle off = no network call at all.
+    _rawg_key = db.get_setting("rawg_api_key", "").strip()
+    if _rawg_key and db.get_setting("rawg_auto_fill", "true") == "true":
+        try:
+            import rawg
+            _cat = game["category"] if "category" in game.keys() else None
+            _filled = rawg.fill_gaps(
+                metadata, metadata.get("title") or search_name, _rawg_key, _cat)
+            if _filled:
+                log.info("RAWG filled %s for '%s'", ", ".join(_filled), search_name)
+        except Exception as e:      # incl. RawgAuthError — never block a scan
+            log.warning("RAWG fill failed for '%s': %s", search_name, e)
 
     if not metadata:
         return False
@@ -716,6 +764,33 @@ def fill_missing_from_steam(game_id: int, steam_app_id: int) -> list:
     except Exception as e:
         log.warning("Steam store backfill failed for game %s: %s", game_id, e)
         return []
+
+
+def fill_missing_from_rawg(game_id: int, title: str, category: Optional[str],
+                           api_key: str) -> list:
+    """
+    Backfill for ONE already-scanned game from RAWG: writes only the columns
+    that are currently empty (db.fill_metadata_gaps()). Returns the columns
+    filled ([] if no confident match / nothing new). Lets rawg.RawgAuthError
+    propagate so a batch can stop on a bad key; swallows everything else.
+    """
+    import rawg
+    try:
+        fields = rawg.fetch_fields(title, api_key, category)
+    except rawg.RawgAuthError:
+        raise
+    except Exception as e:
+        log.warning("RAWG backfill failed for game %s: %s", game_id, e)
+        return []
+    if not fields:
+        return []
+    filled = db.fill_metadata_gaps(game_id, fields)
+    if "genres" in filled:
+        try:
+            sync_tags_from_genres(game_id, fields.get("genres") or [])
+        except Exception as e:
+            log.debug("tag sync after RAWG fill failed for %d: %s", game_id, e)
+    return filled
 
 
 def fetch_all_missing(progress_callback=None, game_done_callback=None) -> int:

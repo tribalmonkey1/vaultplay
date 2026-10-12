@@ -973,6 +973,18 @@ class GameDetailView(QWidget):
         self.desc_label.setStyleSheet(f"color: {COLORS['text_dim']}; line-height: 1.7;")
         self.desc_label.setWordWrap(True)
         self.left_layout.addWidget(self.desc_label)
+        # RAWG's free-tier terms require an active link back to RAWG wherever
+        # its data is shown. Only visible when a RAWG key is configured and
+        # auto-fill is on (i.e. when RAWG data could be on the page).
+        self.rawg_credit = QLabel(
+            '<a href="https://rawg.io" style="color: inherit;">'
+            'Some game details provided by RAWG</a>')
+        self.rawg_credit.setFont(QFont("DM Sans", 9))
+        self.rawg_credit.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self.rawg_credit.setOpenExternalLinks(True)
+        self.rawg_credit.setContentsMargins(0, 6, 0, 0)
+        self.rawg_credit.hide()
+        self.left_layout.addWidget(self.rawg_credit)
         self.left_layout.addSpacing(24)
         self.left_layout.addStretch()
 
@@ -1410,6 +1422,12 @@ class GameDetailView(QWidget):
         self.install_card.setVisible(is_game)
         self._about_title.setVisible(is_game)
         self.desc_label.setVisible(is_game)
+        try:
+            _rawg_on = bool(db.get_setting("rawg_api_key", "").strip()) and \
+                db.get_setting("rawg_auto_fill", "true") == "true"
+        except Exception:
+            _rawg_on = False
+        self.rawg_credit.setVisible(is_game and _rawg_on)
         self._screenshots_title.setVisible(is_game)
 
         if not is_game:
