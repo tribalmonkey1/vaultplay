@@ -701,6 +701,15 @@ class WishlistView(QWidget):
         painter.drawLine(x, y, x, y + self._tile_h)
         painter.end()
 
+    # ── Controller Support ────────────────────────────────────────────────
+
+    def controller_scroll(self, delta: int):
+        """Right-stick scroll (see controller.py). The Wishlist grid has
+        no D-pad focus support yet (not part of Phase A/B), but scrolling
+        it with the stick works the same as every other page."""
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.value() + delta)
+
     # ── Resize ────────────────────────────────────────────────────────────
 
     def resizeEvent(self, event):

@@ -766,9 +766,18 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
 
 # ── Executable finders ────────────────────────────────────────────────────────
 
+# Matches setup/install/autorun/autoplay anywhere in the filename (e.g.
+# "Gw2Setup-64.exe", "setup.exe", "install_game.exe"), but never uninstallers
+# or DirectX/redistributable setups (unins*, dxsetup*, *redist*).
 INSTALLER_RE = re.compile(
-    r"(^|[\\/])(setup|install|installer|autorun|autoplay)[^\\/]*\.exe$",
+    r"(?:^|[\\/])(?![^\\/]*(?:unins|dxsetup|redist))"
+    r"[^\\/]*(?:setup|install|autorun|autoplay)[^\\/]*\.exe$",
     re.IGNORECASE
+)
+
+# Folders never worth searching for the primary installer.
+_INSTALLER_SKIP_DIR_RE = re.compile(
+    r"(redist|directx|dotnet|prereq|physx)", re.IGNORECASE
 )
 SKIP_EXE_RE = re.compile(
     r"(setup|install|unins|uninstall|crash|report|redist|vcredist"
@@ -779,11 +788,27 @@ SKIP_EXE_RE = re.compile(
 
 
 def find_installer_exe(search_root: Path) -> Optional[Path]:
-    for root, dirs, files in os.walk(search_root):
-        for f in files:
-            if INSTALLER_RE.search(f):
-                return Path(root) / f
-    return None
+    """
+    Find the primary installer exe under search_root. Collects every match
+    (skipping redist/DirectX/.NET folders) and returns the SHALLOWEST one,
+    so a bundled redistributable setup can't beat the real installer.
+    Falls back to searching everything if the pruned search finds nothing.
+    """
+    def _search(prune: bool) -> list:
+        found = []
+        for root, dirs, files in os.walk(search_root):
+            if prune:
+                dirs[:] = [d for d in dirs if not _INSTALLER_SKIP_DIR_RE.search(d)]
+            for f in files:
+                if INSTALLER_RE.search(f):
+                    found.append(Path(root) / f)
+        return found
+
+    candidates = _search(prune=True) or _search(prune=False)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (len(p.parts), p.name.lower()))
+    return candidates[0]
 
 
 def find_game_exe(search_root: Path) -> Optional[Path]:
@@ -1462,7 +1487,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             if not exe_path:
                 try:
                     mounts = _discover_mount_points()
-                    for _, mount_path in mounts.items():
+                    for mount_path in mounts:
                         found = find_game_exe(mount_path)
                         if found:
                             exe_path = found
@@ -1597,7 +1622,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             if not exe_path:
                 try:
                     mounts = _discover_mount_points()
-                    for _, mount_path in mounts.items():
+                    for mount_path in mounts:
                         found = find_game_exe(mount_path)
                         if found:
                             exe_path = found

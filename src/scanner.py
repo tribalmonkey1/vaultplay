@@ -44,8 +44,13 @@ SKIP_FOLDER_RE = re.compile(
     re.IGNORECASE
 )
 
+# Keywords may appear anywhere in the filename (e.g. "Gw2Setup-64.exe");
+# "start*.exe" is still only matched at the START of the name. Uninstallers
+# and DirectX/redist setups are excluded so portable games that bundle them
+# aren't misclassified as 'installer'.
 INSTALLER_RE = re.compile(
-    r"(^|[\\/])(setup|install|installer|autorun|autoplay|start)[^\\/]*\.exe$",
+    r"(?:^|[\\/])(?![^\\/]*(?:unins|dxsetup|redist))"
+    r"(?:[^\\/]*(?:setup|install|autorun|autoplay)|start)[^\\/]*\.exe$",
     re.IGNORECASE
 )
 ISO_RE       = re.compile(r"\.iso$", re.IGNORECASE)

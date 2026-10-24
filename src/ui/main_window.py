@@ -34,7 +34,8 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QSizePolicy,
-    QFrame, QApplication, QMessageBox, QLineEdit, QAbstractButton, QDialog
+    QFrame, QApplication, QMessageBox, QLineEdit, QAbstractButton, QDialog,
+    QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QThread, QThreadPool, QTimer, pyqtSignal, QSize, QPoint, QEvent
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QColor, QKeyEvent
@@ -230,6 +231,39 @@ class UpdateCheckWorker(QThread):
 
 
 # ── Currently Playing Indicator (sidebar widget) ──────────────────────────────
+
+class ControllerHintBar(QWidget):
+    """
+    Slim, always-the-same button legend pinned to the bottom of the
+    window, shown only while a controller is connected and controller
+    support is enabled — a glanceable reminder of what each button does,
+    visible no matter which page is showing. The full reference table
+    lives on Settings → Controller; this is just the quick-glance version.
+    Shown/hidden by MainWindow — see _on_ctrl_connected()/
+    _on_ctrl_disconnected()/_stop_controller().
+    """
+    _HINTS = [
+        ("A", "Select"), ("B", "Back"), ("Y", "Menu"),
+        ("LB / RB", "Sidebar / Content"), ("Right Stick", "Scroll"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(28)
+        self.setStyleSheet(
+            f"background: {COLORS['surface']}; border-top: 1px solid {COLORS['border']};")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(18)
+        for button, action in self._HINTS:
+            chip = QLabel(f"{button}  {action}")
+            chip.setFont(QFont("DM Mono", 9))
+            chip.setStyleSheet(
+                f"color: {COLORS['text_muted']}; background: transparent; border: none;")
+            layout.addWidget(chip)
+        layout.addStretch()
+        self.hide()
+
 
 class PlayingIndicator(QWidget):
     """
@@ -1204,7 +1238,12 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        row = QWidget()
+        root_layout = QHBoxLayout(row)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
@@ -1227,6 +1266,15 @@ class MainWindow(QMainWindow):
         # Content stack
         self.stack = QStackedWidget()
         root_layout.addWidget(self.stack, 1)
+
+        outer_layout.addWidget(row, 1)
+
+        # Controller Support — slim bottom legend, shown only while a
+        # controller is connected (see _on_ctrl_connected/_on_ctrl_disconnected
+        # below). Spans the full window width, so it lives in outer_layout
+        # below `row` rather than inside root_layout alongside the sidebar.
+        self.controller_hint_bar = ControllerHintBar()
+        outer_layout.addWidget(self.controller_hint_bar)
 
         # Views
         self.library_view = LibraryView()
@@ -1271,6 +1319,10 @@ class MainWindow(QMainWindow):
         self.settings_view.nas_path_changed.connect(self._on_nas_path_changed)
         self.settings_view.rescan_requested.connect(self._on_rescan_requested)
         self.settings_view.reload_requested.connect(self._load_library)
+        # Controller Support (Phase B) — live-updates Settings' "Detected
+        # Controller" status label on connect/disconnect.
+        self.controller_status_changed.connect(
+            self.settings_view._on_controller_status_changed)
 
         self.wishlist_view = WishlistView()
         self.wishlist_view.back_requested.connect(self._show_library)
@@ -2675,6 +2727,7 @@ class MainWindow(QMainWindow):
         w.context_menu.connect(self._on_ctrl_context_menu)
         w.page_prev.connect(self._on_ctrl_page_prev)
         w.page_next.connect(self._on_ctrl_page_next)
+        w.scroll.connect(self._on_ctrl_scroll)
         w.open_settings.connect(self._on_ctrl_open_settings)
         w.focus_search.connect(self._on_ctrl_focus_search)
         w.controller_connected.connect(self._on_ctrl_connected)
@@ -2691,6 +2744,7 @@ class MainWindow(QMainWindow):
         w.stop()
         w.deleteLater()
         self._ctrl_set_zone(None)
+        self.controller_hint_bar.hide()
         if self._controller_name:
             self._controller_name = ""
             self.controller_status_changed.emit("")
@@ -2710,16 +2764,37 @@ class MainWindow(QMainWindow):
     def _on_ctrl_open_settings(self):        self._on_ctrl_action("open_settings")
     def _on_ctrl_focus_search(self):         self._on_ctrl_action("focus_search")
 
+    def _on_ctrl_scroll(self, delta: int):
+        """Right stick — scrolls whatever page is currently showing,
+        independent of the D-pad/sidebar zone model above (no "zone"
+        gating here: the stick should scroll the visible page regardless
+        of whether focus is currently on the sidebar or the content)."""
+        if not self.isActiveWindow():
+            return
+        target = self._ctrl_scroll_target()
+        if target is not None and hasattr(target, "controller_scroll"):
+            target.controller_scroll(delta)
+
+    def _ctrl_scroll_target(self):
+        """Like _ctrl_content_widget(), but also includes the Wishlist
+        page — scrolling only needs a QScrollArea to nudge, not the full
+        D-pad focus API the Wishlist grid doesn't have yet."""
+        return {0: self.library_view, 1: self.detail_view,
+                2: self.settings_view, 3: self.wishlist_view
+                }.get(self.stack.currentIndex())
+
     def _on_ctrl_connected(self, name: str):
         self._controller_name = name
         log.info("[CONTROLLER] Connected: %s", name)
         self.library_view.show_status(f"🎮 Controller connected: {name}", timeout=3000)
+        self.controller_hint_bar.show()
         self.controller_status_changed.emit(name)
 
     def _on_ctrl_disconnected(self):
         self._controller_name = ""
         log.info("[CONTROLLER] Disconnected")
         self._ctrl_set_zone(None)
+        self.controller_hint_bar.hide()
         self.library_view.show_status("🎮 Controller disconnected", timeout=3000)
         self.controller_status_changed.emit("")
 
@@ -2757,7 +2832,8 @@ class MainWindow(QMainWindow):
             self._ctrl_set_zone("sidebar")
             return
         if action == "page_next":
-            if self.stack.currentIndex() == 0 and self.library_view.controller_has_targets():
+            cw = self._ctrl_content_widget()
+            if cw is not None and cw.controller_has_targets():
                 self._ctrl_set_zone("content")
             return
 
@@ -2767,27 +2843,43 @@ class MainWindow(QMainWindow):
             self._ctrl_wake()
             return
 
-        on_library = self.stack.currentIndex() == 0
         if action == "direction":
             if self._ctrl_zone == "sidebar":
                 self.sidebar.controller_move(arg)
-            elif on_library:
-                self.library_view.controller_move(arg)
+            else:
+                cw = self._ctrl_content_widget()
+                if cw is not None:
+                    cw.controller_move(arg)
         elif action == "activate":
             if self._ctrl_zone == "sidebar":
                 self.sidebar.controller_activate()
-            elif on_library:
-                self.library_view.controller_activate()
+            else:
+                cw = self._ctrl_content_widget()
+                if cw is not None:
+                    cw.controller_activate()
         elif action == "context_menu":
-            if self._ctrl_zone == "content" and on_library:
+            if self._ctrl_zone == "content" and self.stack.currentIndex() == 0:
                 self.library_view.controller_context_menu()
+
+    def _ctrl_content_widget(self):
+        """The current stack page's controller_* target, or None for a
+        page with no Phase A/B support (the Wishlist grid isn't gamepad-
+        navigable yet)."""
+        idx = self.stack.currentIndex()
+        if idx == 0:
+            return self.library_view
+        if idx == 1:
+            return self.detail_view
+        if idx == 2:
+            return self.settings_view
+        return None
 
     def _ctrl_wake(self):
         fw = QApplication.focusWidget()
         if isinstance(fw, QLineEdit):
             fw.clearFocus()   # e.g. leaving the search box after Select
-        on_library = self.stack.currentIndex() == 0
-        if on_library and self.library_view.controller_has_targets():
+        cw = self._ctrl_content_widget()
+        if cw is not None and cw.controller_has_targets():
             self._ctrl_set_zone("content")
         else:
             self._ctrl_set_zone("sidebar")
@@ -2798,18 +2890,36 @@ class MainWindow(QMainWindow):
             self.sidebar.controller_focus_default()
         else:
             self.sidebar.controller_set_focus_visible(False)
+        # Only ever touch the widget matching the PAGE ACTUALLY SHOWING —
+        # not every content widget indiscriminately. A page that was never
+        # loaded this session (e.g. the detail view, before any game has
+        # been opened) can have incomplete internal state, and calling
+        # into it anyway was the root cause of a real crash (pressing LB
+        # on the Settings page with the detail page never having been
+        # visited — see game_detail.py's completion_combo guard).
+        cw = self._ctrl_content_widget()
+        if cw is None:
+            return
         if zone == "content":
-            if self.stack.currentIndex() == 0:
-                self.library_view.controller_focus_default()
+            cw.controller_focus_default()
         else:
-            self.library_view.set_controller_focus_visible(False)
+            cw.set_controller_focus_visible(False)
 
     def _ctrl_back(self):
         idx = self.stack.currentIndex()
         if idx == 1:
             self._on_detail_back()
             return
-        if idx in (2, 3):
+        if idx == 2:
+            # Settings has its own two-level focus (nav list, then a
+            # page's own controls) — B should step back OUT of a page's
+            # controls to the nav list first, only actually leaving
+            # Settings once focus was already on the nav list.
+            if self.settings_view.controller_back():
+                return
+            self._show_library()
+            return
+        if idx == 3:
             self._show_library()
             return
         fw = QApplication.focusWidget()
@@ -2833,9 +2943,19 @@ class MainWindow(QMainWindow):
             key = Qt.Key.Key_Escape
         if key is None:
             return
+        # A combo box's dropdown is a container frame wrapping a list
+        # view; real key presses land on that view (via the popup's focus
+        # widget), not on the frame itself — sending them to the frame
+        # opens the popup fine but never moves or confirms anything. A
+        # QMenu/plain popup has no item view inside it and just gets the
+        # keys directly; a QCompleter popup IS the view, so findChild()
+        # (which excludes self) correctly falls through to `popup`.
+        target = (popup.focusWidget()
+                  or popup.findChild(QAbstractItemView)
+                  or popup)
         for etype in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             QApplication.sendEvent(
-                popup, QKeyEvent(etype, key, Qt.KeyboardModifier.NoModifier))
+                target, QKeyEvent(etype, key, Qt.KeyboardModifier.NoModifier))
 
     def _ctrl_drive_modal(self, modal, action: str, arg):
         """Minimal modal-dialog support: B closes, D-pad moves focus, A

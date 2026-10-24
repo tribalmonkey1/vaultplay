@@ -66,6 +66,14 @@ REPEAT_INITIAL_DELAY = 0.400   # seconds held before repeating starts
 REPEAT_INTERVAL      = 0.150   # seconds between repeats
 POLL_INTERVAL        = 0.016   # ~60Hz
 
+# Right-stick scrolling — independent of the left-stick/D-pad discrete
+# navigation above. Continuous/analog: emits every tick the stick is held
+# past the deadzone, no initial-delay/repeat-rate split, scaled by how far
+# the stick is pushed so a light nudge scrolls slowly and a full push
+# scrolls fast.
+RIGHT_STICK_DEADZONE   = 8000
+SCROLL_MAX_PX_PER_TICK = 22
+
 
 def is_available() -> bool:
     """True if pysdl2 imported. (libSDL2 problems surface in run(), which
@@ -80,6 +88,9 @@ class ControllerWatcher(QThread):
     context_menu            = pyqtSignal()
     page_prev               = pyqtSignal()
     page_next               = pyqtSignal()
+    # Right stick — scrolls whatever page is currently showing. Positive
+    # delta = scroll down (stick pushed down), negative = scroll up.
+    scroll                   = pyqtSignal(int)
     open_settings           = pyqtSignal()
     focus_search            = pyqtSignal()
     controller_connected    = pyqtSignal(str)
@@ -143,6 +154,7 @@ class ControllerWatcher(QThread):
             while sdl2.SDL_PollEvent(ctypes.byref(event)):
                 self._handle_event(event)
             self._update_direction()
+            self._update_scroll()
             time.sleep(POLL_INTERVAL)
 
     def _handle_event(self, event):
@@ -264,3 +276,17 @@ class ControllerWatcher(QThread):
         elif current is not None and now >= self._next_repeat:
             self.direction.emit(current)
             self._next_repeat = now + REPEAT_INTERVAL
+
+    def _update_scroll(self):
+        entry = self._controllers.get(self._active_id) if self._active_id is not None else None
+        if not entry:
+            return
+        y = sdl2.SDL_GameControllerGetAxis(
+            entry[0], sdl2.SDL_CONTROLLER_AXIS_RIGHTY)
+        if abs(y) < RIGHT_STICK_DEADZONE:
+            return
+        sign = 1 if y > 0 else -1
+        magnitude = (abs(y) - RIGHT_STICK_DEADZONE) / (32767 - RIGHT_STICK_DEADZONE)
+        delta = int(sign * magnitude * SCROLL_MAX_PX_PER_TICK)
+        if delta:
+            self.scroll.emit(delta)

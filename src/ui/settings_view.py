@@ -29,9 +29,10 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QLineEdit, QComboBox, QStackedWidget, QScrollArea,
-    QFileDialog, QSizePolicy, QCheckBox
+    QFileDialog, QSizePolicy, QCheckBox, QAbstractButton, QApplication,
+    QGridLayout
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QFont, QColor
 
 import json
@@ -138,6 +139,10 @@ class SettingsToggle(QWidget):
         self.setFixedSize(44, 24)
         self._checked = checked
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Controller Support — opt into Qt's native focus/tab chain. A
+        # plain QWidget defaults to NoFocus, which would make this toggle
+        # invisible to focusNextChild()/focusPreviousChild() traversal.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._update()
 
     def _update(self):
@@ -160,12 +165,29 @@ class SettingsToggle(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         x = 23 if self._checked else 3
         p.drawEllipse(x, 3, 18, 18)
+        # Controller Support — this widget fully self-paints (no QStyle
+        # involvement), so the app-wide QPushButton/QComboBox :focus CSS
+        # rule in style.py has nothing to attach to here; draw the ring
+        # directly instead, keyed off Qt's own native hasFocus().
+        if self.hasFocus():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(COLORS["accent"]), 2))
+            p.drawRoundedRect(1, 1, 42, 22, 12, 12)
         p.end()
 
-    def mousePressEvent(self, event):
+    def toggle(self):
         self._checked = not self._checked
         self._update()
         self.changed.emit(self._checked)
+
+    def mousePressEvent(self, event):
+        self.toggle()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.toggle()
+        else:
+            super().keyPressEvent(event)
 
     @property
     def checked(self) -> bool:
@@ -442,6 +464,15 @@ class SettingsView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._widgets = {}   # key → widget for reading values
+        # Controller Support (Phase B) — the ring always tracks the active
+        # nav page (self._current_page), so there's no separate focus index
+        # to keep in sync; _show_page() is the one place that paints it.
+        self._ctrl_focus_visible = False
+        # Controller Support — two focus levels: the nav list itself, and
+        # (once the user dives in with "right") the current page's own
+        # controls, navigated via Qt's native focus chain. See
+        # controller_move()/_focus_first_in_page() below.
+        self._ctrl_in_content = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -491,6 +522,7 @@ class SettingsView(QWidget):
             ("🎨  Appearance",     self._build_appearance_page),
             ("🔄  Scan & Cache",   self._build_scan_page),
             ("🔔  Version Tracking", self._build_version_tracking_page),
+            ("🎮  Controller",      self._build_controller_page),
             ("ℹ  About",           self._build_about_page),
         ]
 
@@ -584,20 +616,33 @@ class SettingsView(QWidget):
         if hasattr(self, "update_last_checked_lbl"):
             self._refresh_update_status_from_settings()
 
+        # Refresh Controller status (connect/disconnect may have happened
+        # while this page wasn't the one showing)
+        self._refresh_controller_status()
+
     def show_about(self):
         """Jump directly to the About page — used when an app_update
         notification is clicked (see main_window._on_notification_navigate)."""
         self._show_page(self._about_page_index)
 
     def _show_page(self, idx: int):
+        if idx != self._current_page:
+            # Controller Support — a focused control from the PREVIOUS
+            # page is meaningless (and may soon be hidden/destroyed) once
+            # we've actually switched pages; a same-page call (used just
+            # to repaint the nav ring after diving in/out of content)
+            # must NOT reset this.
+            self._ctrl_in_content = False
         self._current_page = idx
         self._pages_stack.setCurrentIndex(idx)
         for i, btn in enumerate(self._nav_items):
-            btn.setStyleSheet(self._nav_style(i == idx))
+            nav_focused = (self._ctrl_focus_visible
+                          and not self._ctrl_in_content and i == idx)
+            btn.setStyleSheet(self._nav_style(i == idx, focused=nav_focused))
 
-    def _nav_style(self, active: bool) -> str:
+    def _nav_style(self, active: bool, focused: bool = False) -> str:
         if active:
-            return f"""
+            base = f"""
                 QPushButton {{
                     background: rgba(232,199,106,0.05);
                     border: none;
@@ -608,20 +653,27 @@ class SettingsView(QWidget):
                     font-weight: 500;
                 }}
             """
-        return f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                border-left: 2px solid transparent;
-                color: {COLORS['text_muted']};
-                padding: 10px 20px;
-                text-align: left;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['surface2']};
-                color: {COLORS['text']};
-            }}
-        """
+        else:
+            base = f"""
+                QPushButton {{
+                    background: transparent;
+                    border: none;
+                    border-left: 2px solid transparent;
+                    color: {COLORS['text_muted']};
+                    padding: 10px 20px;
+                    text-align: left;
+                }}
+                QPushButton:hover {{
+                    background: {COLORS['surface2']};
+                    color: {COLORS['text']};
+                }}
+            """
+        if focused:
+            # Controller Support (Phase B) — overlaid last so it wins the
+            # cascade; a full border reads clearly as "focused" without
+            # needing to preserve the active row's border-left-only look.
+            base += f"QPushButton {{ border: 2px solid {COLORS['accent']}; }}"
+        return base
 
     def _scrollable_page(self, title: str) -> tuple[QScrollArea, QVBoxLayout]:
         scroll = QScrollArea()
@@ -3662,3 +3714,302 @@ class SettingsView(QWidget):
         app = QApplication.instance()
         if app:
             app.quit()
+
+    # ── Controller ────────────────────────────────────────────────────────
+
+    _CONTROLLER_BUTTON_MAP = [
+        ("D-pad / Left Stick", "Move between items"),
+        ("A", "Select / confirm"),
+        ("B", "Back / cancel"),
+        ("Y", "Open a tile's right-click menu"),
+        ("LB", "Jump to the sidebar"),
+        ("RB", "Jump to the main content (or into a settings page's own controls)"),
+        ("Right Stick", "Scroll the current page"),
+        ("Start", "Open Settings"),
+        ("Back / Select", "Jump to search"),
+    ]
+
+    def _build_controller_page(self) -> QScrollArea:
+        scroll, layout = self._scrollable_page("Controller")
+        layout.addWidget(SectionHeader("Gamepad Navigation"))
+
+        explain = QLabel(
+            "Navigate the library, sidebar, and this settings page with a "
+            "connected gamepad. Uses SDL2's gamecontroller mappings, so "
+            "most Xbox, PlayStation, and Switch Pro controllers work "
+            "without extra setup."
+        )
+        explain.setFont(QFont("DM Sans", 11))
+        explain.setStyleSheet(f"color: {COLORS['text_muted']}; padding-bottom: 8px;")
+        explain.setWordWrap(True)
+        layout.addWidget(explain)
+
+        # Button reference table
+        table = QWidget()
+        table.setStyleSheet("background: transparent;")
+        grid = QGridLayout(table)
+        grid.setContentsMargins(0, 4, 0, 12)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(6)
+        for row, (button, action) in enumerate(self._CONTROLLER_BUTTON_MAP):
+            btn_lbl = QLabel(button)
+            btn_lbl.setFont(QFont("DM Mono", 10, QFont.Weight.DemiBold))
+            btn_lbl.setStyleSheet(f"color: {COLORS['accent']}; background: transparent;")
+            btn_lbl.setFixedWidth(150)
+            grid.addWidget(btn_lbl, row, 0, Qt.AlignmentFlag.AlignTop)
+
+            action_lbl = QLabel(action)
+            action_lbl.setFont(QFont("DM Sans", 10))
+            action_lbl.setStyleSheet(f"color: {COLORS['text_dim']}; background: transparent;")
+            action_lbl.setWordWrap(True)
+            grid.addWidget(action_lbl, row, 1)
+        layout.addWidget(table)
+
+        enabled = db.get_setting("controller_enabled", "true") == "true"
+        ctrl_toggle = SettingsToggle(enabled)
+
+        def _on_toggle(v):
+            self._save("controller_enabled", "true" if v else "false")
+            try:
+                main_win = self.window()
+                if hasattr(main_win, "_apply_controller_setting"):
+                    main_win._apply_controller_setting()
+            except Exception:
+                pass
+            self._refresh_controller_status()
+
+        ctrl_toggle.changed.connect(_on_toggle)
+        self._make_setting_row(layout, "controller_enabled",
+                               "Enable Controller Support",
+                               "Turn off to stop VaultPlay from reading gamepad "
+                               "input entirely.",
+                               ctrl_toggle)
+
+        status_row = SettingsRow(
+            "Detected Controller",
+            "Updates automatically when a controller connects or disconnects.")
+        self.controller_status_lbl = QLabel("")
+        self.controller_status_lbl.setFont(QFont("DM Mono", 9))
+        status_row.add_control(self.controller_status_lbl)
+        layout.addWidget(status_row)
+        self._refresh_controller_status()
+
+        pysdl2_note = QLabel(
+            "Requires the pysdl2 Python package plus libSDL2 itself. On "
+            "Arch, libSDL2 is the `sdl2` pacman package (you likely "
+            "already have it); pysdl2 is the separate Python binding and "
+            "isn't in the official repos, so install it with `pip install "
+            "pysdl2 --break-system-packages` (an AUR package, "
+            "python-pysdl2, also exists if you'd rather not use pip "
+            "directly). If either piece is missing, this toggle has no "
+            "effect — the app runs exactly as it does without a "
+            "controller."
+        )
+        pysdl2_note.setFont(QFont("DM Sans", 10))
+        pysdl2_note.setStyleSheet(f"color: {COLORS['text_muted']}; padding-top: 8px;")
+        pysdl2_note.setWordWrap(True)
+        layout.addWidget(pysdl2_note)
+
+        layout.addStretch()
+        return scroll
+
+    def _refresh_controller_status(self):
+        if not hasattr(self, "controller_status_lbl"):
+            return
+        name = ""
+        try:
+            main_win = self.window()
+            if hasattr(main_win, "controller_name"):
+                name = main_win.controller_name()
+        except Exception:
+            pass
+        if name:
+            self.controller_status_lbl.setText(f"● {name}")
+            self.controller_status_lbl.setStyleSheet("color: #4ade80;")
+        else:
+            self.controller_status_lbl.setText("○ Not connected")
+            self.controller_status_lbl.setStyleSheet(f"color: {COLORS['text_muted']};")
+
+    def _on_controller_status_changed(self, name: str):
+        """Connected by MainWindow to its own controller_status_changed
+        signal (see main_window.py) — live-updates the status label on
+        connect/disconnect while this page may or may not be the one
+        currently showing. No-op if the page was never built yet."""
+        self._refresh_controller_status()
+
+    # ── Controller Support (gamepad navigation) ─────────────────────────────
+    # Two focus levels. Level 1 (the default): up/down move between nav
+    # items, switching the page as focus moves — there's nothing further
+    # to confirm on A at this level. Pressing "right" DIVES into the
+    # current page's own controls (level 2): up/down walk every focusable
+    # control on that page in the order it was built (Qt's native focus
+    # chain, scoped to that page's own widgets so it can never leak focus
+    # into the sidebar or another page), and "left" (or B) steps back out
+    # to the nav list. A toggles/clicks/opens whatever's focused at level 2.
+
+    @staticmethod
+    def _is_descendant(widget, ancestor) -> bool:
+        p = widget
+        while p is not None:
+            if p is ancestor:
+                return True
+            p = p.parentWidget()
+        return False
+
+    def _current_page_container(self):
+        """The QWidget actually holding this page's controls (the inner
+        container handed to QScrollArea.setWidget() by _scrollable_page()),
+        or None if the current stack page isn't a QScrollArea built that way."""
+        page = self._pages_stack.currentWidget()
+        if isinstance(page, QScrollArea):
+            return page.widget()
+        return None
+
+    def _focusable_descendants(self, container) -> list:
+        """Every control inside `container` that can take keyboard focus,
+        sorted into VISUAL reading order (top-to-bottom, then left-to-
+        right within a row). Qt's own child order isn't reliable for that
+        on pages whose rows are rebuilt dynamically (install paths,
+        categories, tags — new rows are appended after the page's static
+        controls no matter where they sit on screen), so position is
+        measured directly instead. Controls whose vertical centers are
+        within a few pixels of each other count as the same row, so a
+        text field and its Browse button side by side stay left-to-right.
+        Explicitly scoped to `container`'s own descendants (never the
+        whole window) so this can never wander into the sidebar or
+        another page's controls."""
+        items = []
+        for w in container.findChildren(QWidget):
+            if (w.focusPolicy() != Qt.FocusPolicy.NoFocus
+                    and w.isVisibleTo(container) and w.isEnabled()):
+                pos = w.mapTo(container, QPoint(0, 0))
+                items.append((pos.y() + w.height() // 2, pos.x(), w))
+        items.sort(key=lambda t: (t[0], t[1]))
+
+        rows = []   # each: [anchor_center_y, [(x, widget), ...]]
+        for cy, x, w in items:
+            if rows and abs(cy - rows[-1][0]) <= 12:
+                rows[-1][1].append((x, w))
+            else:
+                rows.append([cy, [(x, w)]])
+        return [w for _cy, row in rows
+                for _x, w in sorted(row, key=lambda t: t[0])]
+
+    def _focus_first_in_page(self) -> bool:
+        body = self._current_page_container()
+        if body is None:
+            return False
+        cands = self._focusable_descendants(body)
+        if not cands:
+            return False
+        cands[0].setFocus(Qt.FocusReason.OtherFocusReason)
+        self._ctrl_scroll_into_view(cands[0])
+        return True
+
+    def _ctrl_scroll_into_view(self, widget):
+        page = self._pages_stack.currentWidget()
+        if isinstance(page, QScrollArea):
+            try:
+                page.ensureWidgetVisible(widget, 20, 60)
+            except Exception:
+                pass
+
+    def controller_has_targets(self) -> bool:
+        return bool(self._nav_items)
+
+    def controller_focus_default(self) -> bool:
+        if not self._nav_items:
+            return False
+        self._ctrl_focus_visible = True
+        self._ctrl_in_content = False
+        self._show_page(self._current_page)
+        return True
+
+    def controller_move(self, direction: str) -> bool:
+        if not self._ctrl_in_content:
+            if direction in ("up", "down"):
+                if not self._nav_items:
+                    return False
+                i = self._current_page + (-1 if direction == "up" else 1)
+                if not (0 <= i < len(self._nav_items)):
+                    return False
+                self._show_page(i)
+                return True
+            if direction == "right" and self._focus_first_in_page():
+                self._ctrl_in_content = True
+                self._show_page(self._current_page)   # repaint — drop the nav ring
+                return True
+            return False
+
+        # ── Level 2: inside the page's own controls ─────────────────────────
+        body = self._current_page_container()
+        fw = QApplication.focusWidget()
+        if body is None or fw is None or not self._is_descendant(fw, body):
+            # Focus drifted somewhere unexpected (e.g. the page was
+            # rebuilt out from under it) — fall back to the nav list
+            # rather than getting stuck.
+            self._ctrl_in_content = False
+            self._show_page(self._current_page)
+            return self.controller_move(direction)
+
+        if direction == "left":
+            fw.clearFocus()
+            self._ctrl_in_content = False
+            self._show_page(self._current_page)
+            return True
+
+        if direction not in ("up", "down", "right"):
+            return False
+        cands = self._focusable_descendants(body)
+        if fw not in cands:
+            return False
+        i = cands.index(fw) + (-1 if direction == "up" else 1)
+        if not (0 <= i < len(cands)):
+            return False
+        cands[i].setFocus(Qt.FocusReason.OtherFocusReason)
+        self._ctrl_scroll_into_view(cands[i])
+        return True
+
+    def controller_activate(self):
+        if not self._ctrl_in_content:
+            return   # moving focus already switched the page — nothing to confirm
+        fw = QApplication.focusWidget()
+        if fw is None:
+            return
+        if isinstance(fw, SettingsToggle):
+            fw.toggle()
+        elif isinstance(fw, QComboBox):
+            fw.showPopup()
+        elif isinstance(fw, QAbstractButton) and fw.isEnabled():
+            fw.click()
+
+    def controller_back(self) -> bool:
+        """B while focus is inside a page's own controls — step back out
+        to the nav list instead of leaving Settings entirely. Returns
+        False (unconsumed) when focus was already on the nav list, so
+        MainWindow's normal 'B leaves this page' handling applies."""
+        if not self._ctrl_in_content:
+            return False
+        fw = QApplication.focusWidget()
+        if fw is not None:
+            fw.clearFocus()
+        self._ctrl_in_content = False
+        self._show_page(self._current_page)
+        return True
+
+    def controller_scroll(self, delta: int):
+        """Right-stick scroll — applies to whichever page is current,
+        regardless of focus level."""
+        page = self._pages_stack.currentWidget()
+        if isinstance(page, QScrollArea):
+            bar = page.verticalScrollBar()
+            bar.setValue(bar.value() + delta)
+
+    def set_controller_focus_visible(self, visible: bool):
+        self._ctrl_focus_visible = visible
+        if not visible and self._ctrl_in_content:
+            fw = QApplication.focusWidget()
+            if fw is not None:
+                fw.clearFocus()
+            self._ctrl_in_content = False
+        self._show_page(self._current_page)

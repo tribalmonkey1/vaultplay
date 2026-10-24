@@ -838,6 +838,17 @@ class GameDetailView(QWidget):
         # None = no game currently running (the common case).
         self._currently_playing_game_id: int | None = None
 
+        # Controller Support (Phase B) — focus is tracked by widget
+        # reference, not index: these buttons persist for the page's
+        # whole lifetime (shown/hidden, never destroyed/recreated), unlike
+        # the virtualized library grid, so a plain reference is safe here.
+        # Only the right column's primary action buttons + the completion
+        # status combo are gamepad-reachable; deep per-row controls (tag
+        # chips, screenshots, collection submenu) stay mouse-only for now.
+        self._ctrl_focused_widget = None
+        self._ctrl_focus_visible = False
+        self._ctrl_orig_style: dict = {}   # id(widget) -> its original styleSheet
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -867,6 +878,7 @@ class GameDetailView(QWidget):
 
         # Scrollable body
         scroll = QScrollArea()
+        self.scroll = scroll   # Controller Support — right-stick scroll target
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
@@ -1439,6 +1451,7 @@ class GameDetailView(QWidget):
         self._mode = "game"
         self._wishlist_item_id = None
         self._apply_mode_visibility()
+        self._ctrl_focused_widget = None
 
         self._game_id = game_id
         game = db.get_game(game_id)
@@ -1823,6 +1836,7 @@ class GameDetailView(QWidget):
         self._mode = "wishlist"
         self._wishlist_item_id = item_id
         self._apply_mode_visibility()
+        self._ctrl_focused_widget = None
 
         self._game_id = None
         item = wishlist_store.get_item(item_id)
@@ -2764,6 +2778,140 @@ class GameDetailView(QWidget):
         save relink) can change info shown on this page — just reload."""
         self.load_game(game_id)
         self.install_finished.emit(game_id)
+
+    # ── Controller Support (gamepad navigation) ─────────────────────────────
+    # Real 2D layout, not a flat list — Favorite/Hide and Launch/Cogwheel
+    # actually sit side by side on the page, so each "row" below is a list
+    # of 1+ widgets laid out left-to-right. Up/down move between rows
+    # (clamping to a shorter row's last column rather than losing focus);
+    # left/right move within the current row only. B is handled by
+    # MainWindow._ctrl_back() directly (it calls back_requested itself),
+    # so the back button is deliberately not included here.
+    #
+    # completion_combo is rebuilt fresh by load_game() on every call (see
+    # that method) rather than created once in __init__ like every other
+    # widget referenced below — it doesn't exist at all until a game has
+    # actually been loaded, so every read of it here is guarded.
+
+    def _ctrl_rows(self) -> list:
+        def ok(w):
+            return w.isVisibleTo(self) and w.isEnabled()
+
+        rows = []
+        if self._mode == "game":
+            if hasattr(self, "completion_combo"):
+                rows.append([self.completion_combo])
+            row = [w for w in (self.fav_btn, self.hide_btn) if ok(w)]
+            if row:
+                rows.append(row)
+            for w in (self.track_versions_btn, self.edit_metadata_btn,
+                      self.add_to_collection_btn):
+                if ok(w):
+                    rows.append([w])
+            if ok(self.install_btn):
+                rows.append([self.install_btn])
+            row = [w for w in (self.launch_btn, self.cogwheel_btn) if ok(w)]
+            if row:
+                rows.append(row)
+            for w in (self.open_folder_btn, self.uninstall_btn):
+                if ok(w):
+                    rows.append([w])
+        else:
+            for w in (self.wishlist_edit_btn, self.wishlist_remove_btn):
+                if ok(w):
+                    rows.append([w])
+        rows.append([self.notes_edit_btn])
+        return rows
+
+    @staticmethod
+    def _ctrl_find_position(rows, widget):
+        for r, row in enumerate(rows):
+            if widget in row:
+                return r, row.index(widget)
+        return None
+
+    def _ctrl_style_widget(self, widget, focused: bool):
+        key = id(widget)
+        orig = self._ctrl_orig_style.get(key)
+        if orig is None:
+            orig = widget.styleSheet()
+            self._ctrl_orig_style[key] = orig
+        if focused:
+            selector = "QComboBox" if isinstance(widget, QComboBox) else "QPushButton"
+            widget.setStyleSheet(
+                orig + f"\n{selector} {{ border: 2px solid {COLORS['accent']}; }}")
+        else:
+            widget.setStyleSheet(orig)
+
+    def _ctrl_apply_focus(self):
+        for row in self._ctrl_rows():
+            for w in row:
+                self._ctrl_style_widget(
+                    w, self._ctrl_focus_visible and w is self._ctrl_focused_widget)
+
+    def controller_has_targets(self) -> bool:
+        return bool(self._ctrl_rows())
+
+    def controller_focus_default(self) -> bool:
+        rows = self._ctrl_rows()
+        if not rows:
+            return False
+        self._ctrl_focus_visible = True
+        if self._ctrl_find_position(rows, self._ctrl_focused_widget) is None:
+            self._ctrl_focused_widget = rows[0][0]
+        self._ctrl_apply_focus()
+        return True
+
+    def controller_move(self, direction: str) -> bool:
+        rows = self._ctrl_rows()
+        if not rows:
+            return False
+        pos = self._ctrl_find_position(rows, self._ctrl_focused_widget)
+        if pos is None:
+            self._ctrl_focused_widget = rows[0][0]
+            self._ctrl_apply_focus()
+            return True
+        r, c = pos
+        if direction == "left":
+            if c <= 0:
+                return False
+            c -= 1
+        elif direction == "right":
+            if c >= len(rows[r]) - 1:
+                return False
+            c += 1
+        elif direction in ("up", "down"):
+            nr = r + (-1 if direction == "up" else 1)
+            if not (0 <= nr < len(rows)):
+                return False
+            r = nr
+            c = min(c, len(rows[r]) - 1)   # shorter row — clamp, don't lose focus
+        else:
+            return False
+        self._ctrl_focused_widget = rows[r][c]
+        self._ctrl_apply_focus()
+        return True
+
+    def controller_activate(self):
+        w = self._ctrl_focused_widget
+        if w is None:
+            return
+        if isinstance(w, QComboBox):
+            w.showPopup()
+        elif isinstance(w, QPushButton) and w.isEnabled():
+            w.click()
+
+    def set_controller_focus_visible(self, visible: bool):
+        self._ctrl_focus_visible = visible
+        self._ctrl_apply_focus()
+
+    def controller_scroll(self, delta: int):
+        """Right-stick scroll (see controller.py) — applies to this page's
+        own QScrollArea regardless of whether the D-pad focus ring is
+        currently showing on it."""
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.value() + delta)
+
 
 
 def _safe_get(row, key, default=None):

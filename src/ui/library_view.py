@@ -3034,6 +3034,14 @@ class LibraryView(QWidget):
             return True
         return False
 
+    def controller_scroll(self, delta: int):
+        """Right-stick scroll (see controller.py). Independent of the
+        D-pad focus ring above — scrolls the virtualized grid's viewport
+        directly, which _on_scrolled() already turns into a visible-tile
+        refresh the normal way."""
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.value() + delta)
+
     # ── Resize handling ───────────────────────────────────────────────────────
 
     def resizeEvent(self, event):
