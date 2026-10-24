@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -890,6 +891,7 @@ Exec={launch_cmd}
 Type=Application
 Categories=Game;
 StartupNotify=true
+X-VaultPlay=true
 """
     if launch_cwd and Path(launch_cwd).exists():
         content += f"Path={launch_cwd}\n"
@@ -943,7 +945,8 @@ Categories=Game;
 def _extract_launch_info(title: str, prefix_path: Path, exe_path: str,
                           wine_bin: str, game_dir: str,
                           game_id: Optional[int] = None,
-                          engine: Optional[str] = None) -> tuple:
+                          engine: Optional[str] = None,
+                          use_shortcuts: bool = True) -> tuple:
     """
     Determine the best launch command, working directory, and icon for a game.
 
@@ -979,10 +982,25 @@ def _extract_launch_info(title: str, prefix_path: Path, exe_path: str,
                            game_id, e)
         return cmd, cwd, icon
 
-    # Try to find a winemenubuilder .desktop first
-    for f in APPS_DIR.glob("*.desktop"):
+    # Files VaultPlay wrote itself must never be mistaken for a third-party
+    # (winemenubuilder) shortcut — reusing them just returns the old command.
+    own_files = {str(APPS_DIR / (re.sub(r"[/\x00]", "_", title).strip() + ".desktop"))}
+    if game_id is not None:
         try:
+            _g = db.get_game(game_id)
+            if _g and _g["desktop_path"]:
+                own_files.add(str(_g["desktop_path"]))
+        except Exception:
+            pass
+
+    # Try to find a winemenubuilder .desktop first
+    for f in (APPS_DIR.glob("*.desktop") if use_shortcuts else ()):
+        try:
+            if str(f) in own_files:
+                continue
             text  = f.read_text(errors="replace")
+            if "X-VaultPlay=true" in text:
+                continue
             lines = {}
             for l in text.splitlines():
                 if "=" in l:
@@ -1122,6 +1140,207 @@ def _find_new_exe(install_path: Path, before: set) -> Optional[Path]:
         return None
     candidates.sort(key=lambda p: (len(p.parts), p.name.lower()))
     return candidates[0]
+
+
+# ── Installed-exe detection (prefix delta) ────────────────────────────────────
+# A Wine installer writes into <prefix>/drive_c/Program Files, which the
+# install-path snapshots in run_install() don't watch. Instead: record every
+# .exe in the prefix right after it's created (the "baseline" — stock Wine
+# files like iexplore.exe are in it), then after the installer finishes the
+# candidates are ONLY exes that weren't there before. The baseline is saved to
+# disk so Cogwheel -> Detect Executable can re-diff later (e.g. after a
+# downloader-style installer fetched the real client on a second run).
+
+_SYSTEM_DIR_SKIP_RE = re.compile(
+    r"^(internet explorer|windows nt|windows defender|windows media player"
+    r"|windows mail|windows photo viewer|windows sidebar|common files"
+    r"|reference assemblies|uninstall information|windowsapps)$",
+    re.IGNORECASE
+)
+
+
+def _baseline_path(prefix_name: str) -> Path:
+    d = db._resolve_config_dir() / "install_baselines"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / (re.sub(r"[^a-zA-Z0-9_.-]", "_", prefix_name) + ".json")
+
+
+def save_prefix_baseline(prefix_name: str, snapshot: dict):
+    import json
+    try:
+        _baseline_path(prefix_name).write_text(json.dumps(snapshot))
+    except OSError as e:
+        log.warning("Could not save prefix baseline for %s: %s", prefix_name, e)
+
+
+def load_prefix_baseline(prefix_name: str) -> Optional[dict]:
+    import json
+    p = _baseline_path(prefix_name)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def snapshot_prefix_exes(actual_prefix: Path) -> dict:
+    """{path relative to drive_c: size} for every .exe under drive_c
+    (top-level windows/ pruned — system32 is huge and never holds a game)."""
+    drive_c = Path(actual_prefix) / "drive_c"
+    out: dict = {}
+    if not drive_c.exists():
+        return out
+    for root, dirs, files in os.walk(drive_c):
+        if Path(root) == drive_c:
+            dirs[:] = [d for d in dirs if d.lower() != "windows"]
+        for f in files:
+            if f.lower().endswith(".exe"):
+                p = Path(root) / f
+                try:
+                    out[str(p.relative_to(drive_c))] = p.stat().st_size
+                except (OSError, ValueError):
+                    pass
+    return out
+
+
+def find_new_prefix_exes(actual_prefix: Path, baseline: dict) -> list:
+    """Exes in the prefix that are NOT in `baseline`, minus setup/uninstall/
+    redist-style files and system folders, largest first (the real client is
+    almost always bigger than its launcher/helpers)."""
+    drive_c = Path(actual_prefix) / "drive_c"
+    now = snapshot_prefix_exes(actual_prefix)
+    found = []
+    for rel, size in now.items():
+        if rel in baseline:
+            continue
+        rp = Path(rel)
+        if SKIP_EXE_RE.search(rp.name):
+            continue
+        if any(_SYSTEM_DIR_SKIP_RE.match(part) or _INSTALLER_SKIP_DIR_RE.search(part)
+               for part in rp.parts[:-1]):
+            continue
+        found.append((size, drive_c / rel))
+    found.sort(key=lambda t: (-t[0], len(t[1].parts), t[1].name.lower()))
+    return [p for _s, p in found]
+
+
+def _prepare_prefix_baseline(prefix_path: Path, wine_bin: str, prefix_name: str,
+                              prog: Callable) -> bool:
+    """create_wine_prefix() + record the baseline. A baseline from an earlier
+    attempt is kept (it's the oldest/cleanest) UNLESS the prefix folder didn't
+    exist, in which case any old file belongs to a deleted prefix."""
+    existed = prefix_path.exists()
+    ok = create_wine_prefix(prefix_path, prog, wine_bin=wine_bin)
+    try:
+        actual = _resolve_actual_prefix(prefix_path, wine_bin)
+        if not existed or load_prefix_baseline(prefix_name) is None:
+            save_prefix_baseline(prefix_name, snapshot_prefix_exes(actual))
+    except Exception as e:
+        log.warning("Could not record prefix baseline: %s", e)
+    return ok
+
+
+def _any_process_in_compat_prefix(target: str) -> bool:
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                raw = f.read()
+        except (OSError, PermissionError):
+            continue
+        for entry in raw.split(b"\x00"):
+            if entry.startswith(b"STEAM_COMPAT_DATA_PATH="):
+                if entry.split(b"=", 1)[1].decode(errors="replace").rstrip("/") == target:
+                    return True
+                break
+    return False
+
+
+def _wait_for_prefix_idle(prefix_path: Path, wine_bin: str,
+                           prog: Optional[Callable] = None, timeout: int = 600):
+    """
+    Block until nothing is still running in the prefix. Launcher-style
+    installers start a child (downloader/updater) and the top-level setup exe
+    returns early — diffing at that moment would find nothing. Capped so a
+    lingering background process can't hang the install forever.
+    """
+    if prog:
+        prog("Finishing install", 85,
+             "Waiting for installer processes to exit — close any launcher "
+             "window that opened…")
+    deadline = time.monotonic() + timeout
+    if Path(wine_bin).name == "proton":
+        target = str(prefix_path).rstrip("/")
+        time.sleep(2)
+        while time.monotonic() < deadline:
+            if not _any_process_in_compat_prefix(target):
+                return
+            time.sleep(2)
+        log.warning("Prefix still busy after %ds — continuing with detection", timeout)
+        return
+    try:
+        env = {**os.environ, "WINEPREFIX": str(prefix_path)}
+        subprocess.run(["wineserver", "--wait"], env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.warning("wineserver --wait timed out after %ds", timeout)
+    except Exception as e:
+        log.debug("wineserver --wait skipped: %s", e)
+
+
+def _detect_installed_exe(prefix_path: Path, wine_bin: str, prefix_name: str,
+                           before_snapshots: dict, prog: Callable,
+                           wait: bool = True) -> tuple:
+    """
+    Returns (exe_path | None, install_dir | None, ambiguous_candidates).
+      1. New exe in a watched install path (existing snapshot logic).
+      2. Exactly one new exe in the prefix since the baseline -> use it.
+      3. Several -> exe None, candidates returned for the picker.
+      4. None -> nothing is guessed; install is recorded with a blank exe.
+    """
+    if wait:
+        _wait_for_prefix_idle(prefix_path, wine_bin, prog)
+    for watch_path, before in before_snapshots.items():
+        found = _find_new_exe(watch_path, before)
+        if found:
+            log.info("Install detected in %s -> %s", watch_path, found)
+            return found, str(found.parent), []
+
+    baseline = load_prefix_baseline(prefix_name)
+    if baseline is None:
+        log.info("No prefix baseline for %s — not guessing an exe", prefix_name)
+        return None, None, []
+    actual = _resolve_actual_prefix(prefix_path, wine_bin)
+    cands = find_new_prefix_exes(actual, baseline)
+    if len(cands) == 1:
+        log.info("Prefix delta found one new exe: %s", cands[0])
+        return cands[0], str(cands[0].parent), []
+    if cands:
+        log.info("Prefix delta found %d candidates — asking user", len(cands))
+        return None, None, cands
+    log.info("Prefix delta found no new exe — leaving exe_path unset")
+    return None, None, []
+
+
+def apply_detected_exe(game_id: int, exe_path: str) -> dict:
+    """Point an existing install at exe_path and rebuild launch_cmd/.desktop
+    (ignoring any pre-existing shortcut files so the chosen exe really wins).
+    Returns regenerate_launch()'s {"success", "error", "launch_cmd"}."""
+    game = db.get_game(game_id)
+    if not game or not game["is_installed"]:
+        return {"success": False, "error": "Game is not installed", "launch_cmd": ""}
+    exe = Path(exe_path)
+    if not exe.exists():
+        return {"success": False, "error": f"File not found: {exe_path}", "launch_cmd": ""}
+    db.update_install_fields(game_id, exe_path=str(exe), install_path=str(exe.parent))
+    version = (game["proton_version"] or "") or db.get_setting("default_proton_version", "")
+    return regenerate_launch(game_id, version, ignore_shortcuts=True)
 
 
 # ── Main install pipeline ─────────────────────────────────────────────────────
@@ -1420,7 +1639,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             return fail("No installer .exe found in ISO")
 
         prog("Creating Wine prefix", 40, f"Prefix: {prefix_name}")
-        create_wine_prefix(prefix_path, prog, wine_bin=wine_bin)
+        _prepare_prefix_baseline(prefix_path, wine_bin, prefix_name, prog)
 
         # Map drives based on user preference
         if db.get_setting("wine_drive_mapping", "auto") == "auto":
@@ -1460,46 +1679,13 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             unmount_iso(mount_point, mount_method, loop_dev)
             return fail("wine not found")
 
+        _wait_for_prefix_idle(prefix_path, wine_bin, prog)
         prog("Unmounting ISO", 90, "Cleaning up ISO mount…")
         unmount_iso(mount_point, mount_method, loop_dev)
 
-        # Find new exe — check snapshot paths first, then fall back to
-        # searching the Wine prefix (drive_c) and mapped drive locations
-        exe_path = None
-        actual_install_path = None
-        for watch_path, before in before_snapshots.items():
-            found = _find_new_exe(watch_path, before)
-            if found:
-                exe_path = found
-                actual_install_path = str(found.parent)
-                log.info("Install detected in %s → %s", watch_path, found)
-                break
-
-        if not exe_path:
-            log.info("Snapshot found nothing — searching Wine prefix for game exe…")
-            actual_prefix = _resolve_actual_prefix(prefix_path, wine_bin)
-            exe_path = (
-                find_game_exe(actual_prefix / "drive_c" / "Program Files") or
-                find_game_exe(actual_prefix / "drive_c" / "Program Files (x86)") or
-                find_game_exe(actual_prefix / "drive_c")
-            )
-            # Also search any mapped drive locations
-            if not exe_path:
-                try:
-                    mounts = _discover_mount_points()
-                    for mount_path in mounts:
-                        found = find_game_exe(mount_path)
-                        if found:
-                            exe_path = found
-                            log.info("Found exe on mapped drive: %s", found)
-                            break
-                except Exception as e:
-                    log.debug("Drive search failed: %s", e)
-            if exe_path:
-                actual_install_path = str(exe_path.parent)
-                log.info("Found game exe via prefix search: %s", exe_path)
-            else:
-                log.info("Could not auto-detect game exe — recording install without exe_path")
+        exe_path, actual_install_path, exe_candidates = _detect_installed_exe(
+            prefix_path, wine_bin, prefix_name, before_snapshots, prog,
+            wait=False)
 
         # Re-fetch game row here — metadata may have arrived since install started
         fresh_game = db.get_game(game_id) or game
@@ -1567,6 +1753,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
                 "tmp_path": str(tmp_path),
                 "cancelled": False,
                 "failed_redists": failed_redists,
+                "exe_candidates": [str(c) for c in exe_candidates],
                 "failed_addons": addon_result["failed"]}
 
     # ── Installer flow ────────────────────────────────────────────────────────
@@ -1577,7 +1764,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             return fail("No installer .exe found")
 
         prog("Creating Wine prefix", 20, f"Prefix: {prefix_name}")
-        create_wine_prefix(prefix_path, prog, wine_bin=wine_bin)
+        _prepare_prefix_baseline(prefix_path, wine_bin, prefix_name, prog)
 
         if db.get_setting("wine_drive_mapping", "auto") == "auto":
             map_all_drives(_resolve_actual_prefix(prefix_path, wine_bin))
@@ -1601,39 +1788,9 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
         except FileNotFoundError:
             return fail("wine not found")
 
-        exe_path = None
-        actual_install_path = None
-        for watch_path, before in before_snapshots.items():
-            found = _find_new_exe(watch_path, before)
-            if found:
-                exe_path = found
-                actual_install_path = str(found.parent)
-                log.info("Install detected in %s → %s", watch_path, found)
-                break
-
-        if not exe_path:
-            log.info("Snapshot found nothing — searching Wine prefix for game exe…")
-            actual_prefix = _resolve_actual_prefix(prefix_path, wine_bin)
-            exe_path = (
-                find_game_exe(actual_prefix / "drive_c" / "Program Files") or
-                find_game_exe(actual_prefix / "drive_c" / "Program Files (x86)") or
-                find_game_exe(actual_prefix / "drive_c")
-            )
-            if not exe_path:
-                try:
-                    mounts = _discover_mount_points()
-                    for mount_path in mounts:
-                        found = find_game_exe(mount_path)
-                        if found:
-                            exe_path = found
-                            log.info("Found exe on mapped drive: %s", found)
-                            break
-                except Exception as e:
-                    log.debug("Drive search failed: %s", e)
-            if exe_path:
-                actual_install_path = str(exe_path.parent)
-            else:
-                log.info("Could not auto-detect game exe — recording install without exe_path")
+        exe_path, actual_install_path, exe_candidates = _detect_installed_exe(
+            prefix_path, wine_bin, prefix_name, before_snapshots, prog,
+            wait=True)
 
         fresh_game = db.get_game(game_id) or game
         icon_path  = ""
@@ -1695,6 +1852,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
                 "tmp_path": str(tmp_path),
                 "cancelled": False,
                 "failed_redists": failed_redists,
+                "exe_candidates": [str(c) for c in exe_candidates],
                 "failed_addons": addon_result["failed"]}
 
     # ── Portable flow ─────────────────────────────────────────────────────────
@@ -1849,7 +2007,8 @@ def parse_wine_bin_from_cmd(launch_cmd: str) -> str:
     return "wine"
 
 
-def regenerate_launch(game_id: int, proton_version: str) -> dict:
+def regenerate_launch(game_id: int, proton_version: str,
+                      ignore_shortcuts: bool = False) -> dict:
     """
     Re-point an existing install at a different Proton/Wine version:
     resolves the new wine_bin, rebuilds launch_cmd/launch_cwd via
@@ -1891,9 +2050,20 @@ def regenerate_launch(game_id: int, proton_version: str) -> dict:
 
     launch_cmd, launch_cwd, _ = _extract_launch_info(
         title, prefix_path, exe_path, wine_bin, game_dir,
-        game_id=game_id, engine=_game_engine(game))
+        game_id=game_id, engine=_game_engine(game),
+        use_shortcuts=not ignore_shortcuts)
 
     icon_path = game["launch_icon"] or ""
+    if ignore_shortcuts:
+        # Explicit exe change — the old icon belonged to the old exe.
+        try:
+            icon_cache = Path.home() / ".config" / "vaultplay" / "icons"
+            safe = re.sub(r"[/\x00]", "_", title).strip()
+            extracted = extract_exe_icon(Path(exe_path), icon_cache / safe)
+            if extracted:
+                icon_path = extracted
+        except Exception:
+            pass
     try:
         desktop_path = create_direct_desktop(title, launch_cmd, launch_cwd, icon_path)
     except Exception as e:
@@ -1906,6 +2076,7 @@ def regenerate_launch(game_id: int, proton_version: str) -> dict:
         launch_cmd=launch_cmd,
         launch_cwd=launch_cwd,
         desktop_path=desktop_path,
+        launch_icon=icon_path,
     )
     log.info("regenerate_launch: game %d now launches via %s (%s)",
              game_id, wine_bin, proton_version or "(default)")

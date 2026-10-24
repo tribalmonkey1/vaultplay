@@ -1147,6 +1147,10 @@ class InstallDialog(QDialog):
                 self.progress_msg.setText(result.get("exe_path") or "Done.")
             self.progress_bar.setValue(100)
             self.cancel_btn.setText("Close")
+            note = self._resolve_exe_after_install(result)
+            if note:
+                self.progress_msg.setText(
+                    (self.progress_msg.text() + "\n" + note).strip())
             self.install_finished.emit(self.game["id"])
             return
 
@@ -1196,6 +1200,27 @@ class InstallDialog(QDialog):
                         error_msg + "\n(Extracted files deleted.)")
                 except Exception as e:
                     log.warning("Could not delete tmp: %s", e)
+
+    def _resolve_exe_after_install(self, result) -> str:
+        """If the installer left the exe undecided, ask instead of guessing.
+        Returns a note for the progress area ('' when an exe was auto-set)."""
+        if result.get("exe_path"):
+            return ""
+        candidates = result.get("exe_candidates") or []
+        if candidates:
+            from ui.exe_picker_dialog import ExePickerDialog
+            dlg = ExePickerDialog(
+                [Path(c) for c in candidates],
+                intro=("The installer added more than one executable. VaultPlay "
+                       "won't guess — pick the one that starts the game."),
+                parent=self)
+            if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_path():
+                r = install_mod.apply_detected_exe(self.game["id"], dlg.selected_path())
+                if r.get("success"):
+                    return f"Executable set: {dlg.selected_path()}"
+                return f"⚠ Could not apply executable: {r.get('error')}"
+        return ("⚠ No game executable detected yet. If the installer downloads "
+                "the game later, use Cogwheel → Detect Executable.")
 
     # ── Misc helpers ──────────────────────────────────────────────────────────
 

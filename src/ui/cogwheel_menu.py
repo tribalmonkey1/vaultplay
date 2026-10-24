@@ -251,10 +251,44 @@ class InstallPathsDialog(QDialog):
             self._status_lbl.setText("⚠ " + "; ".join(warnings) + " — saved anyway.")
             self._status_lbl.setStyleSheet(f"color: {COLORS['accent']}; {_LABEL_BASE}")
 
+        old_game = db.get_game(self._game_id)
         db.register_manual_install(
             self._game_id, exe_path=exe, wine_prefix=prefix, install_path=install_path)
+        self._refresh_launch_data(exe, prefix, old_game)
         self.saved.emit(self._game_id)
         self.accept()
+
+    def _refresh_launch_data(self, new_exe: str, new_prefix: str, old_game):
+        """
+        The Play button runs the stored launch_cmd, not exe_path — so after
+        the exe/prefix changes that command (and the .desktop) must be
+        rebuilt, otherwise the old exe keeps launching. If it can't be
+        rebuilt, the stale command is cleared so it can't run the wrong thing.
+        """
+        old_exe = (_safe_get(old_game, "exe_path", "") or "").strip() if old_game else ""
+        old_prefix = (_safe_get(old_game, "wine_prefix", "") or "").strip() if old_game else ""
+        old_cmd = (_safe_get(old_game, "launch_cmd", "") or "").strip() if old_game else ""
+        changed = (new_exe != old_exe) or (new_prefix != old_prefix)
+
+        if new_exe and Path(new_exe).exists() and (changed or not old_cmd):
+            game = db.get_game(self._game_id)
+            version = _detect_current_proton_value(game)
+            result = install_mod.regenerate_launch(
+                self._game_id, version, ignore_shortcuts=True)
+            if result.get("success"):
+                return
+            log.warning("regenerate_launch after path change failed: %s",
+                        result.get("error"))
+            db.update_install_fields(
+                self._game_id, launch_cmd="", launch_cwd="", desktop_path="")
+            QMessageBox.warning(
+                self, "Launch command not updated",
+                f"Paths were saved, but the launch command couldn't be "
+                f"rebuilt:\n{result.get('error')}\n\nThe old command was "
+                "cleared so it can't run the wrong file. Try Manage Install → Apply.")
+        elif changed and old_cmd:
+            db.update_install_fields(
+                self._game_id, launch_cmd="", launch_cwd="", desktop_path="")
 
 
 # ── Section box (mirrors ui/install_dialog.py's SectionBox styling) ──────────
@@ -824,6 +858,10 @@ class CogwheelButton(QPushButton):
             manage_action = menu.addAction("Manage Install…  (Proton, Redistributables)")
             manage_action.triggered.connect(lambda: self._open_manage_install(game))
 
+        if wine_prefix and Path(wine_prefix).exists():
+            detect_action = menu.addAction("Detect Executable…")
+            detect_action.triggered.connect(lambda: self._detect_executable(game))
+
         # "Launch with Debug Log" — only shown when a Play button would actually be
         # available (same is_detected gate game_detail.py uses to show/hide Launch),
         # since there's nothing to debug-launch otherwise. Separate from the normal
@@ -884,6 +922,39 @@ class CogwheelButton(QPushButton):
         open_action.triggered.connect(lambda: self._open_path(save_path))
 
     # ── Action handlers ──────────────────────────────────────────────────────
+
+    def _detect_executable(self, game):
+        """Re-diff the Wine prefix against the baseline recorded when it was
+        created and offer the exes that have appeared since (e.g. after a
+        downloader-style installer fetched the real client)."""
+        from ui.exe_picker_dialog import ExePickerDialog
+        prefix_path = Path(game["wine_prefix"])
+        actual = prefix_path / "pfx" if (prefix_path / "pfx").is_dir() else prefix_path
+        baseline = install_mod.load_prefix_baseline(prefix_path.name)
+        candidates = []
+        intro = ""
+        if baseline is None:
+            intro = ("No install baseline was recorded for this prefix (it was "
+                     "created before this feature, or outside VaultPlay), so "
+                     "there's nothing to compare against. Browse for the exe.")
+        else:
+            candidates = install_mod.find_new_prefix_exes(actual, baseline)
+            if not candidates:
+                intro = ("No new executables have appeared in this prefix since "
+                         "it was created. If a launcher is still downloading "
+                         "the game, let it finish and try again — or browse.")
+        start = str(actual / "drive_c") if (actual / "drive_c").exists() else ""
+        dlg = ExePickerDialog(candidates, start_dir=start, intro=intro, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.selected_path():
+            return
+        result = install_mod.apply_detected_exe(game["id"], dlg.selected_path())
+        if result.get("success"):
+            QMessageBox.information(
+                self, "Detect Executable", "✓ Executable set and launch command rebuilt.")
+            self.game_changed.emit(game["id"])
+        else:
+            QMessageBox.warning(
+                self, "Detect Executable", f"Couldn't apply it:\n{result.get('error')}")
 
     def _open_install_paths(self, game):
         dlg = InstallPathsDialog(game, parent=self)
