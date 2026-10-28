@@ -294,7 +294,7 @@ class InstallPathsDialog(QDialog):
 # ── Section box (mirrors ui/install_dialog.py's SectionBox styling) ──────────
 
 class SectionBox(QFrame):
-    def __init__(self, title=None, parent=None):
+    def __init__(self, title=None, parent=None, subtitle=None):
         super().__init__(parent)
         self.setStyleSheet(f"""
             QFrame {{
@@ -308,10 +308,17 @@ class SectionBox(QFrame):
         if title:
             lbl = QLabel(title.upper())
             lbl.setFont(QFont("DM Mono", 8))
+            lbl.setWordWrap(True)   # long titles wrap instead of running off-screen
             lbl.setStyleSheet(
                 f"color: {COLORS['text_muted']}; letter-spacing: 2px;"
                 f" {_LABEL_BASE}")
             self._inner.addWidget(lbl)
+        if subtitle:
+            sub = QLabel(subtitle)
+            sub.setFont(QFont("DM Sans", 10))
+            sub.setWordWrap(True)
+            sub.setStyleSheet(f"color: {COLORS['text_muted']}; {_LABEL_BASE}")
+            self._inner.addWidget(sub)
 
     def add(self, widget):
         self._inner.addWidget(widget)
@@ -404,11 +411,13 @@ def _currently_applied_redists(game_id: int, wine_prefix: str) -> set:
         original install-time run. This is what makes an install made
         before installs.redists existed still pre-check correctly.
     """
-    stored = set(db.get_install_redists(game_id))
-    on_disk: set = set()
+    # Only what winetricks has actually recorded as installed — requested
+    # and failed verbs are tracked separately (installs.redists /
+    # installs.redists_failed) and shown as "not installed" below.
     if wine_prefix and Path(wine_prefix).exists():
-        on_disk = install_mod.get_installed_redists(Path(wine_prefix))
-    return stored | on_disk
+        return set(install_mod.normalize_redists(
+            list(install_mod.get_installed_redists(Path(wine_prefix)))))
+    return set()
 
 
 class _ManageApplyWorker(QThread):
@@ -460,8 +469,9 @@ class ManageInstallDialog(QDialog):
         title = game["title"] or game["display_name"] or game["folder_name"]
         self.setWindowTitle(f"Manage Install — {title}")
         self.setModal(True)
-        self.setMinimumWidth(560)
-        self.setFixedWidth(600)
+        # Resizable: the user can widen it; content wraps/shrinks instead of clipping.
+        self.setMinimumWidth(480)
+        self.resize(720, 780)
         self.setStyleSheet(f"QDialog {{ background: {COLORS['surface']}; }}")
 
         root = QVBoxLayout(self)
@@ -471,7 +481,7 @@ class ManageInstallDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         body = QWidget()
         body.setStyleSheet(f"background: {COLORS['surface']};")
@@ -495,15 +505,20 @@ class ManageInstallDialog(QDialog):
         matched_label = next((lbl for lbl, val in versions if val == current), "")
         tier = _safe_get(game, "protondb_tier", "") or ""
         reports = _safe_get(game, "protondb_reports", 0) or 0
-        proton_title = "Proton / Wine Version"
+        sub_parts = []
         if tier:
             tier_label, _ = protondb_mod.tier_display(tier)
-            proton_title += f"  ·  ProtonDB: {tier_label} ({reports} reports)"
+            sub_parts.append(f"ProtonDB: {tier_label} ({reports} reports)")
         if matched_label:
-            proton_title += f"  ·  currently: {matched_label}"
+            sub_parts.append(f"currently: {matched_label}")
 
-        proton_box = SectionBox(proton_title)
+        proton_box = SectionBox("Proton / Wine Version",
+                                subtitle="  ·  ".join(sub_parts) or None)
         self.proton_combo = NoScrollComboBox()
+        # Long version names must not force the dialog wider than the screen.
+        self.proton_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.proton_combo.setMinimumContentsLength(16)
         self.proton_combo.setFont(QFont("DM Sans", 11))
         if not versions:
             self.proton_combo.addItem("No versions found — install via ProtonUp-Qt", "")
@@ -540,8 +555,28 @@ class ManageInstallDialog(QDialog):
         body_l.addWidget(proton_box)
 
         # ── Redistributables ─────────────────────────────────────────────────
+        import steamdb as steamdb_mod
         applied = _currently_applied_redists(self._game_id, _safe_get(game, "wine_prefix", ""))
-        redist_box = SectionBox(f"Redistributables  ·  {len(applied)} currently applied")
+        try:
+            failed_prev = set(install_mod.normalize_redists(
+                json.loads(_safe_get(game, "redists_failed") or "[]")))
+        except (TypeError, ValueError):
+            failed_prev = set()
+        wanted = set(install_mod.normalize_redists(
+            db.get_install_redists(self._game_id))) | failed_prev
+        try:
+            rec = steamdb_mod.get_redists_for_install(
+                _safe_get(game, "steam_app_id"), title,
+                auto_detect=db.get_setting("auto_detect_redists", "true") == "true")["auto"]
+            wanted |= set(install_mod.normalize_redists(rec))
+        except Exception as e:
+            log.debug("Manage Install: could not load recommended redists: %s", e)
+        missing = {v for v in wanted if v in COMMON_REDISTS and v not in applied}
+
+        redist_sub = f"{len(applied & set(COMMON_REDISTS))} applied"
+        if missing:
+            redist_sub += f"  ·  {len(missing)} recommended but not installed"
+        redist_box = SectionBox("Redistributables", subtitle=redist_sub)
         self._checks: dict[str, QCheckBox] = {}
         grid_w = QWidget()
         grid_w.setStyleSheet("background: transparent; border: none;")
@@ -551,14 +586,16 @@ class ManageInstallDialog(QDialog):
         col1.setSpacing(4)
         col2.setSpacing(4)
         for i, verb in enumerate(COMMON_REDISTS):
-            cb = QCheckBox(verb)
-            cb.setFont(QFont("DM Mono", 10))
             is_applied = verb in applied
-            cb.setChecked(is_applied)
-            cb.setStyleSheet(
-                f"color: {COLORS['accent2']};" if is_applied
-                else f"color: {COLORS['text_dim']};"
-            )
+            is_missing = verb in missing
+            suffix = ("   ✓ applied" if is_applied
+                      else "   ✗ not installed" if is_missing else "")
+            cb = QCheckBox(verb + suffix)
+            cb.setFont(QFont("DM Mono", 10))
+            cb.setChecked(is_applied or is_missing)
+            color = ("#4ade80" if is_applied
+                     else COLORS['danger'] if is_missing else COLORS['text_dim'])
+            cb.setStyleSheet(f"color: {color};")
             self._checks[verb] = cb
             (col1 if i % 2 == 0 else col2).addWidget(cb)
         grid_l.addLayout(col1)
@@ -917,6 +954,9 @@ class CogwheelButton(QPushButton):
         relink_action.setEnabled(diag in ("missing", "plain_folder", "wrong_symlink"))
         relink_action.triggered.connect(lambda: self._relink_save(game, source_path, save_path))
 
+        restore_action = save_menu.addAction("Restore from Backup…")
+        restore_action.triggered.connect(lambda: self._restore_from_backup(game))
+
         open_action = save_menu.addAction("Open Save Backup Directory")
         open_action.setEnabled(bool(save_path and Path(save_path).exists()))
         open_action.triggered.connect(lambda: self._open_path(save_path))
@@ -1033,13 +1073,30 @@ class CogwheelButton(QPushButton):
         try:
             canonical = save_backup.move_and_link(Path(chosen), save_root, game["folder_name"])
         except save_backup.SaveMoveConflict as e:
-            reply = QMessageBox.question(
-                self, "Save Files",
-                f"A backed-up save already exists at:\n{e.canonical_path}\n\n"
-                "Continuing will overwrite it with the save you just picked. Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel)
-            if reply != QMessageBox.StandardButton.Yes:
+            box = QMessageBox(self)
+            box.setWindowTitle("Save Files")
+            box.setText("You already have a backed-up save for this game.")
+            box.setInformativeText(
+                f"Backup: {e.canonical_path}\n\n"
+                "Use your existing backup (the folder you picked is linked to it), "
+                "or replace the backup with what's in the folder you picked? "
+                "Whichever you don't choose is kept in a “_replaced” folder.")
+            use_btn = box.addButton("Use My Existing Backup", QMessageBox.ButtonRole.AcceptRole)
+            rep_btn = box.addButton("Replace Backup", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(use_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == use_btn:
+                import save_restore
+                r = save_restore.adopt_existing_backup(game_id, game["folder_name"], Path(chosen), save_root)
+                if r.get("ok"):
+                    QMessageBox.information(self, "Save Files", "✓ Linked to your existing backup.")
+                    self.game_changed.emit(game_id)
+                else:
+                    QMessageBox.warning(self, "Save Files", f"Restore failed:\n{r.get('error')}")
+                return
+            if clicked != rep_btn:
                 return
             try:
                 canonical = save_backup.move_and_link(
@@ -1058,6 +1115,22 @@ class CogwheelButton(QPushButton):
             msg += f"\n\nAlso auto-backed up: {names}"
         QMessageBox.information(self, "Save Files", msg)
         self.game_changed.emit(game_id)
+
+    def _restore_from_backup(self, game):
+        """Manual trigger for the same restore offer shown before launch."""
+        wine_prefix = (game["wine_prefix"] or "").strip()
+        if not wine_prefix or not Path(wine_prefix).exists():
+            QMessageBox.warning(self, "Save Files", "Wine prefix not found — set it first.")
+            return
+        wine_bin = install_mod.parse_wine_bin_from_cmd(_safe_get(game, "launch_cmd", "") or "")
+        # The offer logic lives on GameDetailView (needs db + dialogs); reuse it.
+        host = self.parent()
+        while host is not None and not hasattr(host, "_offer_save_restore"):
+            host = host.parent()
+        if host is None:
+            return
+        if host._offer_save_restore(game, wine_bin, wine_prefix, manual=True):
+            self.game_changed.emit(game["id"])
 
     def _relink_save(self, game, source_path, save_path):
         if not source_path or not save_path:

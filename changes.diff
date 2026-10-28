@@ -1,0 +1,2863 @@
+diff --git a/src/db.py b/src/db.py
+index ade4a2e..9d4c5fe 100644
+--- a/src/db.py
++++ b/src/db.py
+@@ -458,6 +458,9 @@ def _migrate_db():
+         ]:
+             if col not in game_cols:
+                 conn.execute(sql)
++        # The install-type override is retired: a chosen type must never be
++        # permanent, so every rescan re-detects it. Clear any stale flags.
++        conn.execute("UPDATE games SET install_tag_override=0 WHERE install_tag_override=1")
+         # installs table migrations
+         install_cols = {row[1] for row in conn.execute("PRAGMA table_info(installs)").fetchall()}
+         for col, sql in [
+@@ -483,6 +486,9 @@ def _migrate_db():
+             # prefix, so the Cogwheel's "Edit Redistributables" dialog has something
+             # to pre-check instead of starting from steamdb's auto-detect every time.
+             ("redists", "ALTER TABLE installs ADD COLUMN redists TEXT DEFAULT '[]'"),
++            # redists_failed — JSON list of verbs that were requested but
++            # failed to install, so Manage Install can flag them.
++            ("redists_failed", "ALTER TABLE installs ADD COLUMN redists_failed TEXT DEFAULT '[]'"),
+         ]:
+             if col not in install_cols:
+                 conn.execute(sql)
+@@ -1026,9 +1032,7 @@ def upsert_game(folder_name: str, nas_path: str, display_name: str,
+                 file_type    = excluded.file_type,
+                 archive_name = excluded.archive_name,
+                 size_bytes   = excluded.size_bytes,
+-                install_tag  = CASE WHEN install_tag_override=1
+-                                    THEN games.install_tag
+-                                    ELSE excluded.install_tag END,
++                install_tag  = excluded.install_tag,
+                 category     = excluded.category,
+                 last_scanned = datetime('now')
+         """, (folder_name, nas_path, display_name, file_type,
+@@ -1128,7 +1132,7 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
+                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
+                    i.game_path, i.launcher_type, i.desktop_path, i.script_path,
+                    i.launch_cmd, i.launch_cwd, i.launch_icon,
+-                   i.proton_version, i.redists,
++                   i.proton_version, i.redists, i.redists_failed,
+                    (i.id IS NOT NULL) AS is_installed,
+                    COALESCE(gs.is_favorite,       0)          AS is_favorite,
+                    COALESCE(gs.is_hidden,         0)          AS is_hidden,
+@@ -1272,7 +1276,7 @@ def remove_install(game_id: int):
+ _INSTALL_UPDATABLE_COLS = frozenset({
+     "install_path", "wine_prefix", "install_method", "exe_path", "game_path",
+     "launcher_type", "desktop_path", "script_path", "launch_cmd", "launch_cwd",
+-    "launch_icon", "proton_version", "redists",
++    "launch_icon", "proton_version", "redists", "redists_failed",
+ })
+ 
+ 
+@@ -1295,7 +1299,7 @@ def update_install_fields(game_id: int, **fields):
+     for key, value in fields.items():
+         if key not in _INSTALL_UPDATABLE_COLS:
+             continue
+-        if key == "redists" and isinstance(value, (list, tuple)):
++        if key in ("redists", "redists_failed") and isinstance(value, (list, tuple)):
+             value = json.dumps(list(value))
+         updates.append(f"{key}=?")
+         params.append(value)
+diff --git a/src/installer.py b/src/installer.py
+index c706835..1ddb94f 100644
+--- a/src/installer.py
++++ b/src/installer.py
+@@ -132,11 +132,42 @@ COMMON_REDISTS = [
+     "vcrun2005", "vcrun2008", "vcrun2010", "vcrun2012",
+     "vcrun2013", "vcrun2015", "vcrun2017", "vcrun2019", "vcrun2022",
+     "dotnet40", "dotnet48",
+-    "d3dx9", "d3dx10", "d3dx11", "d3dcompiler_47",
++    "d3dx9", "d3dx10", "d3dx11_43", "d3dcompiler_47",
+     "xact", "physx", "openal",
+ ]
+ 
+ 
++# Old verb names that never existed in winetricks -> the real ones. Applied
++# when reading stored/detected redist lists so older records keep working.
++REDIST_ALIASES = {"d3dx11": "d3dx11_43"}
++
++
++def normalize_redists(verbs) -> list:
++    out = []
++    for v in verbs or []:
++        v = REDIST_ALIASES.get(v, v)
++        if v not in out:
++            out.append(v)
++    return out
++
++
++def _winetricks_prefix(prefix_path: Path) -> Path:
++    """The directory winetricks must target: Proton keeps its real Wine
++    prefix in <prefix_path>/pfx, plain Wine uses prefix_path itself."""
++    pfx = Path(prefix_path) / "pfx"
++    return pfx if (pfx / "system.reg").exists() else Path(prefix_path)
++
++
++def _store_redist_result(game_id: int, requested, failed):
++    try:
++        db.update_install_fields(
++            game_id,
++            redists=normalize_redists(requested),
++            redists_failed=normalize_redists(failed))
++    except Exception as e:
++        log.warning("Could not store redist result for game %s: %s", game_id, e)
++
++
+ def _game_engine(game) -> Optional[str]:
+     """
+     Best-effort read of this game's engine name, for Launch Options'
+@@ -706,7 +737,7 @@ def get_installed_redists(prefix_path: Path) -> set:
+     by reading the winetricks.log file it maintains automatically.
+     Returns an empty set if the log doesn't exist or can't be read.
+     """
+-    log_path = prefix_path / "winetricks.log"
++    log_path = _winetricks_prefix(Path(prefix_path)) / "winetricks.log"
+     try:
+         if log_path.exists():
+             return {line.strip() for line in log_path.read_text().splitlines()
+@@ -723,8 +754,10 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
+     Skips verbs already recorded in winetricks.log unless force=True.
+     Returns list of verbs that failed.
+     """
++    prefix_path = Path(prefix_path)
++    redists = normalize_redists(redists)
+     already_installed = get_installed_redists(prefix_path)
+-    env    = {**os.environ, "WINEPREFIX": str(prefix_path)}
++    env    = {**os.environ, "WINEPREFIX": str(_winetricks_prefix(prefix_path))}
+     failed = []
+ 
+     to_install = redists if force else [
+@@ -749,8 +782,10 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
+                         f"Installing {verb}…")
+         try:
+             r = subprocess.run(["winetricks", "-q", verb], env=env,
+-                               capture_output=True, timeout=300)
++                               capture_output=True, text=True, timeout=300)
+             if r.returncode != 0:
++                log.warning("winetricks %s failed (rc=%d): %s", verb,
++                            r.returncode, (r.stderr or r.stdout or "")[-400:])
+                 failed.append(verb)
+         except subprocess.TimeoutExpired:
+             failed.append(verb)
+@@ -1601,9 +1636,26 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
+     wine_bin = _resolve_wine_bin(_version_path) if _version_path else "wine"
+     log.info("Using Wine/Proton binary: %s (version key: %s)", wine_bin, proton_value)
+ 
+-    # ── Extract (skip if tmp already populated from a previous attempt) ───────
++    # ── Extract ───────────────────────────────────────────────────────────────
++    # Portable archives extract straight into the final install folder (no
++    # .tmp round trip). Other flows extract to tmp (skipped if already
++    # populated from a previous attempt).
++    portable_direct = (install_tag == "portable"
++                       and file_type in ("rar", "7zip", "zip"))
+     source_path = None
+-    if file_type in ("rar", "7zip", "zip"):
++    if portable_direct:
++        prog("Extracting", 0, f"Extracting {archive_name} to {game_dest}…")
++        try:
++            if game_dest.exists():
++                shutil.rmtree(game_dest)
++        except Exception as e:
++            return fail(f"Could not clear {game_dest}: {e}")
++        if not extract_archive(nas_path, archive_name, file_type, game_dest, prog):
++            return {"success": False,
++                    "error": f"Extraction failed for {archive_name}",
++                    "tmp_path": str(game_dest), "cancelled": False}
++        source_path = game_dest
++    elif file_type in ("rar", "7zip", "zip"):
+         if tmp_has_contents(tmp_path, archive_name):
+             prog("Extracting", 100,
+                  f"Using existing extracted files in {tmp_path.name} — skipping extraction.")
+@@ -1732,6 +1784,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
+             launch_icon=launch_icon,
+             proton_version=proton_value,
+         )
++        _store_redist_result(game_id, options.get("redists"), failed_redists)
+ 
+         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
+         addon_result = _install_pending_addons(
+@@ -1833,6 +1886,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
+             launch_icon=launch_icon,
+             proton_version=proton_value,
+         )
++        _store_redist_result(game_id, options.get("redists"), failed_redists)
+ 
+         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
+         addon_result = _install_pending_addons(
+@@ -1867,13 +1921,14 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
+         if options.get("redists"):
+             failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
+ 
+-        prog("Copying files", 40, f"Copying to {game_dest}…")
+-        try:
+-            if game_dest.exists():
+-                shutil.rmtree(game_dest)
+-            shutil.copytree(str(source_path), str(game_dest))
+-        except Exception as e:
+-            return fail(f"Copy failed: {e}")
++        if not portable_direct:
++            prog("Copying files", 40, f"Copying to {game_dest}…")
++            try:
++                if game_dest.exists():
++                    shutil.rmtree(game_dest)
++                shutil.copytree(str(source_path), str(game_dest))
++            except Exception as e:
++                return fail(f"Copy failed: {e}")
+ 
+         prog("Finding game exe", 70, "Locating launch executable…")
+         exe_path = find_game_exe(game_dest)
+@@ -1926,6 +1981,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
+             launch_icon=launch_icon,
+             proton_version=proton_value,
+         )
++        _store_redist_result(game_id, options.get("redists"), failed_redists)
+ 
+         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
+         addon_result = _install_pending_addons(
+@@ -2113,8 +2169,9 @@ def rerun_redists(game_id: int, redists: list, force: bool = True,
+                 "error": "Wine prefix not found on disk — set the prefix path first.",
+                 "failed": []}
+ 
++    redists = normalize_redists(redists)
+     failed = install_redists(prefix_path, redists, progress_cb, force=force)
+-    db.update_install_fields(game_id, redists=redists)
++    db.update_install_fields(game_id, redists=redists, redists_failed=failed)
+     log.info("rerun_redists: game %d — %d requested, %d failed",
+              game_id, len(redists), len(failed))
+     return {"success": True, "error": None, "failed": failed}
+diff --git a/src/main.py b/src/main.py
+index 34c89b5..0ece76b 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -93,6 +93,7 @@ def _print_system_info():
+ 
+ # ── Now safe to import local modules ─────────────────────────────────────────
+ import db
++import dbsafety
+ from ui.main_window import MainWindow
+ 
+ def main():
+@@ -112,13 +113,23 @@ def main():
+     # VaultPlay to other Python apps instead of the VaultPlay .desktop entry).
+     sys.argv[0] = "vaultplay"
+ 
++    import thread_guard
++    thread_guard.install()   # track every QThread so shutdown can stop them all
++
+     app = QApplication(sys.argv)
++    app.aboutToQuit.connect(thread_guard.shutdown_all)
+     app.setApplicationDisplayName("VaultPlay")
+     # setDesktopFileName links this process to the .desktop file so KDE
+     # can match the taskbar entry, pinning, and StartupWMClass correctly.
+     app.setDesktopFileName("VaultPlay")
+     app.setFont(QFont("DM Sans", 11))
+ 
++    # Snapshot the DB BEFORE anything can touch it this session. Skipped if
++    # a backup was already taken within the last 6 hours so rapid restarts
++    # don't rotate good backups out. Never raises.
++    _log_phase("DB backup")
++    dbsafety.backup_now("startup", min_interval_s=6 * 3600)
++
+     _log_phase("DB init")
+     db.init_db()
+ 
+@@ -127,7 +138,9 @@ def main():
+     window.show()
+     _log_phase("Window shown — entering event loop")
+ 
+-    sys.exit(app.exec())
++    code = app.exec()
++    thread_guard.shutdown_all()
++    sys.exit(code)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/playtime.py b/src/playtime.py
+index 87827c1..28091e3 100644
+--- a/src/playtime.py
++++ b/src/playtime.py
+@@ -3,72 +3,33 @@ playtime.py — Background playtime tracking for VaultPlay
+ 
+ Tracks how long a game session lasts and records it to game_state.playtime_minutes.
+ 
+-Design
+-------
+-PlaytimeWatcher is a QThread started immediately after a successful game launch.
+-It blocks on a single wait call appropriate for the Wine variant in use:
+-
+-  Plain Wine / Wine-GE (wine, wine64, wine-ge-*):
+-      Runs `wineserver --wait` as a subprocess with WINEPREFIX set.
+-      wineserver blocks until every process in the prefix has exited —
+-      meaning it naturally handles multi-process games and the case where
+-      the Wine launcher wrapper exits immediately after spawning the game.
+-
+-      wineserver --wait waits on a wineserver that's ALREADY running for
+-      the prefix — it doesn't start one. Because PlaytimeWatcher.start()
+-      fires right after the game's Popen call, the very first call can
+-      race ahead of Wine actually spinning up its wineserver for this
+-      session (connecting to X, loading DLLs, etc. all take real time),
+-      seeing nothing running yet and returning success in milliseconds.
+-      This is caught by cross-checking self._proc.poll(): if wineserver
+-      claims done while the process we actually launched is still alive,
+-      that's the startup race, not a real session end, and the wait is
+-      retried — see _wait_wine().
+-
+-  Proton (any binary named "proton"):
+-      Calls proc.wait() on the original Popen handle, THEN polls /proc for
+-      any remaining process whose environment shows STEAM_COMPAT_DATA_PATH
+-      matching this session's wine_prefix, blocking until none remain.
+-      The second step exists because proc.wait() alone is NOT reliable —
+-      some games (e.g. a launcher.exe stub that spawns the real game.exe
+-      and exits) have their top-level Proton-launched process exit long
+-      before the actual game does. Every process spawned under a Proton
+-      launch inherits STEAM_COMPAT_DATA_PATH from the environment
+-      installer.py's _build_wine_env() sets, so scanning for it gives the
+-      same "wait for everything in the prefix" guarantee wineserver --wait
+-      gives plain Wine, without needing access to Proton's internal
+-      wineserver (which lives inside the pressure-vessel container and is
+-      not accessible via the system wineserver binary).
+-
+-Safety cap
+-----------
+-Both strategies use a 24-hour (86400s) timeout. If the wait exceeds this,
+-the session is ended and whatever time elapsed is recorded. This prevents
+-the watcher from running forever if something goes wrong.
+-
+-Minimum session length
+-----------------------
+-Sessions under MIN_SESSION_MINUTES (2 minutes) are discarded entirely.
+-This filters out accidental double-clicks, launcher windows that close
+-immediately, and crashes at startup.
+-
+-Usage
+------
+-  proc = subprocess.Popen(cmd, env=env)
+-  watcher = PlaytimeWatcher(
+-      game_id    = game_id,
+-      proc       = proc,
+-      wine_bin   = wine_bin,           # full path or "wine"
+-      wine_prefix = str(prefix_path),  # WINEPREFIX value
+-  )
+-  watcher.session_ended.connect(on_session_ended)
+-  watcher.start()
+-
+-  # on_session_ended(game_id: int, minutes: int)
+-  # minutes == 0 means session was under MIN_SESSION_MINUTES (not recorded)
++PlaytimeWatcher is a QThread started right after a successful game launch.
++
++  Plain Wine / Wine-GE: runs `wineserver --wait` (WINEPREFIX set) so multi-process
++      games and launcher stubs are handled. wineserver --wait only waits on an
++      ALREADY running wineserver, so a result that arrives while the launched
++      process is still alive is the startup race and is retried.
++
++  Proton: waits on the Popen handle, THEN polls /proc for any process whose
++      environment shows STEAM_COMPAT_DATA_PATH == this prefix.
++
++Shutdown safety (2026-10-28)
++----------------------------
++Every wait below is interruptible: it polls in short slices and checks
++self._abort. MainWindow.closeEvent calls request_abort() on every watcher, so
++the thread exits quickly WITHOUT recording a session (the game keeps running;
++on next start VaultPlay re-attaches to it). Previously the thread sat in a
++blocking wait / time.sleep, and destroying the QThread at interpreter exit
++aborted the process ("QThread: Destroyed while thread is still running").
++
++Force Quit (request_kill) now terminates every process belonging to the prefix
++(Proton: anything with matching STEAM_COMPAT_DATA_PATH; Wine: `wineserver -k`),
++not only the top-level launcher, so a hung game that ignored its own Exit is
++actually stopped.
++
++Sessions under MIN_SESSION_MINUTES are discarded. 24h safety cap on every wait.
+ """
+ 
+-
+ # ── AppImage path fix ─────────────────────────────────────────────────────────
+ import sys as _sys, os as _os
+ _appdir = _os.environ.get("APPDIR", "")
+@@ -101,6 +62,7 @@ log = logging.getLogger(__name__)
+ 
+ MIN_SESSION_MINUTES: int = 2        # sessions shorter than this are discarded
+ MAX_SESSION_SECONDS: int = 86400    # 24-hour safety cap
++_SLICE: float = 0.5                 # granularity of interruptible waits
+ 
+ 
+ def is_proton(wine_bin: str) -> bool:
+@@ -109,10 +71,6 @@ def is_proton(wine_bin: str) -> bool:
+ 
+ 
+ # ── Restart-reattachment (Currently Playing Indicator) ────────────────────────
+-# If VaultPlay is closed and reopened while a game launched via its Play
+-# button is still running, these helpers let MainWindow find that process on
+-# /proc and attach a normal PlaytimeWatcher to it — with the correct elapsed
+-# time already accumulated, rather than restarting the timer from 0.
+ 
+ def _clock_ticks_per_sec() -> int:
+     try:
+@@ -130,19 +88,9 @@ def _system_uptime_seconds() -> Optional[float]:
+ 
+ 
+ def proc_start_elapsed_seconds(pid: int) -> Optional[float]:
+-    """
+-    Return how many seconds ago process `pid` started, by reading its
+-    /proc/<pid>/stat starttime field (in clock ticks since boot) and
+-    comparing against /proc/uptime. Returns None if unreadable — the
+-    caller should fall back to treating the session as starting "now"
+-    rather than crashing.
+-
+-    The process name field in /proc/<pid>/stat is wrapped in parens and
+-    can itself contain spaces or parens, so this splits on the LAST ')'
+-    to safely skip past it before splitting the remaining whitespace-
+-    separated fields (starttime is field 22 overall, i.e. index 19 after
+-    the 3 fields following the closing paren).
+-    """
++    """Seconds since process `pid` started (from /proc/<pid>/stat starttime),
++    or None if unreadable. Splits on the LAST ')' because the comm field can
++    contain spaces/parens."""
+     uptime = _system_uptime_seconds()
+     if uptime is None:
+         return None
+@@ -153,22 +101,13 @@ def proc_start_elapsed_seconds(pid: int) -> Optional[float]:
+         starttime_ticks = int(after[19])
+     except (OSError, ValueError, IndexError):
+         return None
+-    hz = _clock_ticks_per_sec()
+-    start_seconds_since_boot = starttime_ticks / hz
+-    elapsed = uptime - start_seconds_since_boot
++    elapsed = uptime - starttime_ticks / _clock_ticks_per_sec()
+     return elapsed if elapsed >= 0 else None
+ 
+ 
+ def find_running_pid_for_exe(exe_path: str) -> Optional[int]:
+-    """
+-    Best-effort scan of /proc for a running process whose cmdline
+-    references exe_path's filename — Wine/Proton invocations commonly
+-    carry the translated exe path as a cmdline argument even though the
+-    top-level process itself is `wine`/`proton`. Returns the first
+-    matching PID, or None if nothing matches or /proc can't be read.
+-    Never raises — used at startup where a scan failure should just mean
+-    "nothing to reattach," not a crash.
+-    """
++    """Best-effort /proc scan for a process whose cmdline references exe_path's
++    filename. Never raises."""
+     if not exe_path:
+         return None
+     target_name = Path(exe_path).name.lower()
+@@ -197,15 +136,35 @@ def find_running_pid_for_exe(exe_path: str) -> Optional[int]:
+     return None
+ 
+ 
++def pids_in_prefix(target_prefix: str) -> list:
++    """PIDs of all processes whose STEAM_COMPAT_DATA_PATH equals target_prefix."""
++    target = (target_prefix or "").rstrip("/")
++    out = []
++    if not target:
++        return out
++    try:
++        pids = os.listdir("/proc")
++    except OSError:
++        return out
++    for pid_str in pids:
++        if not pid_str.isdigit():
++            continue
++        try:
++            with open(f"/proc/{pid_str}/environ", "rb") as f:
++                raw = f.read()
++        except (OSError, PermissionError):
++            continue
++        for entry in raw.split(b"\x00"):
++            if entry.startswith(b"STEAM_COMPAT_DATA_PATH="):
++                value = entry.split(b"=", 1)[1].decode(errors="replace").rstrip("/")
++                if value == target:
++                    out.append(int(pid_str))
++                break
++    return out
++
++
+ class AttachedProcess:
+-    """
+-    Minimal subprocess.Popen-like wrapper around a PID VaultPlay did not
+-    itself launch — used when reattaching to a game found still running
+-    on /proc after an app restart (see find_running_pid_for_exe()).
+-    Exposes just enough of the Popen surface (pid/poll/wait/kill) for
+-    PlaytimeWatcher to treat it identically to a real Popen handle,
+-    without needing its own reattachment-specific code path.
+-    """
++    """Minimal Popen-like wrapper around a PID VaultPlay did not launch."""
+ 
+     def __init__(self, pid: int):
+         self.pid = pid
+@@ -230,7 +189,7 @@ class AttachedProcess:
+         while self._alive():
+             if deadline is not None and time.monotonic() >= deadline:
+                 raise subprocess.TimeoutExpired(cmd=str(self.pid), timeout=timeout)
+-            time.sleep(1.0)
++            time.sleep(0.25)
+         self.returncode = 0
+         return self.returncode
+ 
+@@ -245,53 +204,65 @@ class PlaytimeWatcher(QThread):
+     """
+     Background thread that tracks a single game session.
+ 
+-    Signals
+-    -------
+-    session_ended(game_id, minutes_recorded)
+-        Emitted when the session ends.
+-        minutes_recorded == 0 means the session was under MIN_SESSION_MINUTES
+-        and was NOT written to the database.
+-        minutes_recorded > 0 means the session was recorded via db.add_playtime.
++    session_ended(game_id, minutes_recorded): minutes 0 == too short / not
++    recorded. NOT emitted when the watcher was aborted for app shutdown.
+     """
+     session_ended = pyqtSignal(int, int)   # game_id, minutes_recorded
+ 
+     def __init__(self, game_id: int, proc, wine_bin: str, wine_prefix: str,
+                  elapsed_seconds: float = 0.0, parent=None):
+-        """
+-        proc: a subprocess.Popen (normal launch) or an AttachedProcess
+-        (restart-reattachment — see find_running_pid_for_exe()). Both
+-        expose poll()/wait()/kill(), so nothing below needs to know which
+-        one it has.
+-
+-        elapsed_seconds: how much time has already elapsed for this
+-        session before this watcher started tracking it — non-zero only
+-        for reattachment, where the game was already running before
+-        VaultPlay (re)started. 0.0 for a normal fresh launch.
+-        """
+         super().__init__(parent)
+         self._game_id         = game_id
+         self._proc            = proc
+         self._wine_bin        = wine_bin
+         self._wine_prefix     = wine_prefix
+         self._elapsed_seconds = max(0.0, elapsed_seconds)
+-        # Daemon so it doesn't block app exit if still running
+-        self.setTerminationEnabled(True)
++        self._abort           = False
++        self._wineserver_proc: Optional[subprocess.Popen] = None
++
++    # ── control ───────────────────────────────────────────────────────────
++    def request_abort(self):
++        """Ask run() to return promptly without recording (app shutting down).
++        Safe from any thread."""
++        self._abort = True
++        ws = self._wineserver_proc
++        if ws is not None:
++            try:
++                ws.terminate()      # only the `wineserver --wait` helper, not the game
++            except Exception:
++                pass
+ 
+     def request_kill(self):
+-        """
+-        Force-terminate the tracked process (Cogwheel → Force Quit).
+-        Does not touch thread/session bookkeeping directly — run() is
+-        already blocked waiting on this same process, so it detects the
+-        exit and records/ends the session exactly as it would for a
+-        normal quit. Safe to call from any thread; never raises.
+-        """
++        """Force Quit: terminate the tracked process AND everything else in
++        the prefix. run() then sees the exit and records the session normally."""
++        gid = self._game_id
+         try:
++            if is_proton(self._wine_bin):
++                pids = pids_in_prefix(self._wine_prefix)
++                for pid in pids:
++                    try:
++                        os.kill(pid, signal.SIGTERM)
++                    except OSError:
++                        pass
++                # Give them a moment, then SIGKILL stragglers.
++                time.sleep(1.5)
++                for pid in pids_in_prefix(self._wine_prefix):
++                    try:
++                        os.kill(pid, signal.SIGKILL)
++                    except OSError:
++                        pass
++            else:
++                env = {**os.environ, "WINEPREFIX": self._wine_prefix}
++                try:
++                    subprocess.run(["wineserver", "-k"], env=env, timeout=10)
++                except Exception as e:
++                    log.debug("[PLAYTIME] wineserver -k failed: %s", e)
+             self._proc.kill()
+-            log.info("[PLAYTIME] Force Quit requested for game_id=%d", self._game_id)
++            log.info("[PLAYTIME] Force Quit requested for game_id=%d", gid)
+         except Exception as e:
+-            log.warning("[PLAYTIME] request_kill failed for game_id=%d: %s",
+-                       self._game_id, e)
++            log.warning("[PLAYTIME] request_kill failed for game_id=%d: %s", gid, e)
+ 
++    # ── main ──────────────────────────────────────────────────────────────
+     def run(self):
+         start = datetime.datetime.utcnow() - datetime.timedelta(
+             seconds=self._elapsed_seconds)
+@@ -305,6 +276,12 @@ class PlaytimeWatcher(QThread):
+         else:
+             self._wait_wine()
+ 
++        if self._abort:
++            log.info("[PLAYTIME] Watcher for game_id=%d aborted (app closing) — "
++                     "session not recorded; will re-attach on next start",
++                     self._game_id)
++            return
++
+         end     = datetime.datetime.utcnow()
+         elapsed = (end - start).total_seconds()
+         minutes = int(elapsed / 60)
+@@ -328,25 +305,15 @@ class PlaytimeWatcher(QThread):
+ 
+         self.session_ended.emit(self._game_id, minutes)
+ 
++    def _sleep(self, seconds: float):
++        """Interruptible sleep."""
++        end = time.monotonic() + seconds
++        while not self._abort and time.monotonic() < end:
++            time.sleep(min(_SLICE, max(0.0, end - time.monotonic())))
++
+     def _wait_wine(self):
+-        """
+-        Block until all Wine processes in the prefix have exited, using
+-        `wineserver --wait`. Falls back to proc.wait() if wineserver is
+-        not available or if the prefix path is not set.
+-
+-        wineserver --wait waits on a wineserver that's ALREADY running for
+-        this prefix — it does not start one. If this is called right after
+-        the game's process was launched (which is exactly when
+-        PlaytimeWatcher.start() fires), it can race ahead of Wine actually
+-        spinning up its wineserver for this session — connecting to the X
+-        server, loading DLLs, etc. all take real wall-clock time. In that
+-        race window, wineserver --wait sees nothing running yet for this
+-        prefix and returns success in milliseconds, even though the game
+-        is still starting. Cross-checking self._proc.poll() catches this:
+-        if wineserver claims nothing is running while the process we
+-        actually launched is still alive, that's the race, not a real
+-        session end — retry instead of trusting it.
+-        """
++        """Block until all Wine processes in the prefix exit (wineserver --wait),
++        falling back to proc.wait(). Interruptible via request_abort()."""
+         if not self._wine_prefix:
+             log.warning("[PLAYTIME] No wine_prefix — falling back to proc.wait()")
+             self._wait_proc()
+@@ -356,84 +323,74 @@ class PlaytimeWatcher(QThread):
+         deadline = time.monotonic() + MAX_SESSION_SECONDS
+         logged_race = False
+ 
+-        while True:
+-            remaining = deadline - time.monotonic()
+-            if remaining <= 0:
+-                log.warning("[PLAYTIME] wineserver --wait retry loop hit 24h "
+-                           "safety cap — ending session")
++        while not self._abort:
++            if time.monotonic() >= deadline:
++                log.warning("[PLAYTIME] wineserver --wait hit 24h safety cap — ending session")
+                 return
+             try:
+-                t0 = time.monotonic()
+-                result = subprocess.run(
+-                    ["wineserver", "--wait"],
+-                    env=env,
+-                    timeout=remaining,
+-                )
+-                elapsed = time.monotonic() - t0
+-                log.debug("[PLAYTIME] wineserver --wait exited with code %d after %.2fs",
+-                          result.returncode, elapsed)
++                ws = subprocess.Popen(["wineserver", "--wait"], env=env)
+             except FileNotFoundError:
+                 log.warning("[PLAYTIME] wineserver not found — falling back to proc.wait()")
+                 self._wait_proc()
+                 return
+-            except subprocess.TimeoutExpired:
+-                log.warning("[PLAYTIME] wineserver --wait hit 24h safety cap — ending session")
+-                return
+             except Exception as e:
+                 log.warning("[PLAYTIME] wineserver --wait error: %s — falling back to proc.wait()", e)
+                 self._wait_proc()
+                 return
+ 
++            self._wineserver_proc = ws
++            try:
++                while ws.poll() is None:
++                    if self._abort:
++                        try:
++                            ws.terminate()
++                        except Exception:
++                            pass
++                        break
++                    if time.monotonic() >= deadline:
++                        try:
++                            ws.terminate()
++                        except Exception:
++                            pass
++                        return
++                    time.sleep(_SLICE)
++            finally:
++                self._wineserver_proc = None
++                try:
++                    ws.wait(timeout=2)
++                except Exception:
++                    pass
++
++            if self._abort:
++                return
++
+             if self._proc.poll() is None:
+-                # wineserver reported nothing running, but the process we
+-                # actually launched is still alive — startup race. Retry.
++                # wineserver said done but our launched process is alive — startup race.
+                 if not logged_race:
+                     log.info("[PLAYTIME] wineserver --wait returned but the launched "
+-                             "process is still running (likely raced ahead of "
+-                             "wineserver starting up) — retrying")
++                             "process is still running (startup race) — retrying")
+                     logged_race = True
+-                time.sleep(1.0)
++                self._sleep(1.0)
+                 continue
+-
+             return
+ 
+     def _wait_proton(self):
+-        """
+-        Block until every process belonging to this Proton session has
+-        exited — not just the top-level launched process.
+-
+-        proc.wait() alone is insufficient: some games run a launcher.exe
+-        stub under Proton that spawns the real game.exe and then exits,
+-        which would otherwise end the tracked session (and, previously,
+-        fire the post-play Save Backup prompt) within seconds of launch
+-        while the actual game keeps running. See module docstring.
+-        """
++        """Wait for the launched process, then for every process in the prefix."""
+         log.debug("[PLAYTIME] Using proc.wait() for Proton session")
+         self._wait_proc()
+-        self._wait_for_prefix_processes_to_exit()
++        if not self._abort:
++            self._wait_for_prefix_processes_to_exit()
+ 
+     def _wait_for_prefix_processes_to_exit(self, poll_interval: float = 2.0):
+-        """
+-        Poll /proc for any process whose environment shows
+-        STEAM_COMPAT_DATA_PATH matching this session's wine_prefix, and
+-        block until none remain (or the 24h safety cap is hit). This is
+-        the Proton equivalent of _wait_wine()'s `wineserver --wait` — see
+-        module docstring for why it's necessary and why it's reliable.
+-        No-op if wine_prefix wasn't provided (nothing to match against).
+-        """
+         if not self._wine_prefix:
+             return
+         target   = self._wine_prefix.rstrip("/")
+         deadline = time.monotonic() + MAX_SESSION_SECONDS
+ 
+-        # Give a just-exited top-level process a brief moment to have its
+-        # spawned child actually appear in /proc before the first check —
+-        # avoids a race where we check in the split second between the
+-        # launcher exiting and the real game.exe process existing.
+-        time.sleep(1.0)
++        self._sleep(1.0)
+ 
+         logged_continuation = False
+-        while time.monotonic() < deadline:
++        while not self._abort and time.monotonic() < deadline:
+             if not self._any_process_in_prefix(target):
+                 return
+             if not logged_continuation:
+@@ -441,74 +398,41 @@ class PlaytimeWatcher(QThread):
+                          "process(es) still running in prefix %s — "
+                          "continuing session", target)
+                 logged_continuation = True
+-            time.sleep(poll_interval)
++            self._sleep(poll_interval)
+ 
+-        log.warning("[PLAYTIME] Proton prefix process check hit 24h safety "
+-                    "cap — ending session")
++        if not self._abort:
++            log.warning("[PLAYTIME] Proton prefix process check hit 24h safety "
++                        "cap — ending session")
+ 
+     @staticmethod
+     def _any_process_in_prefix(target_prefix: str) -> bool:
+-        """
+-        True if any currently-running process has STEAM_COMPAT_DATA_PATH
+-        equal to target_prefix in its environment. Reading another
+-        process's /proc/<pid>/environ requires matching UID, which holds
+-        here since every Wine/Proton/Steam process runs as the same user.
+-        Silently skips any PID it can't read (permission errors, the
+-        process exiting mid-scan, zombies with empty environ) rather than
+-        treating a read failure as "still running".
+-        """
+-        try:
+-            pids = os.listdir("/proc")
+-        except OSError:
+-            return False
+-        for pid_str in pids:
+-            if not pid_str.isdigit():
+-                continue
+-            try:
+-                with open(f"/proc/{pid_str}/environ", "rb") as f:
+-                    raw = f.read()
+-            except (OSError, PermissionError):
+-                continue
+-            for entry in raw.split(b"\x00"):
+-                if entry.startswith(b"STEAM_COMPAT_DATA_PATH="):
+-                    value = entry.split(b"=", 1)[1].decode(errors="replace").rstrip("/")
+-                    if value == target_prefix:
+-                        return True
+-                    break
+-        return False
++        return bool(pids_in_prefix(target_prefix))
+ 
+     def _wait_proc(self):
+-        """
+-        Fall back: wait on the original Popen handle with a 24-hour cap.
+-        This is reliable for Proton and acceptable as a fallback for Wine
+-        (though Wine launchers sometimes exit early — prefer wineserver --wait).
+-        """
++        """Wait on the original handle in short slices (interruptible), 24h cap."""
++        deadline = time.monotonic() + MAX_SESSION_SECONDS
+         try:
+-            self._proc.wait(timeout=MAX_SESSION_SECONDS)
+-            log.debug("[PLAYTIME] proc.wait() returned, returncode=%s",
+-                      self._proc.returncode)
+-        except subprocess.TimeoutExpired:
+-            log.warning("[PLAYTIME] proc.wait() hit 24h safety cap — ending session")
+-            try:
+-                self._proc.kill()
+-            except Exception:
+-                pass
++            while not self._abort:
++                try:
++                    self._proc.wait(timeout=_SLICE)
++                    log.debug("[PLAYTIME] proc.wait() returned, returncode=%s",
++                              self._proc.returncode)
++                    return
++                except subprocess.TimeoutExpired:
++                    if time.monotonic() >= deadline:
++                        log.warning("[PLAYTIME] proc.wait() hit 24h safety cap — ending session")
++                        try:
++                            self._proc.kill()
++                        except Exception:
++                            pass
++                        return
+         except Exception as e:
+             log.warning("[PLAYTIME] proc.wait() error: %s", e)
+ 
+ 
+ def format_playtime(minutes: int) -> str:
+-    """
+-    Format a total playtime in minutes as a human-readable string.
+-
+-    Examples:
+-      0   → "No playtime recorded"
+-      45  → "45 minutes"
+-      60  → "1 hour"
+-      90  → "1 hour 30 minutes"
+-      120 → "2 hours"
+-      1445 → "1 day 0 hours"  (over 24h shown in days)
+-    """
++    """Human-readable playtime: 0 → "No playtime recorded", 90 → "1 hour 30 minutes",
++    >24h shown in days."""
+     if minutes <= 0:
+         return "No playtime recorded"
+     if minutes < 60:
+diff --git a/src/save_backup.py b/src/save_backup.py
+index 96c3623..4eeb283 100644
+--- a/src/save_backup.py
++++ b/src/save_backup.py
+@@ -875,8 +875,15 @@ def move_and_link(source_folder: Path, save_root: Path, game_folder_name: str,
+ 
+     if canonical.exists():
+         # Only reached with overwrite_confirmed=True — the caller already
+-        # obtained explicit user confirmation before this point.
+-        shutil.rmtree(canonical)
++        # obtained explicit user confirmation before this point. The old
++        # backup is MOVED to <save_root>/_replaced/ rather than deleted, so
++        # even a confirmed overwrite is recoverable.
++        import datetime as _dt
++        aside = (Path(save_root) / "_replaced" / "PC" / game_folder_name
++                 / _dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
++        aside.parent.mkdir(parents=True, exist_ok=True)
++        shutil.move(str(canonical), str(aside))
++        log.info("[SAVE BACKUP] Previous backup moved aside to %s", aside)
+ 
+     shutil.move(str(source_folder), str(canonical))
+ 
+@@ -890,6 +897,14 @@ def move_and_link(source_folder: Path, save_root: Path, game_folder_name: str,
+ 
+     log.info("[SAVE BACKUP] Moved %s → %s (symlink left behind)",
+              source_folder, canonical)
++
++    # Remember WHERE in the prefix this save lives so a fresh install can
++    # restore it automatically (see save_restore.py).
++    try:
++        import save_restore
++        save_restore.write_manifest(save_root, game_folder_name, source_folder)
++    except Exception as e:
++        log.warning("[SAVE BACKUP] Could not write restore manifest: %s", e)
+     return canonical
+ 
+ 
+diff --git a/src/steamdb.py b/src/steamdb.py
+index 77123f1..e18c6a4 100644
+--- a/src/steamdb.py
++++ b/src/steamdb.py
+@@ -84,11 +84,11 @@ REDIST_TEXT_PATTERNS = [
+     # DirectX — handles both "DirectX 11" and "DirectX: Version 11"
+     (re.compile(r"directx[\s:]*(?:version\s*)?9|dx\s*9|d3d\s*9",    re.I), ["d3dx9"]),
+     (re.compile(r"directx[\s:]*(?:version\s*)?10|dx\s*10|d3d\s*10", re.I), ["d3dx10", "d3dcompiler_47"]),
+-    (re.compile(r"directx[\s:]*(?:version\s*)?11|dx\s*11|d3d\s*11", re.I), ["d3dx11", "d3dcompiler_47"]),
++    (re.compile(r"directx[\s:]*(?:version\s*)?11|dx\s*11|d3d\s*11", re.I), ["d3dx11_43", "d3dcompiler_47"]),
+     (re.compile(r"directx[\s:]*(?:version\s*)?12|dx\s*12|d3d\s*12", re.I), ["d3dcompiler_47"]),
+     # Generic DirectX — only when no version info follows
+     (re.compile(r"directx(?![\s:]*(?:version\s*)?\d)", re.I),
+-     ["d3dx9", "d3dx11", "d3dcompiler_47"]),
++     ["d3dx9", "d3dx11_43", "d3dcompiler_47"]),
+     (re.compile(r"d3dcompiler", re.I),               ["d3dcompiler_47"]),
+     (re.compile(r"xna\b|xna game studio", re.I),     ["xact"]),
+     (re.compile(r"\bxact\b", re.I),                  ["xact"]),
+@@ -105,7 +105,7 @@ ENGINE_HINTS = [
+     (re.compile(r"unity\b|unity engine", re.I),
+      ["vcrun2019", "vcrun2022"]),
+     (re.compile(r"cryengine|cry engine", re.I),
+-     ["vcrun2019", "d3dx11", "d3dcompiler_47"]),
++     ["vcrun2019", "d3dx11_43", "d3dcompiler_47"]),
+     (re.compile(r"source engine|source 2", re.I),
+      ["vcrun2019", "d3dcompiler_47"]),
+     (re.compile(r"gamemaker|game maker studio", re.I),
+diff --git a/src/ui/cogwheel_menu.py b/src/ui/cogwheel_menu.py
+index c833064..364fbbf 100644
+--- a/src/ui/cogwheel_menu.py
++++ b/src/ui/cogwheel_menu.py
+@@ -294,7 +294,7 @@ class InstallPathsDialog(QDialog):
+ # ── Section box (mirrors ui/install_dialog.py's SectionBox styling) ──────────
+ 
+ class SectionBox(QFrame):
+-    def __init__(self, title=None, parent=None):
++    def __init__(self, title=None, parent=None, subtitle=None):
+         super().__init__(parent)
+         self.setStyleSheet(f"""
+             QFrame {{
+@@ -308,10 +308,17 @@ class SectionBox(QFrame):
+         if title:
+             lbl = QLabel(title.upper())
+             lbl.setFont(QFont("DM Mono", 8))
++            lbl.setWordWrap(True)   # long titles wrap instead of running off-screen
+             lbl.setStyleSheet(
+                 f"color: {COLORS['text_muted']}; letter-spacing: 2px;"
+                 f" {_LABEL_BASE}")
+             self._inner.addWidget(lbl)
++        if subtitle:
++            sub = QLabel(subtitle)
++            sub.setFont(QFont("DM Sans", 10))
++            sub.setWordWrap(True)
++            sub.setStyleSheet(f"color: {COLORS['text_muted']}; {_LABEL_BASE}")
++            self._inner.addWidget(sub)
+ 
+     def add(self, widget):
+         self._inner.addWidget(widget)
+@@ -404,11 +411,13 @@ def _currently_applied_redists(game_id: int, wine_prefix: str) -> set:
+         original install-time run. This is what makes an install made
+         before installs.redists existed still pre-check correctly.
+     """
+-    stored = set(db.get_install_redists(game_id))
+-    on_disk: set = set()
++    # Only what winetricks has actually recorded as installed — requested
++    # and failed verbs are tracked separately (installs.redists /
++    # installs.redists_failed) and shown as "not installed" below.
+     if wine_prefix and Path(wine_prefix).exists():
+-        on_disk = install_mod.get_installed_redists(Path(wine_prefix))
+-    return stored | on_disk
++        return set(install_mod.normalize_redists(
++            list(install_mod.get_installed_redists(Path(wine_prefix)))))
++    return set()
+ 
+ 
+ class _ManageApplyWorker(QThread):
+@@ -460,8 +469,9 @@ class ManageInstallDialog(QDialog):
+         title = game["title"] or game["display_name"] or game["folder_name"]
+         self.setWindowTitle(f"Manage Install — {title}")
+         self.setModal(True)
+-        self.setMinimumWidth(560)
+-        self.setFixedWidth(600)
++        # Resizable: the user can widen it; content wraps/shrinks instead of clipping.
++        self.setMinimumWidth(480)
++        self.resize(720, 780)
+         self.setStyleSheet(f"QDialog {{ background: {COLORS['surface']}; }}")
+ 
+         root = QVBoxLayout(self)
+@@ -471,7 +481,7 @@ class ManageInstallDialog(QDialog):
+         scroll = QScrollArea()
+         scroll.setWidgetResizable(True)
+         scroll.setFrameShape(QFrame.Shape.NoFrame)
+-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
++        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+ 
+         body = QWidget()
+         body.setStyleSheet(f"background: {COLORS['surface']};")
+@@ -495,15 +505,20 @@ class ManageInstallDialog(QDialog):
+         matched_label = next((lbl for lbl, val in versions if val == current), "")
+         tier = _safe_get(game, "protondb_tier", "") or ""
+         reports = _safe_get(game, "protondb_reports", 0) or 0
+-        proton_title = "Proton / Wine Version"
++        sub_parts = []
+         if tier:
+             tier_label, _ = protondb_mod.tier_display(tier)
+-            proton_title += f"  ·  ProtonDB: {tier_label} ({reports} reports)"
++            sub_parts.append(f"ProtonDB: {tier_label} ({reports} reports)")
+         if matched_label:
+-            proton_title += f"  ·  currently: {matched_label}"
++            sub_parts.append(f"currently: {matched_label}")
+ 
+-        proton_box = SectionBox(proton_title)
++        proton_box = SectionBox("Proton / Wine Version",
++                                subtitle="  ·  ".join(sub_parts) or None)
+         self.proton_combo = NoScrollComboBox()
++        # Long version names must not force the dialog wider than the screen.
++        self.proton_combo.setSizeAdjustPolicy(
++            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
++        self.proton_combo.setMinimumContentsLength(16)
+         self.proton_combo.setFont(QFont("DM Sans", 11))
+         if not versions:
+             self.proton_combo.addItem("No versions found — install via ProtonUp-Qt", "")
+@@ -540,8 +555,28 @@ class ManageInstallDialog(QDialog):
+         body_l.addWidget(proton_box)
+ 
+         # ── Redistributables ─────────────────────────────────────────────────
++        import steamdb as steamdb_mod
+         applied = _currently_applied_redists(self._game_id, _safe_get(game, "wine_prefix", ""))
+-        redist_box = SectionBox(f"Redistributables  ·  {len(applied)} currently applied")
++        try:
++            failed_prev = set(install_mod.normalize_redists(
++                json.loads(_safe_get(game, "redists_failed") or "[]")))
++        except (TypeError, ValueError):
++            failed_prev = set()
++        wanted = set(install_mod.normalize_redists(
++            db.get_install_redists(self._game_id))) | failed_prev
++        try:
++            rec = steamdb_mod.get_redists_for_install(
++                _safe_get(game, "steam_app_id"), title,
++                auto_detect=db.get_setting("auto_detect_redists", "true") == "true")["auto"]
++            wanted |= set(install_mod.normalize_redists(rec))
++        except Exception as e:
++            log.debug("Manage Install: could not load recommended redists: %s", e)
++        missing = {v for v in wanted if v in COMMON_REDISTS and v not in applied}
++
++        redist_sub = f"{len(applied & set(COMMON_REDISTS))} applied"
++        if missing:
++            redist_sub += f"  ·  {len(missing)} recommended but not installed"
++        redist_box = SectionBox("Redistributables", subtitle=redist_sub)
+         self._checks: dict[str, QCheckBox] = {}
+         grid_w = QWidget()
+         grid_w.setStyleSheet("background: transparent; border: none;")
+@@ -551,14 +586,16 @@ class ManageInstallDialog(QDialog):
+         col1.setSpacing(4)
+         col2.setSpacing(4)
+         for i, verb in enumerate(COMMON_REDISTS):
+-            cb = QCheckBox(verb)
+-            cb.setFont(QFont("DM Mono", 10))
+             is_applied = verb in applied
+-            cb.setChecked(is_applied)
+-            cb.setStyleSheet(
+-                f"color: {COLORS['accent2']};" if is_applied
+-                else f"color: {COLORS['text_dim']};"
+-            )
++            is_missing = verb in missing
++            suffix = ("   ✓ applied" if is_applied
++                      else "   ✗ not installed" if is_missing else "")
++            cb = QCheckBox(verb + suffix)
++            cb.setFont(QFont("DM Mono", 10))
++            cb.setChecked(is_applied or is_missing)
++            color = ("#4ade80" if is_applied
++                     else COLORS['danger'] if is_missing else COLORS['text_dim'])
++            cb.setStyleSheet(f"color: {color};")
+             self._checks[verb] = cb
+             (col1 if i % 2 == 0 else col2).addWidget(cb)
+         grid_l.addLayout(col1)
+@@ -917,6 +954,9 @@ class CogwheelButton(QPushButton):
+         relink_action.setEnabled(diag in ("missing", "plain_folder", "wrong_symlink"))
+         relink_action.triggered.connect(lambda: self._relink_save(game, source_path, save_path))
+ 
++        restore_action = save_menu.addAction("Restore from Backup…")
++        restore_action.triggered.connect(lambda: self._restore_from_backup(game))
++
+         open_action = save_menu.addAction("Open Save Backup Directory")
+         open_action.setEnabled(bool(save_path and Path(save_path).exists()))
+         open_action.triggered.connect(lambda: self._open_path(save_path))
+@@ -1033,13 +1073,30 @@ class CogwheelButton(QPushButton):
+         try:
+             canonical = save_backup.move_and_link(Path(chosen), save_root, game["folder_name"])
+         except save_backup.SaveMoveConflict as e:
+-            reply = QMessageBox.question(
+-                self, "Save Files",
+-                f"A backed-up save already exists at:\n{e.canonical_path}\n\n"
+-                "Continuing will overwrite it with the save you just picked. Continue?",
+-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+-                QMessageBox.StandardButton.Cancel)
+-            if reply != QMessageBox.StandardButton.Yes:
++            box = QMessageBox(self)
++            box.setWindowTitle("Save Files")
++            box.setText("You already have a backed-up save for this game.")
++            box.setInformativeText(
++                f"Backup: {e.canonical_path}\n\n"
++                "Use your existing backup (the folder you picked is linked to it), "
++                "or replace the backup with what's in the folder you picked? "
++                "Whichever you don't choose is kept in a “_replaced” folder.")
++            use_btn = box.addButton("Use My Existing Backup", QMessageBox.ButtonRole.AcceptRole)
++            rep_btn = box.addButton("Replace Backup", QMessageBox.ButtonRole.DestructiveRole)
++            box.addButton(QMessageBox.StandardButton.Cancel)
++            box.setDefaultButton(use_btn)
++            box.exec()
++            clicked = box.clickedButton()
++            if clicked == use_btn:
++                import save_restore
++                r = save_restore.adopt_existing_backup(game_id, game["folder_name"], Path(chosen), save_root)
++                if r.get("ok"):
++                    QMessageBox.information(self, "Save Files", "✓ Linked to your existing backup.")
++                    self.game_changed.emit(game_id)
++                else:
++                    QMessageBox.warning(self, "Save Files", f"Restore failed:\n{r.get('error')}")
++                return
++            if clicked != rep_btn:
+                 return
+             try:
+                 canonical = save_backup.move_and_link(
+@@ -1059,6 +1116,22 @@ class CogwheelButton(QPushButton):
+         QMessageBox.information(self, "Save Files", msg)
+         self.game_changed.emit(game_id)
+ 
++    def _restore_from_backup(self, game):
++        """Manual trigger for the same restore offer shown before launch."""
++        wine_prefix = (game["wine_prefix"] or "").strip()
++        if not wine_prefix or not Path(wine_prefix).exists():
++            QMessageBox.warning(self, "Save Files", "Wine prefix not found — set it first.")
++            return
++        wine_bin = install_mod.parse_wine_bin_from_cmd(_safe_get(game, "launch_cmd", "") or "")
++        # The offer logic lives on GameDetailView (needs db + dialogs); reuse it.
++        host = self.parent()
++        while host is not None and not hasattr(host, "_offer_save_restore"):
++            host = host.parent()
++        if host is None:
++            return
++        if host._offer_save_restore(game, wine_bin, wine_prefix, manual=True):
++            self.game_changed.emit(game["id"])
++
+     def _relink_save(self, game, source_path, save_path):
+         if not source_path or not save_path:
+             return
+diff --git a/src/ui/game_detail.py b/src/ui/game_detail.py
+index eade3ce..21c5dcf 100644
+--- a/src/ui/game_detail.py
++++ b/src/ui/game_detail.py
+@@ -373,6 +373,11 @@ class _GalleryPreview(QWidget):
+         self._is_video = False
+         self._scaled: QPixmap | None = None
+         self._scaled_key = None
++        self._ring = False   # Controller Support focus ring
++
++    def set_ring(self, on: bool):
++        self._ring = on
++        self.update()
+ 
+     def set_content(self, pix, is_video: bool):
+         self._pix = pix
+@@ -429,8 +434,12 @@ class _GalleryPreview(QWidget):
+ 
+         p.setClipping(False)
+         p.setBrush(Qt.BrushStyle.NoBrush)
+-        p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+-        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 10, 10)
++        if self._ring:
++            p.setPen(QPen(QColor(COLORS["accent"]), 3))
++            p.drawRoundedRect(QRectF(1.5, 1.5, w - 3, h - 3), 10, 10)
++        else:
++            p.setPen(QPen(QColor(255, 255, 255, 20), 1))
++            p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 10, 10)
+         p.end()
+ 
+     def mousePressEvent(self, event):
+@@ -606,6 +615,23 @@ class MediaGalleryWidget(QWidget):
+     def has_items(self) -> bool:
+         return bool(self._items)
+ 
++    # ── Controller Support ────────────────────────────────────────────────
++
++    def controller_step(self, delta: int) -> bool:
++        """Select the previous/next gallery item. False at either end."""
++        i = self._current + delta
++        if not (0 <= i < len(self._items)):
++            return False
++        self._select(i)
++        return True
++
++    def controller_activate(self):
++        """A button — plays the selected item if it's a video."""
++        self._on_preview_clicked()
++
++    def set_controller_focused(self, on: bool):
++        self.preview.set_ring(on)
++
+     def clear(self):
+         for t in self._thumbs:
+             self.strip_layout.removeWidget(t)
+@@ -849,6 +875,15 @@ class GameDetailView(QWidget):
+         self._ctrl_focus_visible = False
+         self._ctrl_orig_style: dict = {}   # id(widget) -> its original styleSheet
+ 
++        # Stale-art guards: the URL each async art load is currently allowed
++        # to paint. A loader finishing for any other URL (e.g. the previous
++        # game's) is ignored, and load_game()/load_wishlist_item() reset the
++        # hero + cover up front so a game with no art shows none.
++        self._hero_url_expected = ""
++        self._cover_url_expected = ""
++        self._trailer_thumb_expected = ""
++        self._wishlist_art_token = None
++
+         root = QVBoxLayout(self)
+         root.setContentsMargins(0, 0, 0, 0)
+         root.setSpacing(0)
+@@ -1246,6 +1281,27 @@ class GameDetailView(QWidget):
+         self.install_btn.clicked.connect(self._on_install_clicked)
+         install_card_layout.addWidget(self.install_btn)
+ 
++        # Already have it set up outside VaultPlay (or lost the DB entry)?
++        # Re-create the install record from an existing install folder,
++        # wine prefix and/or .desktop file. Only visible when not installed.
++        self.locate_btn = QPushButton("📂  Already installed? Locate Game…")
++        self.locate_btn.setFont(QFont("DM Sans", 11))
++        self.locate_btn.setStyleSheet(f"""
++            QPushButton {{
++                background: {COLORS['surface2']};
++                border: 1px solid {COLORS['border']};
++                border-radius: 8px;
++                color: {COLORS['text_muted']};
++                padding: 8px 14px;
++            }}
++            QPushButton:hover {{
++                color: {COLORS['text']};
++                background: {COLORS['surface3']};
++            }}
++        """)
++        self.locate_btn.clicked.connect(self._on_locate_clicked)
++        install_card_layout.addWidget(self.locate_btn)
++
+         # Launch button + Cogwheel Menu button, side by side (Blizzard-style —
+         # see Cogwheel Menu spec). Cogwheel only ever shows for installed
+         # games, launch-detected or not (the warning state still needs it,
+@@ -1445,11 +1501,39 @@ class GameDetailView(QWidget):
+         if not is_game:
+             self.media_gallery.clear()
+ 
++    def _reset_art(self):
++        """Clear hero + cover back to the empty placeholder. Called on every
++        load so a game with no art never inherits the previous page's art."""
++        self.hero._bg_pix = None
++        self.hero.update()
++        self.cover_img.setPixmap(QPixmap())
++        self.cover_img.setStyleSheet(f"""
++            background: {COLORS['surface2']};
++            border: 2px solid rgba(255,255,255,0.12);
++            border-radius: 8px;
++        """)
++
++    def _reset_art_cover_only(self):
++        self.cover_img.setPixmap(QPixmap())
++        self.cover_img.setStyleSheet(f"""
++            background: {COLORS['surface2']};
++            border: 2px solid rgba(255,255,255,0.12);
++            border-radius: 8px;
++        """)
++
+     # ── Load game ─────────────────────────────────────────────────────────────
+ 
+     def load_game(self, game_id: int):
++        # Reset art only when switching to a different game/mode; a reload of
++        # the same game (favorite toggle etc.) keeps its art without flicker.
++        _switching = (self._mode != "game" or self._game_id != game_id)
+         self._mode = "game"
+         self._wishlist_item_id = None
++        self._wishlist_art_token = None
++        if _switching:
++            self._reset_art()
++            self._hero_url_expected = ""
++            self._cover_url_expected = ""
+         self._apply_mode_visibility()
+         self._ctrl_focused_widget = None
+ 
+@@ -1747,6 +1831,7 @@ class GameDetailView(QWidget):
+ 
+         if game["is_installed"]:
+             self.install_btn.hide()
++            self.locate_btn.hide()
+             self.cogwheel_btn.set_game(game_id)
+             self.cogwheel_btn.show()
+             exe = (game["exe_path"] or "").strip()
+@@ -1767,6 +1852,7 @@ class GameDetailView(QWidget):
+             self.uninstall_btn.show()
+         else:
+             self.install_btn.show()
++            self.locate_btn.show()
+             self.launch_btn.hide()
+             self.cogwheel_btn.hide()
+             self._launch_btn_available = False
+@@ -1788,13 +1874,24 @@ class GameDetailView(QWidget):
+         self._screenshots_title.setVisible(self.media_gallery.has_items())
+ 
+         # Async load hero + cover
+-        if game["hero_url"]:
+-            loader = ImageLoader(game["hero_url"])
++        new_hero = game["hero_url"] or ""
++        new_cover = game["cover_url"] or ""
++        if new_hero != self._hero_url_expected:
++            # URL changed (e.g. edited metadata) — drop the old hero.
++            self.hero._bg_pix = None
++            self.hero.update()
++        if new_cover != self._cover_url_expected:
++            self._reset_art_cover_only()
++        self._hero_url_expected = new_hero
++        self._cover_url_expected = new_cover
++
++        if new_hero:
++            loader = ImageLoader(new_hero)
+             loader.signals.loaded.connect(self._on_hero_loaded)
+             self._pool.start(loader)
+ 
+-        if game["cover_url"]:
+-            loader = ImageLoader(game["cover_url"])
++        if new_cover:
++            loader = ImageLoader(new_cover)
+             loader.signals.loaded.connect(self._on_cover_loaded)
+             self._pool.start(loader)
+ 
+@@ -1835,6 +1932,9 @@ class GameDetailView(QWidget):
+         """
+         self._mode = "wishlist"
+         self._wishlist_item_id = item_id
++        self._hero_url_expected = ""
++        self._cover_url_expected = ""
++        self._wishlist_art_token = object()
+         self._apply_mode_visibility()
+         self._ctrl_focused_widget = None
+ 
+@@ -1906,8 +2006,11 @@ class GameDetailView(QWidget):
+         self.hero.update()
+         cover_url = item.get("cover_url") or ""
+         if cover_url:
++            _tok = self._wishlist_art_token
+             loader = _WishlistArtLoader(cover_url)
+-            loader.signals.loaded.connect(self._on_wishlist_art_loaded)
++            loader.signals.loaded.connect(
++                lambda path, _t=_tok: self._on_wishlist_art_loaded(path)
++                if _t is self._wishlist_art_token else None)
+             self._pool.start(loader)
+ 
+         # ── Trailer ───────────────────────────────────────────────────────────
+@@ -1941,12 +2044,15 @@ class GameDetailView(QWidget):
+         if not trailer_url:
+             return
+         thumb_url = _youtube_thumbnail_url(trailer_url)
++        self._trailer_thumb_expected = thumb_url or ""
+         if thumb_url:
+             loader = ImageLoader(thumb_url)
+             loader.signals.loaded.connect(self._on_trailer_thumb_loaded)
+             self._pool.start(loader)
+ 
+     def _on_trailer_thumb_loaded(self, url: str, local_path: str):
++        if url != self._trailer_thumb_expected:
++            return
+         pix = QPixmap(local_path)
+         if not pix.isNull():
+             self.trailer_thumb.set_thumbnail_pixmap(pix)
+@@ -2104,9 +2210,13 @@ class GameDetailView(QWidget):
+             self.launch_btn.setEnabled(True)
+ 
+     def _on_hero_loaded(self, url: str, local_path: str):
++        if self._mode != "game" or url != self._hero_url_expected:
++            return   # stale load for a previously viewed game
+         self.hero.set_image(local_path)
+ 
+     def _on_cover_loaded(self, url: str, local_path: str):
++        if self._mode != "game" or url != self._cover_url_expected:
++            return   # stale load for a previously viewed game
+         pix = QPixmap(local_path)
+         if not pix.isNull():
+             scaled = pix.scaled(110, 165,
+@@ -2374,6 +2484,19 @@ class GameDetailView(QWidget):
+         dlg.install_finished.connect(self._on_install_finished)
+         dlg.exec()
+ 
++    def _on_locate_clicked(self):
++        """Open the Locate Game dialog (adopt an existing install)."""
++        if not self._game_id:
++            return
++        game = db.get_game(self._game_id)
++        if not game:
++            return
++        from ui.locate_game_dialog import LocateGameDialog
++        dlg = LocateGameDialog(dict(game), parent=self)
++        if dlg.exec():
++            self.load_game(self._game_id)
++            self.install_finished.emit(self._game_id)
++
+     def _maybe_snapshot_before_launch(self, game, wine_bin: str, wine_prefix: str):
+         """
+         Save Backup pre-launch hook, covering all three flows:
+@@ -2408,6 +2531,10 @@ class GameDetailView(QWidget):
+         if not wine_prefix:
+             return
+         try:
++            # Fresh install / recreated prefix: offer to restore the backup
++            # BEFORE the game runs, so it starts from the user's progress.
++            self._offer_save_restore(game, wine_bin, wine_prefix)
++
+             existing = db.get_save_paths(self._game_id)
+             source_path = existing.get("save_source_path")
+             save_path   = existing.get("save_path")
+@@ -2416,6 +2543,16 @@ class GameDetailView(QWidget):
+                       self._game_id, game["folder_name"], diag)
+ 
+             if diag == "ok":
++                # Back-fill the restore manifest for saves linked before it
++                # existed, so a future fresh install can restore automatically.
++                try:
++                    import save_restore
++                    _root = Path(db.get_setting(
++                        "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
++                    if save_restore.read_manifest(_root, game["folder_name"]) is None:
++                        save_restore.write_manifest(_root, game["folder_name"], source_path)
++                except Exception as _e:
++                    log.debug("[SAVE RESTORE] manifest backfill skipped: %s", _e)
+                 return  # linked and intact — nothing to do
+ 
+             if diag == "canonical_missing":
+@@ -2485,6 +2622,75 @@ class GameDetailView(QWidget):
+         except Exception as e:
+             log.warning("[SAVE BACKUP] Pre-launch check/snapshot failed: %s", e)
+ 
++    def _offer_save_restore(self, game, wine_bin: str, wine_prefix: str,
++                            manual: bool = False) -> bool:
++        """
++        Look for a backup (main save and/or achievements/stats) that exists in
++        the Save Backup folder but isn't linked into this game's prefix, and
++        offer to restore it. See save_restore.py for why this was missing.
++        manual=True (Cogwheel → Restore from Backup) ignores "don't ask again"
++        and reports when there is nothing to restore. Returns True if anything
++        was restored. Never raises.
++        """
++        try:
++            import save_restore
++            import installer as install_mod
++            gid = self._game_id
++            if not manual and db.get_setting(f"save_restore_declined_{gid}", "") == "true":
++                return False
++
++            save_root = Path(db.get_setting(
++                "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
++            actual = install_mod._resolve_actual_prefix(Path(wine_prefix), wine_bin)
++            drive_c = actual / "drive_c"
++            if not drive_c.exists():
++                return False
++            proton = Path(wine_bin or "").name == "proton"
++            linked = [e.get("canonical_path") for e in db.get_save_extra_paths(gid)
++                      if e.get("canonical_path")]
++            info = save_restore.find_restorable(
++                save_root, game["folder_name"], drive_c, proton, linked)
++
++            # The main save is only restorable when it isn't linked yet.
++            paths = db.get_save_paths(gid)
++            if save_backup.diagnose_source_path(
++                    paths.get("save_source_path"), paths.get("save_path")) == "ok":
++                info["main"] = None
++
++            if not info["main"] and not info["extras"]:
++                if manual:
++                    msg = "Nothing to restore — your backup is already linked."
++                    if info.get("legacy_main"):
++                        msg = ("A backup exists, but it was made before VaultPlay recorded "
++                               "where it belongs, so it can't be placed automatically.\n\n"
++                               "Use Save Files → Re-Link Save Location… and pick this game's "
++                               "save folder — choose “Use my existing backup” when asked.")
++                    QMessageBox.information(self, "Restore from Backup", msg)
++                return False
++
++            from ui.save_restore_dialog import SaveRestoreDialog
++            title = game["title"] or game["display_name"] or game["folder_name"]
++            dlg = SaveRestoreDialog(title, info, parent=self)
++            if dlg.exec() != SaveRestoreDialog.DialogCode.Accepted:
++                if dlg.never:
++                    db.set_setting(f"save_restore_declined_{gid}", "true")
++                return False
++
++            res = save_restore.restore_all(
++                gid, game["folder_name"], save_root, info,
++                dlg.want_main(), dlg.want_extras())
++            if res["errors"]:
++                QMessageBox.warning(self, "Restore from Backup",
++                                    "Some items could not be restored:\n\n" + "\n".join(res["errors"]))
++            did = bool(res["main"] or res["extras"])
++            if did:
++                log.info("[SAVE RESTORE] game_id=%d restored main=%s extras=%s",
++                         gid, res["main"], res["extras"])
++            return did
++        except Exception as e:
++            log.warning("[SAVE RESTORE] restore offer failed: %s", e)
++            return False
++
+     def _warn_broken_save_link(self, game, source_path, save_path):
+         """Shared fallback warning: shown when a broken link couldn't be
+         auto-repaired (Flow 3 repair_link() failed) or, previously, for
+@@ -2661,12 +2867,8 @@ class GameDetailView(QWidget):
+                                 f"Could not open folder:\n{e}")
+ 
+     def _on_uninstall_clicked(self):
+-        """
+-        Three-step uninstall:
+-          1. Remove the DB record + desktop/script files (always)
+-          2. Ask: delete game files?
+-          3. Ask: delete Wine prefix?
+-        """
++        """Single-window uninstall: ui/uninstall_dialog.py asks what to remove
++        (record/shortcut, game files, Wine prefix) with checkboxes."""
+         if not self._game_id:
+             return
+         game = db.get_game(self._game_id)
+@@ -2679,93 +2881,47 @@ class GameDetailView(QWidget):
+         desktop_path = (game["desktop_path"] or "").strip()
+         script_path  = (game["script_path"]  or "").strip()
+ 
+-        # ── Step 1: confirm and remove DB record ──────────────────────────────
+-        confirm = QMessageBox(self)
+-        confirm.setWindowTitle("Uninstall Game")
+-        confirm.setText(f"Uninstall <b>{title}</b>?")
+-        confirm.setInformativeText(
+-            "This will remove the VaultPlay install record, "
+-            "desktop shortcut, and launcher script.\n\n"
+-            "You will be asked separately about game files and the Wine prefix."
+-        )
+-        confirm.setStandardButtons(
+-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+-        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
+-        confirm.setStyleSheet(
+-            f"QMessageBox {{ background: {COLORS['surface']}; "
+-            f"color: {COLORS['text']}; }}")
+-        if confirm.exec() != QMessageBox.StandardButton.Yes:
++        from PyQt6.QtWidgets import QDialog
++        from ui.uninstall_dialog import UninstallDialog
++        dlg = UninstallDialog(title, install_path, wine_prefix, parent=self)
++        if dlg.exec() != QDialog.DialogCode.Accepted:
+             return
+ 
+-        # Remove desktop shortcut and launcher script
+-        for p in [desktop_path, script_path]:
+-            if p and Path(p).exists():
+-                try:
+-                    Path(p).unlink()
+-                    log.info("Deleted: %s", p)
+-                except Exception as e:
+-                    log.warning("Could not delete %s: %s", p, e)
++        errors = []
+ 
+-        # Remove install record from DB
+-        try:
+-            db.remove_install(self._game_id)
+-            log.info("Uninstalled game %d (%s) — DB record removed", self._game_id, title)
+-        except Exception as e:
+-            log.error("remove_install failed: %s", e)
+-
+-        # ── Step 2: delete game files? ────────────────────────────────────────
+-        if install_path and Path(install_path).exists():
+-            files_msg = QMessageBox(self)
+-            files_msg.setWindowTitle("Delete Game Files?")
+-            files_msg.setText(f"Delete game files for <b>{title}</b>?")
+-            files_msg.setInformativeText(
+-                f"This will permanently delete:\n{install_path}\n\n"
+-                "This cannot be undone."
+-            )
+-            yes_btn    = files_msg.addButton("Delete Game Files",
+-                                              QMessageBox.ButtonRole.DestructiveRole)
+-            keep_btn   = files_msg.addButton("Keep Files",
+-                                              QMessageBox.ButtonRole.AcceptRole)
+-            files_msg.setDefaultButton(keep_btn)
+-            files_msg.setStyleSheet(
+-                f"QMessageBox {{ background: {COLORS['surface']}; "
+-                f"color: {COLORS['text']}; }}")
+-            files_msg.exec()
+-            if files_msg.clickedButton() == yes_btn:
+-                try:
+-                    shutil.rmtree(install_path)
+-                    log.info("Deleted game files: %s", install_path)
+-                except Exception as e:
+-                    QMessageBox.warning(self, "Delete Failed",
+-                                        f"Could not delete game files:\n{e}")
+-
+-        # ── Step 3: delete Wine prefix? ───────────────────────────────────────
+-        if wine_prefix and Path(wine_prefix).exists():
+-            prefix_msg = QMessageBox(self)
+-            prefix_msg.setWindowTitle("Delete Wine Prefix?")
+-            prefix_msg.setText(f"Delete the Wine prefix for <b>{title}</b>?")
+-            prefix_msg.setInformativeText(
+-                f"This will permanently delete:\n{wine_prefix}\n\n"
+-                "Only do this if no other games share this prefix."
+-            )
+-            yes_btn2   = prefix_msg.addButton("Delete Prefix",
+-                                               QMessageBox.ButtonRole.DestructiveRole)
+-            keep_btn2  = prefix_msg.addButton("Keep Prefix",
+-                                               QMessageBox.ButtonRole.AcceptRole)
+-            prefix_msg.setDefaultButton(keep_btn2)
+-            prefix_msg.setStyleSheet(
+-                f"QMessageBox {{ background: {COLORS['surface']}; "
+-                f"color: {COLORS['text']}; }}")
+-            prefix_msg.exec()
+-            if prefix_msg.clickedButton() == yes_btn2:
+-                try:
+-                    shutil.rmtree(wine_prefix)
+-                    log.info("Deleted Wine prefix: %s", wine_prefix)
+-                except Exception as e:
+-                    QMessageBox.warning(self, "Delete Failed",
+-                                        f"Could not delete Wine prefix:\n{e}")
++        if dlg.remove_record():
++            for p in [desktop_path, script_path]:
++                if p and Path(p).exists():
++                    try:
++                        Path(p).unlink()
++                        log.info("Deleted: %s", p)
++                    except Exception as e:
++                        log.warning("Could not delete %s: %s", p, e)
++            try:
++                db.remove_install(self._game_id)
++                log.info("Uninstalled game %d (%s) — DB record removed",
++                         self._game_id, title)
++            except Exception as e:
++                log.error("remove_install failed: %s", e)
++                errors.append(f"Could not remove the install record:\n{e}")
++
++        if dlg.delete_files() and install_path and Path(install_path).exists():
++            try:
++                shutil.rmtree(install_path)
++                log.info("Deleted game files: %s", install_path)
++            except Exception as e:
++                errors.append(f"Could not delete game files:\n{e}")
++
++        if dlg.delete_prefix() and wine_prefix and Path(wine_prefix).exists():
++            try:
++                shutil.rmtree(wine_prefix)
++                log.info("Deleted Wine prefix: %s", wine_prefix)
++            except Exception as e:
++                errors.append(f"Could not delete Wine prefix:\n{e}")
++
++        if errors:
++            QMessageBox.warning(self, "Uninstall", "\n\n".join(errors))
+ 
+-        # Reload and notify library
+         self.load_game(self._game_id)
+         self.install_finished.emit(self._game_id)
+ 
+@@ -2799,6 +2955,8 @@ class GameDetailView(QWidget):
+ 
+         rows = []
+         if self._mode == "game":
++            if self.media_gallery.isVisibleTo(self) and self.media_gallery.has_items():
++                rows.append([self.media_gallery])
+             if hasattr(self, "completion_combo"):
+                 rows.append([self.completion_combo])
+             row = [w for w in (self.fav_btn, self.hide_btn) if ok(w)]
+@@ -2810,6 +2968,8 @@ class GameDetailView(QWidget):
+                     rows.append([w])
+             if ok(self.install_btn):
+                 rows.append([self.install_btn])
++            if ok(self.locate_btn):
++                rows.append([self.locate_btn])
+             row = [w for w in (self.launch_btn, self.cogwheel_btn) if ok(w)]
+             if row:
+                 rows.append(row)
+@@ -2831,6 +2991,9 @@ class GameDetailView(QWidget):
+         return None
+ 
+     def _ctrl_style_widget(self, widget, focused: bool):
++        if isinstance(widget, MediaGalleryWidget):
++            widget.set_controller_focused(focused)
++            return
+         key = id(widget)
+         orig = self._ctrl_orig_style.get(key)
+         if orig is None:
+@@ -2848,6 +3011,8 @@ class GameDetailView(QWidget):
+             for w in row:
+                 self._ctrl_style_widget(
+                     w, self._ctrl_focus_visible and w is self._ctrl_focused_widget)
++        if self._ctrl_focus_visible and self._ctrl_focused_widget is not None:
++            self.scroll.ensureWidgetVisible(self._ctrl_focused_widget, 20, 60)
+ 
+     def controller_has_targets(self) -> bool:
+         return bool(self._ctrl_rows())
+@@ -2866,6 +3031,9 @@ class GameDetailView(QWidget):
+         rows = self._ctrl_rows()
+         if not rows:
+             return False
++        if (self._ctrl_focused_widget is self.media_gallery
++                and direction in ("left", "right")):
++            return self.media_gallery.controller_step(-1 if direction == "left" else 1)
+         pos = self._ctrl_find_position(rows, self._ctrl_focused_widget)
+         if pos is None:
+             self._ctrl_focused_widget = rows[0][0]
+@@ -2896,6 +3064,9 @@ class GameDetailView(QWidget):
+         w = self._ctrl_focused_widget
+         if w is None:
+             return
++        if w is self.media_gallery:
++            w.controller_activate()
++            return
+         if isinstance(w, QComboBox):
+             w.showPopup()
+         elif isinstance(w, QPushButton) and w.isEnabled():
+diff --git a/src/ui/install_dialog.py b/src/ui/install_dialog.py
+index 8f68cfe..bb677a8 100644
+--- a/src/ui/install_dialog.py
++++ b/src/ui/install_dialog.py
+@@ -433,7 +433,7 @@ class InstallDialog(QDialog):
+             try:
+                 result = steamdb_mod.get_redists_for_install(
+                     steam_app_id, game_title2, auto_detect=True)
+-                self._auto_redists  = result["auto"]
++                self._auto_redists  = install_mod.normalize_redists(result["auto"])
+                 self._redist_source = result["source"]
+             except Exception as _e:
+                 log.warning("SteamDB redist detection failed: %s", _e)
+@@ -1041,15 +1041,6 @@ class InstallDialog(QDialog):
+                 "danger")
+             return
+ 
+-        # If the user overrode the install type, persist it so future scans
+-        # don't overwrite the choice (install_tag_override=1 in the games table).
+-        original_tag = self.game.get("install_tag") or "portable"
+-        if self._install_tag != original_tag:
+-            try:
+-                db.set_install_tag_override(self.game["id"], self._install_tag)
+-            except Exception as _e:
+-                log.warning("Could not persist install_tag override: %s", _e)
+-
+         # Check if this prefix already has some redists installed
+         prefix_name = self.prefix_edit.text().strip() or \
+                       install_mod.make_prefix_name(self.game.get("folder_name", ""))
+diff --git a/src/ui/launch_options_section.py b/src/ui/launch_options_section.py
+index 18fe762..4e7c40c 100644
+--- a/src/ui/launch_options_section.py
++++ b/src/ui/launch_options_section.py
+@@ -81,6 +81,7 @@ class _MiniGroup(QFrame):
+         if title:
+             lbl = QLabel(title.upper())
+             lbl.setFont(QFont("DM Mono", 8))
++            lbl.setWordWrap(True)
+             lbl.setStyleSheet(
+                 f"color: {COLORS['text_muted']}; letter-spacing: 1.5px; {_LABEL_BASE}")
+             self._layout.addWidget(lbl)
+@@ -315,8 +316,15 @@ class LaunchOptionsSection(QWidget):
+         # ── Reset to Defaults ────────────────────────────────────────────────
+         reset_row = QHBoxLayout()
+         reset_row.setContentsMargins(0, 4, 0, 0)
+-        reset_row.addStretch()
+-        self.reset_btn = QPushButton("Reset to Defaults")
++        reset_hint = _label(
++            "Clears every launch option above for this game (renderer, overlay, "
++            "env vars, arguments…). Click Apply afterwards to rebuild the launcher.",
++            muted=True, wrap=True)
++        reset_row.addWidget(reset_hint, 1)
++        self.reset_btn = QPushButton("Reset Launch Options")
++        self.reset_btn.setToolTip(
++            "Reset all launch options for this game back to the defaults. "
++            "You'll be asked to confirm.")
+         self.reset_btn.setFont(QFont("DM Sans", 10))
+         self.reset_btn.setStyleSheet(f"""
+             QPushButton {{
+diff --git a/src/ui/main_window.py b/src/ui/main_window.py
+index 6a5add9..91713b2 100644
+--- a/src/ui/main_window.py
++++ b/src/ui/main_window.py
+@@ -41,7 +41,9 @@ from PyQt6.QtCore import Qt, QThread, QThreadPool, QTimer, pyqtSignal, QSize, QP
+ from PyQt6.QtGui import QFont, QIcon, QPixmap, QColor, QKeyEvent
+ 
+ import db
++import dbsafety
+ import scanner
++import scan_reconcile
+ import metadata as meta_mod
+ import protondb as protondb_mod
+ import version_checker as vc_mod
+@@ -78,7 +80,9 @@ class ScanWorker(QThread):
+         import time
+         log.info("[PHASE] ScanWorker.run() — %s", self.nas_path)
+         t0 = time.monotonic()
+-        result = scanner.scan_nas(
++        # scan_and_reconcile never clears anything: it upserts what it finds,
++        # then flags games whose NAS folder is gone (and un-flags returned ones).
++        result = scan_reconcile.scan_and_reconcile(
+             self.nas_path,
+             progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name)
+         )
+@@ -1414,7 +1418,9 @@ class MainWindow(QMainWindow):
+         log.info("Setup wizard complete. NAS path: %s", nas_path)
+         import os
+         self.sidebar.set_nas_connected(os.path.exists(nas_path), nas_path)
+-        self._start_scan(nas_path, clear_first=True)
++        # Never clear here: re-running the wizard on an existing library
++        # must not wipe it. The scan upserts and flags missing games.
++        self._start_scan(nas_path, clear_first=False)
+ 
+     def _initial_load(self):
+         """
+@@ -1441,6 +1447,10 @@ class MainWindow(QMainWindow):
+         # of whether a scan is about to be queued.
+         self._reattach_running_games()
+ 
++        # Orphaned installs — VaultPlay .desktop files with no install
++        # record (e.g. after a DB problem) are re-adopted automatically.
++        QTimer.singleShot(1200, self._heal_orphan_installs)
++
+         nas_path = db.get_setting("nas_path", "")
+         if nas_path and nas_path.strip() not in ("", "/"):
+             self.sidebar.set_nas_connected(True, nas_path)
+@@ -1454,6 +1464,10 @@ class MainWindow(QMainWindow):
+                 timeout=0
+             )
+ 
++        # Games that never got metadata (e.g. after a data problem) get
++        # fetched even when no scan runs this launch.
++        QTimer.singleShot(4000, self._maybe_fetch_missing_metadata)
++
+         # Arm the persisted version check timer now that the app is loaded
+         self._arm_version_check_timer()
+ 
+@@ -1464,6 +1478,35 @@ class MainWindow(QMainWindow):
+         # aren't installed or "controller_enabled" is off.
+         self._apply_controller_setting()
+ 
++    def _maybe_fetch_missing_metadata(self):
++        if self._meta_worker and self._meta_worker.isRunning():
++            return
++        try:
++            if db.get_setting("sgdb_api_key", "") and db.get_games_missing_metadata():
++                self._start_metadata_fetch()
++        except Exception as e:
++            log.debug("Missing-metadata check failed: %s", e)
++
++    def _heal_orphan_installs(self):
++        """Re-adopt VaultPlay-created .desktop launchers that have no install
++        record. Only ones whose name matches a library game are healed
++        automatically; the rest are left alone (Locate Game handles those)."""
++        try:
++            orphans = dbsafety.find_orphans()
++        except Exception as e:
++            log.warning("Orphan scan failed: %s", e)
++            return
++        healed = []
++        for o in orphans:
++            if o.get("game_id") and dbsafety.heal_orphan(o):
++                healed.append(o["name"])
++        if healed:
++            log.info("Re-adopted %d orphaned install(s): %s", len(healed), healed)
++            self._load_library()
++            self.library_view.show_status(
++                f"Restored {len(healed)} installed game(s): " + ", ".join(healed[:3])
++                + ("…" if len(healed) > 3 else ""), timeout=6000)
++
+     def _on_trickle_finished(self):
+         """
+         Called when LibraryView finishes adding all tiles to the grid.
+@@ -1482,7 +1525,12 @@ class MainWindow(QMainWindow):
+             self._start_scan(path, clear_first=False)
+ 
+     def _on_nas_path_changed(self, path: str):
+-        """Called when NAS path Apply is clicked or blacklist toggled."""
++        """Called when NAS path Apply is clicked or blacklist toggled.
++
++        Changing the path NEVER clears the library: games present at both
++        paths are kept (with their metadata/installs), new ones are added,
++        and ones missing from the new path are flagged missing_from_nas.
++        """
+         if path == "__reload__":
+             self._load_library()
+         else:
+@@ -1491,7 +1539,7 @@ class MainWindow(QMainWindow):
+                 self.sidebar.set_nas_connected(True, path)
+             else:
+                 self.sidebar.set_nas_connected(False, path)
+-            self._start_scan(path, clear_first=True)
++            self._start_scan(path, clear_first=False)
+ 
+     def _show_library(self):
+         # See Sidebar.clear_wishlist_highlight()'s docstring — this is the
+@@ -1691,7 +1739,11 @@ class MainWindow(QMainWindow):
+             return  # already running
+ 
+         if clear_first:
+-            self.library_view.show_status("NAS path changed — clearing library…")
++            # No built-in caller requests this any more (a path change now
++            # reconciles instead), but if one does, snapshot the DB first so
++            # it is always recoverable from <config>/backups.
++            dbsafety.backup_now("before_clear")
++            self.library_view.show_status("Clearing library…")
+             db.clear_all_games()
+             self._load_library()
+ 
+@@ -1711,10 +1763,14 @@ class MainWindow(QMainWindow):
+         new    = result.get("new", 0)
+         total  = result.get("total", 0)
+         errors = result.get("errors", [])
++        recon  = result.get("reconcile") or {}
++        flagged = recon.get("flagged", 0)
+ 
+         msg = f"Scan complete — {total} games found"
+         if new:
+             msg += f", {new} new"
++        if flagged:
++            msg += f", {flagged} missing from NAS"
+         if errors:
+             msg += f", {len(errors)} error(s)"
+ 
+@@ -1752,8 +1808,20 @@ class MainWindow(QMainWindow):
+         except Exception:
+             pass
+ 
+-        if new and not (self._meta_worker and self._meta_worker.isRunning()):
+-            from PyQt6.QtCore import QTimer
++        # Orphaned installs whose game row only just got (re)created by this
++        # scan can be adopted now.
++        QTimer.singleShot(500, self._heal_orphan_installs)
++
++        # Fetch metadata when the scan found new games OR any game is still
++        # missing metadata (otherwise a library re-created after a DB
++        # problem would never get its art back, since "new" would be 0).
++        needs_meta = bool(new)
++        if not needs_meta:
++            try:
++                needs_meta = bool(db.get_games_missing_metadata())
++            except Exception:
++                needs_meta = False
++        if needs_meta and not (self._meta_worker and self._meta_worker.isRunning()):
+             QTimer.singleShot(2000, self._start_metadata_fetch)
+ 
+         # Fire auto-track pass for new games, independent of the metadata chain.
+@@ -1762,7 +1830,6 @@ class MainWindow(QMainWindow):
+         new_game_ids = result.get("new_game_ids", [])
+         if new_game_ids:
+             self._pending_new_game_ids = new_game_ids
+-            from PyQt6.QtCore import QTimer
+             QTimer.singleShot(1000, self._start_auto_track)
+             # Wishlist — Acquired-Game Auto-Match: independent of the
+             # version-tracking auto-track pass above (both are separate
+@@ -1965,11 +2032,12 @@ class MainWindow(QMainWindow):
+ 
+     def _check_wishlist_matches(self, new_game_ids: list):
+         """
+-        Fires after every scan that found new games — fuzzy-matches each
++        Fires after every scan that found new games — matches each
+         newly-scanned game's title against the wishlist (see
+-        wishlist_store.find_acquired_matches()) and asks about each
+-        un-ignored match in turn. No-ops immediately if the wishlist isn't
+-        configured, since there's nothing to match against.
++        wishlist_store.find_acquired_matches(), which is word-based and
++        deliberately strict) and asks about each un-ignored match in turn.
++        No-ops immediately if the wishlist isn't configured, since there's
++        nothing to match against.
+         """
+         if not wishlist_store.is_configured() or not new_game_ids:
+             return
+@@ -1998,10 +2066,12 @@ class MainWindow(QMainWindow):
+ 
+     def _confirm_wishlist_match(self, match: dict):
+         """
+-        One-at-a-time confirmation for a single fuzzy wishlist match.
++        One-at-a-time confirmation for a single wishlist match.
+         Three outcomes:
+           Remove from Wishlist        — the game was acquired; delete the
+-                                         wishlist item.
++                                         wishlist item (a backup of the
++                                         wishlist is taken automatically,
++                                         so it can be restored later).
+           Not This Time               — no change; this exact pair will be
+                                          offered again on a future scan
+                                          (e.g. if it was a false positive
+@@ -2015,14 +2085,18 @@ class MainWindow(QMainWindow):
+         """
+         msg = QMessageBox(self)
+         msg.setWindowTitle("Wishlist Match Found")
++        kind = match.get("confidence", "exact")
++        verb = "looks like" if kind == "exact" else "might be"
+         msg.setText(
+-            f"'{match['scanned_title']}' looks like it might be "
++            f"'{match['scanned_title']}' {verb} "
+             f"'{match['wishlist_title']}' from your wishlist.")
+         msg.setInformativeText("Remove it from your wishlist?")
+         remove_btn = msg.addButton("Remove from Wishlist", QMessageBox.ButtonRole.AcceptRole)
+         msg.addButton("Not This Time", QMessageBox.ButtonRole.RejectRole)
+         ignore_btn = msg.addButton("Keep — Don't Ask Again", QMessageBox.ButtonRole.DestructiveRole)
+-        msg.setDefaultButton(remove_btn)
++        # "close" matches are plausible-but-uncertain (e.g. "Metro Exodus"
++        # vs "Exodus"): default to the safe choice, not removal.
++        msg.setDefaultButton(remove_btn if kind == "exact" else ignore_btn)
+         msg.setStyleSheet(
+             f"QMessageBox {{ background: {COLORS['surface']}; color: {COLORS['text']}; }}")
+         msg.exec()
+@@ -2649,17 +2723,38 @@ class MainWindow(QMainWindow):
+         try:
+             canonical = save_backup.move_and_link(chosen_folder, save_root, folder_name)
+         except save_backup.SaveMoveConflict as e:
+-            reply = QMessageBox.question(
+-                self, "Save Backup",
+-                f"A backed-up save already exists at:\n{e.canonical_path}\n\n"
+-                "Continuing will overwrite it with the save you just picked. "
+-                "Continue?",
+-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+-                QMessageBox.StandardButton.Cancel
+-            )
+-            if reply != QMessageBox.StandardButton.Yes:
+-                log.info("[SAVE BACKUP] User declined overwrite for game_id=%d — skipped",
+-                         game_id)
++            # A backup already exists (typical after a fresh install). The
++            # default is to KEEP it and restore it into this folder — never
++            # to overwrite it with the brand-new save.
++            box = QMessageBox(self)
++            box.setWindowTitle("Save Backup")
++            box.setText("You already have a backed-up save for this game.")
++            box.setInformativeText(
++                f"Backup: {e.canonical_path}\n\n"
++                "Use your existing backup to continue your progress, or "
++                "replace it with the save you just created? Whichever you "
++                "don't choose is kept in a “_replaced” folder, not deleted.")
++            use_btn = box.addButton("Use My Existing Backup",
++                                    QMessageBox.ButtonRole.AcceptRole)
++            rep_btn = box.addButton("Replace Backup With New Save",
++                                    QMessageBox.ButtonRole.DestructiveRole)
++            box.addButton(QMessageBox.StandardButton.Cancel)
++            box.setDefaultButton(use_btn)
++            box.exec()
++            clicked = box.clickedButton()
++            if clicked == use_btn:
++                import save_restore
++                r = save_restore.adopt_existing_backup(
++                    game_id, folder_name, chosen_folder, save_root)
++                if r.get("ok"):
++                    self.library_view.show_status(
++                        "✓ Restored your existing save backup", timeout=5000)
++                else:
++                    self.library_view.show_status(
++                        f"⚠ Restore failed: {r.get('error')}", timeout=6000)
++                return
++            if clicked != rep_btn:
++                log.info("[SAVE BACKUP] User cancelled conflict prompt for game_id=%d", game_id)
+                 return
+             try:
+                 canonical = save_backup.move_and_link(
+@@ -2751,6 +2846,19 @@ class MainWindow(QMainWindow):
+ 
+     def closeEvent(self, event):
+         self._stop_controller()
++        # Stop every worker/watcher BEFORE widgets are destroyed — destroying a
++        # running QThread aborts the process. Games keep running; their
++        # playtime watchers re-attach on next start.
++        for w in list(self._playtime_watchers.values()):
++            try:
++                w.request_abort()
++            except Exception:
++                pass
++        try:
++            import thread_guard
++            thread_guard.shutdown_all()
++        except Exception as e:
++            log.warning("Thread shutdown failed: %s", e)
+         super().closeEvent(event)
+ 
+     # ── Signal slots (all funnel into _on_ctrl_action) ───────────────────
+diff --git a/src/ui/settings_view.py b/src/ui/settings_view.py
+index 7d117ec..bc3ea13 100644
+--- a/src/ui/settings_view.py
++++ b/src/ui/settings_view.py
+@@ -37,6 +37,7 @@ from PyQt6.QtGui import QFont, QColor
+ 
+ import json
+ import db
++import dbsafety
+ import protondb as protondb_mod
+ import scanner
+ import update_check
+@@ -165,14 +166,6 @@ class SettingsToggle(QWidget):
+         p.setPen(Qt.PenStyle.NoPen)
+         x = 23 if self._checked else 3
+         p.drawEllipse(x, 3, 18, 18)
+-        # Controller Support — this widget fully self-paints (no QStyle
+-        # involvement), so the app-wide QPushButton/QComboBox :focus CSS
+-        # rule in style.py has nothing to attach to here; draw the ring
+-        # directly instead, keyed off Qt's own native hasFocus().
+-        if self.hasFocus():
+-            p.setBrush(Qt.BrushStyle.NoBrush)
+-            p.setPen(QPen(QColor(COLORS["accent"]), 2))
+-            p.drawRoundedRect(1, 1, 42, 22, 12, 12)
+         p.end()
+ 
+     def toggle(self):
+@@ -473,6 +466,8 @@ class SettingsView(QWidget):
+         # controls, navigated via Qt's native focus chain. See
+         # controller_move()/_focus_first_in_page() below.
+         self._ctrl_in_content = False
++        # One FocusRing overlay per page's QScrollArea (see ui/focus_ring.py)
++        self._rings = {}
+ 
+         root = QVBoxLayout(self)
+         root.setContentsMargins(0, 0, 0, 0)
+@@ -635,6 +630,8 @@ class SettingsView(QWidget):
+             self._ctrl_in_content = False
+         self._current_page = idx
+         self._pages_stack.setCurrentIndex(idx)
++        if not self._ctrl_in_content:
++            self._ctrl_hide_rings()
+         for i, btn in enumerate(self._nav_items):
+             nav_focused = (self._ctrl_focus_visible
+                           and not self._ctrl_in_content and i == idx)
+@@ -833,12 +830,13 @@ class SettingsView(QWidget):
+         status_row.add_control(test_btn)
+         layout.addWidget(status_row)
+ 
+-        # Apply NAS path change on focus lost / enter
+-        def _apply_nas():
+-            path = nas_edit.text().strip()
+-            if path:
+-                self.nas_path_changed.emit(path)
+-        nas_edit.editingFinished.connect(_apply_nas)
++        # NOTE: the NAS path is applied ONLY by the Apply button (or Enter in
++        # the field, below). It used to also apply on editingFinished, which
++        # Qt fires whenever the field merely LOSES FOCUS — even with the text
++        # unchanged — so just tabbing/controller-navigating past this field
++        # re-emitted nas_path_changed and triggered a library rescan. That
++        # was the root cause of the library being wiped.
++        nas_edit.returnPressed.connect(_apply_nas_path)
+ 
+         layout.addStretch()
+         return scroll
+@@ -1080,7 +1078,8 @@ class SettingsView(QWidget):
+         name_edit.setStyleSheet(f"color: {COLORS['text']}; min-width: 160px;")
+         name_edit.setPlaceholderText("Display name…")
+         name_edit.editingFinished.connect(
+-            lambda f=folder, e=name_edit: db.rename_category(f, e.text().strip() or f)
++            lambda f=folder, e=name_edit, d=display:
++                self._on_rename_category(f, e.text().strip() or f, d)
+         )
+         row_l.addWidget(name_edit, 1)
+ 
+@@ -1120,6 +1119,13 @@ class SettingsView(QWidget):
+ 
+         return row
+ 
++    def _on_rename_category(self, folder: str, new_name: str, old_display: str):
++        """editingFinished fires on every focus loss, changed or not — only
++        write when the display name was actually edited."""
++        if new_name == (old_display or folder):
++            return
++        db.rename_category(folder, new_name)
++
+     def _toggle_blacklist(self, folder_name: str, blacklist: bool):
+         db.set_category_blacklisted(folder_name, blacklist)
+         self._refresh_category_list()
+@@ -1230,7 +1236,8 @@ class SettingsView(QWidget):
+         name_edit.setFont(QFont("DM Sans", 11))
+         name_edit.setStyleSheet(f"color: {COLORS['text']}; min-width: 160px;")
+         name_edit.editingFinished.connect(
+-            lambda tid=tag["id"], e=name_edit: self._on_rename_tag(tid, e.text().strip())
++            lambda tid=tag["id"], e=name_edit, old=tag["name"]:
++                self._on_rename_tag(tid, e.text().strip(), old)
+         )
+         row_l.addWidget(name_edit, 1)
+ 
+@@ -1302,7 +1309,12 @@ class SettingsView(QWidget):
+ 
+         return row
+ 
+-    def _on_rename_tag(self, tag_id: int, new_name: str):
++    def _on_rename_tag(self, tag_id: int, new_name: str, old_name: str = None):
++        # editingFinished fires on every focus loss, even with no edit — and
++        # this handler rebuilds the whole tag list, which destroys the very
++        # widget being navigated (and kicked the controller focus out).
++        if old_name is not None and new_name == old_name:
++            return
+         if not new_name:
+             self._refresh_tags_list()   # revert the blanked edit back to its old name
+             return
+@@ -2838,6 +2850,9 @@ class SettingsView(QWidget):
+             QMessageBox.StandardButton.Cancel
+         )
+         if reply == QMessageBox.StandardButton.Yes:
++            # Last-resort safety net: keep a restorable snapshot even for an
++            # explicit wipe (see <config>/backups/).
++            dbsafety.backup_now("before_clear_database")
+             db.clear_database()
+             # Reload settings UI to reflect cleared state
+             self.load_settings()
+@@ -3895,6 +3910,76 @@ class SettingsView(QWidget):
+         return [w for _cy, row in rows
+                 for _x, w in sorted(row, key=lambda t: t[0])]
+ 
++    # Controls whose vertical centers are within this many px share a row.
++    _CTRL_ROW_TOL = 12
++
++    @staticmethod
++    def _pick_neighbor(rects: dict, cur, direction: str, row_tol: int = 12):
++        """
++        Pure geometry: given {key: (x, y, w, h)} for every focusable control
++        and the key of the current one, return the key to move to (or None).
++
++          left / right : stay on the SAME row, nearest control on that side.
++          up / down    : go to the nearest row above/below, and within that
++                         row pick the control that best lines up with the
++                         current one (largest horizontal overlap, else the
++                         nearest centre). So a name field moves to the next
++                         name field, and a button column stays a button
++                         column, instead of walking across each row.
++        """
++        if cur not in rects:
++            return None
++        x, y, w, h = rects[cur]
++        cx, cy = x + w / 2.0, y + h / 2.0
++
++        def cen(k):
++            kx, ky, kw, kh = rects[k]
++            return kx + kw / 2.0, ky + kh / 2.0
++
++        others = [k for k in rects if k != cur]
++        if direction in ("left", "right"):
++            same = [k for k in others if abs(cen(k)[1] - cy) <= row_tol]
++            if direction == "right":
++                side = [k for k in same if cen(k)[0] > cx]
++                return min(side, key=lambda k: cen(k)[0]) if side else None
++            side = [k for k in same if cen(k)[0] < cx]
++            return max(side, key=lambda k: cen(k)[0]) if side else None
++
++        if direction == "down":
++            below = [k for k in others if cen(k)[1] > cy + row_tol]
++            if not below:
++                return None
++            row_y = min(cen(k)[1] for k in below)
++            row = [k for k in below if abs(cen(k)[1] - row_y) <= row_tol]
++        elif direction == "up":
++            above = [k for k in others if cen(k)[1] < cy - row_tol]
++            if not above:
++                return None
++            row_y = max(cen(k)[1] for k in above)
++            row = [k for k in above if abs(cen(k)[1] - row_y) <= row_tol]
++        else:
++            return None
++
++        def score(k):
++            kx, ky, kw, kh = rects[k]
++            overlap = max(0.0, min(x + w, kx + kw) - max(x, kx))
++            return (-overlap, abs(cen(k)[0] - cx))
++        return min(row, key=score)
++
++    def _ctrl_neighbor(self, fw, cands: list, direction: str, body):
++        """Map the focused widget (or the candidate that contains it, e.g.
++        a spin box's inner line edit) onto _pick_neighbor() geometry."""
++        cur = fw
++        while cur is not None and cur not in cands:
++            cur = cur.parentWidget()
++        if cur is None:
++            return None
++        rects = {}
++        for w in cands:
++            p = w.mapTo(body, QPoint(0, 0))
++            rects[w] = (p.x(), p.y(), w.width(), w.height())
++        return self._pick_neighbor(rects, cur, direction, self._CTRL_ROW_TOL)
++
+     def _focus_first_in_page(self) -> bool:
+         body = self._current_page_container()
+         if body is None:
+@@ -3902,10 +3987,30 @@ class SettingsView(QWidget):
+         cands = self._focusable_descendants(body)
+         if not cands:
+             return False
+-        cands[0].setFocus(Qt.FocusReason.OtherFocusReason)
+-        self._ctrl_scroll_into_view(cands[0])
++        self._ctrl_focus(cands[0])
+         return True
+ 
++    def _ctrl_ring(self):
++        page = self._pages_stack.currentWidget()
++        if not isinstance(page, QScrollArea):
++            return None
++        ring = self._rings.get(page)
++        if ring is None:
++            from ui.focus_ring import FocusRing
++            ring = self._rings[page] = FocusRing(page)
++        return ring
++
++    def _ctrl_focus(self, widget):
++        widget.setFocus(Qt.FocusReason.OtherFocusReason)
++        self._ctrl_scroll_into_view(widget)
++        ring = self._ctrl_ring()
++        if ring is not None:
++            ring.show_for(widget)
++
++    def _ctrl_hide_rings(self):
++        for ring in getattr(self, "_rings", {}).values():
++            ring.clear()
++
+     def _ctrl_scroll_into_view(self, widget):
+         page = self._pages_stack.currentWidget()
+         if isinstance(page, QScrollArea):
+@@ -3952,23 +4057,21 @@ class SettingsView(QWidget):
+             self._show_page(self._current_page)
+             return self.controller_move(direction)
+ 
++        if direction not in ("left", "right", "up", "down"):
++            return False
++        cands = self._focusable_descendants(body)
++        target = self._ctrl_neighbor(fw, cands, direction, body)
++        if target is not None:
++            self._ctrl_focus(target)
++            return True
+         if direction == "left":
++            # Nothing further left on this row — step back out to the
++            # settings page list.
+             fw.clearFocus()
+             self._ctrl_in_content = False
+             self._show_page(self._current_page)
+             return True
+-
+-        if direction not in ("up", "down", "right"):
+-            return False
+-        cands = self._focusable_descendants(body)
+-        if fw not in cands:
+-            return False
+-        i = cands.index(fw) + (-1 if direction == "up" else 1)
+-        if not (0 <= i < len(cands)):
+-            return False
+-        cands[i].setFocus(Qt.FocusReason.OtherFocusReason)
+-        self._ctrl_scroll_into_view(cands[i])
+-        return True
++        return False
+ 
+     def controller_activate(self):
+         if not self._ctrl_in_content:
+diff --git a/src/ui/style.py b/src/ui/style.py
+index a2a6e40..77ea105 100644
+--- a/src/ui/style.py
++++ b/src/ui/style.py
+@@ -109,18 +109,6 @@ QPushButton:pressed {{
+     background: {COLORS['bg']};
+ }}
+ 
+-# Controller Support — gamepad-driven keyboard focus (Tab order /
+-# focusNextChild) renders as a ring via Qt's dedicated `outline` paint
+-# layer rather than `border`, since many buttons in this app set a full
+-# custom per-instance stylesheet (hover states, danger styling, etc.)
+-# that would otherwise win over an app-wide `border` override. `outline`
+-# is a separate Qt stylesheet primitive not used anywhere else in this
+-# app, so it layers on top instead of competing with those.
+-QPushButton:focus, QComboBox:focus {{
+-    outline: 2px solid {COLORS['accent']};
+-    outline-offset: 1px;
+-}}
+-
+ QCheckBox {{
+     spacing: 8px;
+     color: {COLORS['text_dim']};
+diff --git a/src/ui/wishlist_view.py b/src/ui/wishlist_view.py
+index 7b6817c..189e804 100644
+--- a/src/ui/wishlist_view.py
++++ b/src/ui/wishlist_view.py
+@@ -31,6 +31,9 @@ form — the edit form is still one right-click ("Edit…") away, or the
+ "✏️ Edit Wishlist Item…" button on the detail page itself. This tile no
+ longer shows its own on-cover trailer badge — the trailer, if any, is
+ now surfaced on the Game Detail page instead (see TrailerThumbnail there).
++
++Backups: wishlist_store keeps automatic backups; the "↩ Restore…" header
++button opens ui/wishlist_restore_dialog.py to bring back removed items.
+ """
+ 
+ # ── AppImage path fix ─────────────────────────────────────────────────────────
+@@ -66,6 +69,7 @@ import metadata as meta_mod
+ import wishlist_store
+ from ui.style import COLORS, accent_button_style
+ from ui.wishlist_dialog import WishlistItemDialog
++from ui.wishlist_restore_dialog import WishlistRestoreDialog
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -392,6 +396,24 @@ class WishlistView(QWidget):
+         header_l.addWidget(title_lbl)
+         header_l.addStretch()
+ 
++        self.restore_btn = QPushButton("↩  Restore…")
++        self.restore_btn.setFont(QFont("DM Sans", 11))
++        self.restore_btn.setToolTip(
++            "Bring back wishlist items that were removed — picks from automatic backups")
++        self.restore_btn.setStyleSheet(f"""
++            QPushButton {{
++                background: transparent;
++                border: 1px solid {COLORS['border']};
++                border-radius: 8px;
++                color: {COLORS['text_muted']};
++                padding: 7px 14px;
++            }}
++            QPushButton:hover {{ background: {COLORS['surface2']}; color: {COLORS['text']}; }}
++            QPushButton:disabled {{ color: {COLORS['text_muted']}; opacity: 0.5; }}
++        """)
++        self.restore_btn.clicked.connect(self._on_restore_clicked)
++        header_l.addWidget(self.restore_btn)
++
+         self.add_btn = QPushButton("➕  Add to Wishlist")
+         self.add_btn.setFont(QFont("DM Sans", 11, QFont.Weight.Medium))
+         self.add_btn.setStyleSheet(accent_button_style())
+@@ -461,6 +483,7 @@ class WishlistView(QWidget):
+             self._clear_tiles()
+             self.scroll.hide()
+             self.add_btn.setEnabled(False)
++            self.restore_btn.setEnabled(False)
+             if status == "unconfigured":
+                 self.status_label.setText(
+                     "Set a Wishlist location in Settings → Paths to get started.")
+@@ -476,6 +499,7 @@ class WishlistView(QWidget):
+         self.status_label.hide()
+         self.scroll.show()
+         self.add_btn.setEnabled(True)
++        self.restore_btn.setEnabled(True)
+ 
+         self._items = wishlist_store.get_items()
+         self._clear_tiles()
+@@ -551,13 +575,23 @@ class WishlistView(QWidget):
+         if tile is not None:
+             tile.set_cover_pixmap(cropped)
+ 
+-    # ── Add / Select / Edit / Remove ──────────────────────────────────────
++    # ── Add / Select / Edit / Remove / Restore ────────────────────────────
+ 
+     def _on_add_clicked(self):
+         dlg = WishlistItemDialog(item=None, parent=self)
+         dlg.saved.connect(self._on_item_saved)
+         dlg.exec()
+ 
++    def _on_restore_clicked(self):
++        """Diff the automatic backups against the live wishlist and let the
++        user pick which removed items to bring back."""
++        dlg = WishlistRestoreDialog(parent=self)
++        dlg.exec()
++        if dlg.restored_count():
++            self._last_mtime = wishlist_store.get_mtime()
++            self._rebuild()
++            self.changed.emit()
++
+     def _on_tile_selected(self, item_id: str):
+         """Plain left-click on a tile — hand off to MainWindow to open the
+         Game Detail page for this wishlist item."""
+@@ -585,7 +619,8 @@ class WishlistView(QWidget):
+         title = item.get("title") if item else "this item"
+         reply = QMessageBox.question(
+             self, "Remove from Wishlist",
+-            f"Remove '{title}' from your wishlist?",
++            f"Remove '{title}' from your wishlist?\n\n"
++            "You can bring it back later with Restore….",
+             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+             QMessageBox.StandardButton.Cancel)
+         if reply != QMessageBox.StandardButton.Yes:
+diff --git a/src/wishlist_store.py b/src/wishlist_store.py
+index b25f98f..1bb4087 100644
+--- a/src/wishlist_store.py
++++ b/src/wishlist_store.py
+@@ -15,6 +15,8 @@ Layout:
+         wishlist.json          # the data itself
+         wishlist_art/          # uploaded cover images
+             <uuid>.<ext>
++        wishlist_backups/      # automatic point-in-time copies of wishlist.json
++            wishlist-<timestamp>.json
+ 
+ wishlist.json shape:
+     {
+@@ -90,6 +92,15 @@ SMB/NFS either — but it keeps two near-simultaneous edits from silently
+ clobbering each other in the common case, the same "good enough for two
+ people" bar redists.json import/export already operates at.
+ 
++Backups
++-------
++Right before every write replaces wishlist.json, the file as it was is
++copied to wishlist_backups/ (skipped when identical to the newest backup).
++The newest BACKUPS_KEEP_RECENT copies are always kept; older ones are
++thinned to one per day for BACKUPS_KEEP_DAYS days. get_deleted_from_backups()
++diffs backups against the live wishlist and restore_items() puts chosen
++items back — see ui/wishlist_restore_dialog.py.
++
+ WishlistView is responsible for polling get_mtime() every few seconds
+ while it's the visible page and reloading if it changed, so an addition
+ from another machine shows up without restarting the app — this module
+@@ -116,6 +127,7 @@ import json
+ import logging
+ import re
+ import shutil
++import time
+ import uuid
+ from pathlib import Path
+ from typing import Callable, Optional
+@@ -126,7 +138,10 @@ log = logging.getLogger(__name__)
+ 
+ WISHLIST_FILENAME = "wishlist.json"
+ ART_SUBDIR         = "wishlist_art"
++BACKUP_SUBDIR      = "wishlist_backups"
+ CURRENT_VERSION    = 1
++BACKUPS_KEEP_RECENT = 40
++BACKUPS_KEEP_DAYS   = 60
+ 
+ 
+ # ── Path helpers ────────────────────────────────────────────────────────────
+@@ -227,6 +242,22 @@ def _backfill_item_defaults(item: dict) -> dict:
+     return item
+ 
+ 
++def _parse_data(data) -> dict:
++    """Normalize a decoded JSON document into the standard structure."""
++    if not isinstance(data, dict):
++        return _empty_data()
++    data.setdefault("version", CURRENT_VERSION)
++    data.setdefault("items", [])
++    data.setdefault("ignored_matches", [])
++    if not isinstance(data["items"], list):
++        data["items"] = []
++    if not isinstance(data["ignored_matches"], list):
++        data["ignored_matches"] = []
++    data["items"] = [_backfill_item_defaults(i) for i in data["items"]
++                      if isinstance(i, dict)]
++    return data
++
++
+ def load() -> dict:
+     """
+     Load wishlist.json fresh from disk. Returns an empty structure if the
+@@ -244,25 +275,161 @@ def load() -> dict:
+             log.warning("wishlist_store: %s did not contain a JSON object — "
+                        "treating as empty", path)
+             return _empty_data()
+-        data.setdefault("version", CURRENT_VERSION)
+-        data.setdefault("items", [])
+-        data.setdefault("ignored_matches", [])
+-        if not isinstance(data["items"], list):
+-            data["items"] = []
+-        if not isinstance(data["ignored_matches"], list):
+-            data["ignored_matches"] = []
+-        data["items"] = [_backfill_item_defaults(i) for i in data["items"]
+-                          if isinstance(i, dict)]
+-        return data
++        return _parse_data(data)
+     except Exception as e:
+         log.warning("wishlist_store: could not load %s: %s", path, e)
+         return _empty_data()
+ 
+ 
++# ── Backups ──────────────────────────────────────────────────────────────────
++
++def _backup_dir() -> Optional[Path]:
++    root = _wishlist_root()
++    return (root / BACKUP_SUBDIR) if root else None
++
++
++def _backup_files() -> list:
++    d = _backup_dir()
++    if not d or not d.is_dir():
++        return []
++    try:
++        return sorted(d.glob("wishlist-*.json"),
++                      key=lambda p: p.stat().st_mtime, reverse=True)
++    except OSError:
++        return []
++
++
++def _snapshot_before_write(live: Path):
++    """Copy the current wishlist.json into the backups folder just before
++    it's replaced. Never raises — a failed backup must not block a save."""
++    try:
++        if not live.exists() or live.stat().st_size == 0:
++            return
++        d = _backup_dir()
++        if d is None:
++            return
++        d.mkdir(parents=True, exist_ok=True)
++        existing = _backup_files()
++        content = live.read_bytes()
++        if existing:
++            try:
++                if existing[0].read_bytes() == content:
++                    return
++            except OSError:
++                pass
++        stamp = time.strftime("%Y%m%d-%H%M%S")
++        dest = d / f"wishlist-{stamp}-{int(time.time() * 1000) % 1000:03d}.json"
++        dest.write_bytes(content)
++        _rotate_backups()
++    except Exception as e:
++        log.warning("wishlist_store: backup before write failed: %s", e)
++
++
++def _rotate_backups():
++    files = _backup_files()   # newest first
++    keep = set(files[:BACKUPS_KEEP_RECENT])
++    cutoff = time.time() - BACKUPS_KEEP_DAYS * 86400
++    seen_days = set()
++    for p in files[BACKUPS_KEEP_RECENT:]:
++        try:
++            m = p.stat().st_mtime
++        except OSError:
++            continue
++        if m < cutoff:
++            continue
++        day = time.strftime("%Y%m%d", time.localtime(m))
++        if day in seen_days:
++            continue
++        seen_days.add(day)
++        keep.add(p)
++    for p in files:
++        if p not in keep:
++            try:
++                p.unlink()
++            except OSError:
++                pass
++
++
++def list_backups() -> list:
++    """Newest first: [{"path", "mtime", "count"}] (count = items in it)."""
++    out = []
++    for p in _backup_files():
++        try:
++            with open(p, "r", encoding="utf-8") as f:
++                data = _parse_data(json.load(f))
++            out.append({"path": str(p), "mtime": p.stat().st_mtime,
++                        "count": len(data["items"])})
++        except Exception:
++            continue
++    return out
++
++
++def load_backup(path: str) -> dict:
++    try:
++        with open(path, "r", encoding="utf-8") as f:
++            return _parse_data(json.load(f))
++    except Exception as e:
++        log.warning("wishlist_store: could not read backup %s: %s", path, e)
++        return _empty_data()
++
++
++def get_deleted_from_backups(backup_path: Optional[str] = None) -> list:
++    """
++    Diff backups against the live wishlist: items that exist in a backup but
++    not (by id) in the current wishlist. With backup_path, diff that single
++    backup; with None, combine every backup (newest copy of each item wins).
++
++    Returns [{"item": dict, "backup_mtime": float}] ordered by when the
++    containing backup was taken (newest first), then by title.
++    """
++    current_ids = {i.get("id") for i in load()["items"]}
++    found = {}
++    paths = [Path(backup_path)] if backup_path else _backup_files()
++    for p in paths:   # newest first, so the first sighting is the newest copy
++        data = load_backup(str(p))
++        try:
++            mtime = p.stat().st_mtime
++        except OSError:
++            mtime = 0.0
++        for item in data["items"]:
++            iid = item.get("id")
++            if iid and iid not in current_ids and iid not in found:
++                found[iid] = {"item": item, "backup_mtime": mtime}
++    return sorted(found.values(),
++                  key=lambda r: (-r["backup_mtime"], r["item"].get("title", "").lower()))
++
++
++def restore_items(items: list) -> int:
++    """Put items (dicts from get_deleted_from_backups) back, keeping their
++    original ids and details, appended to the bottom of the priority list.
++    Items whose id is already present are skipped. Returns the number
++    restored."""
++    restored = {"n": 0}
++
++    def _apply(data):
++        existing_ids = {i.get("id") for i in data["items"]}
++        order = max((i.get("sort_order", 0) for i in data["items"]), default=-1)
++        for item in items:
++            if not item.get("id") or item["id"] in existing_ids:
++                continue
++            order += 1
++            new_item = dict(item)
++            new_item["sort_order"] = order
++            data["items"].append(new_item)
++            existing_ids.add(item["id"])
++            restored["n"] += 1
++
++    if not items:
++        return 0
++    result = _read_modify_write(_apply)
++    return restored["n"] if result is not None else 0
++
++
+ def _save(data: dict) -> bool:
+     """Atomic write: temp file + os.replace(). Returns True on success,
+     False if wishlist_path isn't configured or the write failed for any
+-    reason (never raises)."""
++    reason (never raises). The previous file is snapshotted into
++    wishlist_backups/ first."""
+     root = _wishlist_root()
+     if not root:
+         log.warning("wishlist_store: wishlist_path not configured — cannot save")
+@@ -275,6 +442,7 @@ def _save(data: dict) -> bool:
+ 
+     path = root / WISHLIST_FILENAME
+     tmp  = path.with_suffix(".tmp")
++    _snapshot_before_write(path)
+     try:
+         with open(tmp, "w", encoding="utf-8") as f:
+             json.dump(data, f, indent=2)
+@@ -445,7 +613,8 @@ def remove_item(item_id: str) -> bool:
+     """Delete an item. Does NOT touch ignored_matches rows referencing it
+     — a harmless orphan (never looked up again once the item is gone) is
+     simpler and safer than trying to prune in lockstep across a shared
+-    file two machines might be editing."""
++    file two machines might be editing. The previous file state is kept in
++    wishlist_backups/, so the item can be brought back via restore_items()."""
+     removed = {"ok": False}
+ 
+     def _apply(data):
+@@ -565,30 +734,98 @@ def resolve_cover_path(cover_url: str) -> Optional[str]:
+ # auto-track pass — both are independent consumers of scan_nas()'s
+ # new_game_ids list. See MainWindow._start_auto_track() for the sibling
+ # pattern this hooks next to.
++#
++# Matching is WORD-based, never raw character-substring. The old rule
++# (squash to alphanumerics, then substring either way) matched "Ys I" with
++# "Physint" ("ysi" appears inside "physint") and "Rage" with "Spyro the
++# Dragon: Ripto's Rage". Now:
++#   exact  — same words after dropping edition noise ("Deluxe Edition",
++#            "GOTY", "Remastered", release-group junk, "the"…).
++#   close  — one title is the START or END of the other on whole-word
++#            boundaries, the shorter side is distinctive (2+ words, or a
++#            single word of 6+ letters — "Exodus" in "Metro Exodus"), and
++#            the leftover words contain no number/roman numeral (so "Doom"
++#            never matches "Doom 3", "Ys" never matches "Ys II").
++#   short single words ("Rage", "Ys") only ever match an exact title.
++
++_NOISE_WORDS = frozenset({
++    "the", "a", "an", "of", "and",
++    "edition", "goty", "remastered", "remaster", "remake", "deluxe",
++    "definitive", "complete", "ultimate", "enhanced", "directors", "cut",
++    "anniversary", "collectors", "premium", "standard", "gold", "hd",
++    "multi", "repack", "proper", "dlc", "dlcs", "all", "update", "build",
++    "win", "pc", "gog", "codex", "plaza", "rune", "cpy", "empress", "flt",
++    "elamigos", "dodi", "fitgirl", "goldberg", "tenoke", "skidrow",
++})
++_ROMAN = frozenset({"ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
++                    "xi", "xii", "xiii", "xiv", "xv", "xx"})
++_MIN_SINGLE_WORD_LEN = 6
++_MAX_EXTRA_WORDS = 3
++
++
++def _title_words(text: str) -> list:
++    """Lowercased alphanumeric words with apostrophes folded away
++    ("Ripto's" -> "riptos") and edition/release noise removed."""
++    t = (text or "").lower().replace("'", "").replace("’", "")
++    t = re.sub(r"\(\d{3,}\)", " ", t)                      # store ids: (12345)
++    t = re.sub(r"\bv\s?\d+(?:[ ._]\d+)*[a-z]?\b", " ", t)  # v1.2 / v1 12 3
++    t = re.sub(r"\bmulti\d*\b", " ", t)                    # MULTi10
++    t = re.sub(r"\bbuild\s*\d+\b", " ", t)
++    words = re.findall(r"[a-z0-9]+", t)
++    return [w for w in words if w not in _NOISE_WORDS]
++
++
++def _is_numeral(word: str) -> bool:
++    return word.isdigit() or word in _ROMAN
++
+ 
+ def _normalize_title_key(text: str) -> str:
+-    """Lowercase, strip everything except alphanumerics — same
+-    normalization idea save_backup.scan_known_locations() already uses
+-    for its name_key matching. Not a new algorithm, per spec."""
+-    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
++    """Kept for any other callers: words joined, no separators."""
++    return "".join(_title_words(text))
++
++
++def match_confidence(wishlist_title: str, scanned_title: str) -> Optional[str]:
++    """'exact' | 'close' | None for a pair of titles (see block comment)."""
++    w = _title_words(wishlist_title)
++    s = _title_words(scanned_title)
++    if not w or not s:
++        return None
++    if w == s:
++        return "exact"
++    if len(w) == len(s):
++        return None
++    short, long_ = (w, s) if len(w) < len(s) else (s, w)
++    # the shorter title must be distinctive enough to count at all
++    if len(short) < 2 and len(short[0]) < _MIN_SINGLE_WORD_LEN:
++        return None
++    extra = len(long_) - len(short)
++    if extra > _MAX_EXTRA_WORDS:
++        return None
++    if long_[:len(short)] == short:
++        leftover = long_[len(short):]
++    elif long_[-len(short):] == short:
++        leftover = long_[:-len(short)]
++    else:
++        return None
++    if any(_is_numeral(x) for x in leftover):
++        return None   # a sequel / different entry, not the same game
++    return "close"
+ 
+ 
+ def find_acquired_matches(scanned_titles: dict) -> list:
+     """
+     scanned_titles: {folder_name: display_title} for newly-scanned games.
+ 
+-    Match rule: normalized title keys are equal, OR one is a substring of
+-    the other — identical containment rule to save_backup.py's
+-    known-location matching, deliberately reused rather than inventing a
+-    new one. Skips any (wishlist_id, folder_name) pair already recorded
+-    in ignored_matches.
++    Uses match_confidence() — word-based, see the block comment above.
++    Skips any (wishlist_id, folder_name) pair already recorded in
++    ignored_matches.
+ 
+     Returns a list of dicts, one per un-ignored match found, each:
+-        {"wishlist_id", "wishlist_title", "folder_name", "scanned_title"}
+-    A single wishlist item or a single scanned game may appear in more
+-    than one result if it fuzzy-matches multiple counterparts — the
+-    caller (the one-at-a-time confirmation flow) handles that the same
+-    way it handles any other queued match.
++        {"wishlist_id", "wishlist_title", "folder_name", "scanned_title",
++         "confidence"}            # confidence: "exact" | "close"
++    Exact matches come first. A single wishlist item or scanned game may
++    appear more than once if it matches multiple counterparts — the
++    caller (the one-at-a-time confirmation flow) queues them all.
+     """
+     items = get_items()
+     if not items or not scanned_titles:
+@@ -603,20 +840,16 @@ def find_acquired_matches(scanned_titles: dict) -> list:
+ 
+     results = []
+     for item in items:
+-        wkey = _normalize_title_key(item.get("title", ""))
+-        if not wkey:
+-            continue
+         for folder_name, scanned_title in scanned_titles.items():
+-            skey = _normalize_title_key(scanned_title)
+-            if not skey:
++            conf = match_confidence(item.get("title", ""), scanned_title)
++            if not conf or _ignored(item["id"], folder_name):
+                 continue
+-            if wkey == skey or wkey in skey or skey in wkey:
+-                if _ignored(item["id"], folder_name):
+-                    continue
+-                results.append({
+-                    "wishlist_id":    item["id"],
+-                    "wishlist_title": item.get("title", ""),
+-                    "folder_name":    folder_name,
+-                    "scanned_title":  scanned_title,
+-                })
++            results.append({
++                "wishlist_id":    item["id"],
++                "wishlist_title": item.get("title", ""),
++                "folder_name":    folder_name,
++                "scanned_title":  scanned_title,
++                "confidence":     conf,
++            })
++    results.sort(key=lambda r: 0 if r["confidence"] == "exact" else 1)
+     return results

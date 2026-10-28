@@ -132,9 +132,40 @@ COMMON_REDISTS = [
     "vcrun2005", "vcrun2008", "vcrun2010", "vcrun2012",
     "vcrun2013", "vcrun2015", "vcrun2017", "vcrun2019", "vcrun2022",
     "dotnet40", "dotnet48",
-    "d3dx9", "d3dx10", "d3dx11", "d3dcompiler_47",
+    "d3dx9", "d3dx10", "d3dx11_43", "d3dcompiler_47",
     "xact", "physx", "openal",
 ]
+
+
+# Old verb names that never existed in winetricks -> the real ones. Applied
+# when reading stored/detected redist lists so older records keep working.
+REDIST_ALIASES = {"d3dx11": "d3dx11_43"}
+
+
+def normalize_redists(verbs) -> list:
+    out = []
+    for v in verbs or []:
+        v = REDIST_ALIASES.get(v, v)
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _winetricks_prefix(prefix_path: Path) -> Path:
+    """The directory winetricks must target: Proton keeps its real Wine
+    prefix in <prefix_path>/pfx, plain Wine uses prefix_path itself."""
+    pfx = Path(prefix_path) / "pfx"
+    return pfx if (pfx / "system.reg").exists() else Path(prefix_path)
+
+
+def _store_redist_result(game_id: int, requested, failed):
+    try:
+        db.update_install_fields(
+            game_id,
+            redists=normalize_redists(requested),
+            redists_failed=normalize_redists(failed))
+    except Exception as e:
+        log.warning("Could not store redist result for game %s: %s", game_id, e)
 
 
 def _game_engine(game) -> Optional[str]:
@@ -706,7 +737,7 @@ def get_installed_redists(prefix_path: Path) -> set:
     by reading the winetricks.log file it maintains automatically.
     Returns an empty set if the log doesn't exist or can't be read.
     """
-    log_path = prefix_path / "winetricks.log"
+    log_path = _winetricks_prefix(Path(prefix_path)) / "winetricks.log"
     try:
         if log_path.exists():
             return {line.strip() for line in log_path.read_text().splitlines()
@@ -723,8 +754,10 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
     Skips verbs already recorded in winetricks.log unless force=True.
     Returns list of verbs that failed.
     """
+    prefix_path = Path(prefix_path)
+    redists = normalize_redists(redists)
     already_installed = get_installed_redists(prefix_path)
-    env    = {**os.environ, "WINEPREFIX": str(prefix_path)}
+    env    = {**os.environ, "WINEPREFIX": str(_winetricks_prefix(prefix_path))}
     failed = []
 
     to_install = redists if force else [
@@ -749,8 +782,10 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
                         f"Installing {verb}…")
         try:
             r = subprocess.run(["winetricks", "-q", verb], env=env,
-                               capture_output=True, timeout=300)
+                               capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
+                log.warning("winetricks %s failed (rc=%d): %s", verb,
+                            r.returncode, (r.stderr or r.stdout or "")[-400:])
                 failed.append(verb)
         except subprocess.TimeoutExpired:
             failed.append(verb)
@@ -1601,9 +1636,26 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
     wine_bin = _resolve_wine_bin(_version_path) if _version_path else "wine"
     log.info("Using Wine/Proton binary: %s (version key: %s)", wine_bin, proton_value)
 
-    # ── Extract (skip if tmp already populated from a previous attempt) ───────
+    # ── Extract ───────────────────────────────────────────────────────────────
+    # Portable archives extract straight into the final install folder (no
+    # .tmp round trip). Other flows extract to tmp (skipped if already
+    # populated from a previous attempt).
+    portable_direct = (install_tag == "portable"
+                       and file_type in ("rar", "7zip", "zip"))
     source_path = None
-    if file_type in ("rar", "7zip", "zip"):
+    if portable_direct:
+        prog("Extracting", 0, f"Extracting {archive_name} to {game_dest}…")
+        try:
+            if game_dest.exists():
+                shutil.rmtree(game_dest)
+        except Exception as e:
+            return fail(f"Could not clear {game_dest}: {e}")
+        if not extract_archive(nas_path, archive_name, file_type, game_dest, prog):
+            return {"success": False,
+                    "error": f"Extraction failed for {archive_name}",
+                    "tmp_path": str(game_dest), "cancelled": False}
+        source_path = game_dest
+    elif file_type in ("rar", "7zip", "zip"):
         if tmp_has_contents(tmp_path, archive_name):
             prog("Extracting", 100,
                  f"Using existing extracted files in {tmp_path.name} — skipping extraction.")
@@ -1732,6 +1784,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launch_icon=launch_icon,
             proton_version=proton_value,
         )
+        _store_redist_result(game_id, options.get("redists"), failed_redists)
 
         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
         addon_result = _install_pending_addons(
@@ -1833,6 +1886,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launch_icon=launch_icon,
             proton_version=proton_value,
         )
+        _store_redist_result(game_id, options.get("redists"), failed_redists)
 
         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
         addon_result = _install_pending_addons(
@@ -1867,13 +1921,14 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
         if options.get("redists"):
             failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
 
-        prog("Copying files", 40, f"Copying to {game_dest}…")
-        try:
-            if game_dest.exists():
-                shutil.rmtree(game_dest)
-            shutil.copytree(str(source_path), str(game_dest))
-        except Exception as e:
-            return fail(f"Copy failed: {e}")
+        if not portable_direct:
+            prog("Copying files", 40, f"Copying to {game_dest}…")
+            try:
+                if game_dest.exists():
+                    shutil.rmtree(game_dest)
+                shutil.copytree(str(source_path), str(game_dest))
+            except Exception as e:
+                return fail(f"Copy failed: {e}")
 
         prog("Finding game exe", 70, "Locating launch executable…")
         exe_path = find_game_exe(game_dest)
@@ -1926,6 +1981,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
             launch_icon=launch_icon,
             proton_version=proton_value,
         )
+        _store_redist_result(game_id, options.get("redists"), failed_redists)
 
         # ── Update & DLC Install Support — apply pending updates/DLC/crackfix ──
         addon_result = _install_pending_addons(
@@ -2113,8 +2169,9 @@ def rerun_redists(game_id: int, redists: list, force: bool = True,
                 "error": "Wine prefix not found on disk — set the prefix path first.",
                 "failed": []}
 
+    redists = normalize_redists(redists)
     failed = install_redists(prefix_path, redists, progress_cb, force=force)
-    db.update_install_fields(game_id, redists=redists)
+    db.update_install_fields(game_id, redists=redists, redists_failed=failed)
     log.info("rerun_redists: game %d — %d requested, %d failed",
              game_id, len(redists), len(failed))
     return {"success": True, "error": None, "failed": failed}

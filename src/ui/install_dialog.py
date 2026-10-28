@@ -433,7 +433,7 @@ class InstallDialog(QDialog):
             try:
                 result = steamdb_mod.get_redists_for_install(
                     steam_app_id, game_title2, auto_detect=True)
-                self._auto_redists  = result["auto"]
+                self._auto_redists  = install_mod.normalize_redists(result["auto"])
                 self._redist_source = result["source"]
             except Exception as _e:
                 log.warning("SteamDB redist detection failed: %s", _e)
@@ -1040,15 +1040,6 @@ class InstallDialog(QDialog):
                 "Selected version is not installed. Download it first.",
                 "danger")
             return
-
-        # If the user overrode the install type, persist it so future scans
-        # don't overwrite the choice (install_tag_override=1 in the games table).
-        original_tag = self.game.get("install_tag") or "portable"
-        if self._install_tag != original_tag:
-            try:
-                db.set_install_tag_override(self.game["id"], self._install_tag)
-            except Exception as _e:
-                log.warning("Could not persist install_tag override: %s", _e)
 
         # Check if this prefix already has some redists installed
         prefix_name = self.prefix_edit.text().strip() or \

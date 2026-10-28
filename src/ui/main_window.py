@@ -41,7 +41,9 @@ from PyQt6.QtCore import Qt, QThread, QThreadPool, QTimer, pyqtSignal, QSize, QP
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QColor, QKeyEvent
 
 import db
+import dbsafety
 import scanner
+import scan_reconcile
 import metadata as meta_mod
 import protondb as protondb_mod
 import version_checker as vc_mod
@@ -78,7 +80,9 @@ class ScanWorker(QThread):
         import time
         log.info("[PHASE] ScanWorker.run() — %s", self.nas_path)
         t0 = time.monotonic()
-        result = scanner.scan_nas(
+        # scan_and_reconcile never clears anything: it upserts what it finds,
+        # then flags games whose NAS folder is gone (and un-flags returned ones).
+        result = scan_reconcile.scan_and_reconcile(
             self.nas_path,
             progress_callback=lambda cur, tot, name: self.progress.emit(cur, tot, name)
         )
@@ -1414,7 +1418,9 @@ class MainWindow(QMainWindow):
         log.info("Setup wizard complete. NAS path: %s", nas_path)
         import os
         self.sidebar.set_nas_connected(os.path.exists(nas_path), nas_path)
-        self._start_scan(nas_path, clear_first=True)
+        # Never clear here: re-running the wizard on an existing library
+        # must not wipe it. The scan upserts and flags missing games.
+        self._start_scan(nas_path, clear_first=False)
 
     def _initial_load(self):
         """
@@ -1441,6 +1447,10 @@ class MainWindow(QMainWindow):
         # of whether a scan is about to be queued.
         self._reattach_running_games()
 
+        # Orphaned installs — VaultPlay .desktop files with no install
+        # record (e.g. after a DB problem) are re-adopted automatically.
+        QTimer.singleShot(1200, self._heal_orphan_installs)
+
         nas_path = db.get_setting("nas_path", "")
         if nas_path and nas_path.strip() not in ("", "/"):
             self.sidebar.set_nas_connected(True, nas_path)
@@ -1454,6 +1464,10 @@ class MainWindow(QMainWindow):
                 timeout=0
             )
 
+        # Games that never got metadata (e.g. after a data problem) get
+        # fetched even when no scan runs this launch.
+        QTimer.singleShot(4000, self._maybe_fetch_missing_metadata)
+
         # Arm the persisted version check timer now that the app is loaded
         self._arm_version_check_timer()
 
@@ -1463,6 +1477,35 @@ class MainWindow(QMainWindow):
         # Controller Support — optional; silently does nothing if pysdl2/SDL2
         # aren't installed or "controller_enabled" is off.
         self._apply_controller_setting()
+
+    def _maybe_fetch_missing_metadata(self):
+        if self._meta_worker and self._meta_worker.isRunning():
+            return
+        try:
+            if db.get_setting("sgdb_api_key", "") and db.get_games_missing_metadata():
+                self._start_metadata_fetch()
+        except Exception as e:
+            log.debug("Missing-metadata check failed: %s", e)
+
+    def _heal_orphan_installs(self):
+        """Re-adopt VaultPlay-created .desktop launchers that have no install
+        record. Only ones whose name matches a library game are healed
+        automatically; the rest are left alone (Locate Game handles those)."""
+        try:
+            orphans = dbsafety.find_orphans()
+        except Exception as e:
+            log.warning("Orphan scan failed: %s", e)
+            return
+        healed = []
+        for o in orphans:
+            if o.get("game_id") and dbsafety.heal_orphan(o):
+                healed.append(o["name"])
+        if healed:
+            log.info("Re-adopted %d orphaned install(s): %s", len(healed), healed)
+            self._load_library()
+            self.library_view.show_status(
+                f"Restored {len(healed)} installed game(s): " + ", ".join(healed[:3])
+                + ("…" if len(healed) > 3 else ""), timeout=6000)
 
     def _on_trickle_finished(self):
         """
@@ -1482,7 +1525,12 @@ class MainWindow(QMainWindow):
             self._start_scan(path, clear_first=False)
 
     def _on_nas_path_changed(self, path: str):
-        """Called when NAS path Apply is clicked or blacklist toggled."""
+        """Called when NAS path Apply is clicked or blacklist toggled.
+
+        Changing the path NEVER clears the library: games present at both
+        paths are kept (with their metadata/installs), new ones are added,
+        and ones missing from the new path are flagged missing_from_nas.
+        """
         if path == "__reload__":
             self._load_library()
         else:
@@ -1491,7 +1539,7 @@ class MainWindow(QMainWindow):
                 self.sidebar.set_nas_connected(True, path)
             else:
                 self.sidebar.set_nas_connected(False, path)
-            self._start_scan(path, clear_first=True)
+            self._start_scan(path, clear_first=False)
 
     def _show_library(self):
         # See Sidebar.clear_wishlist_highlight()'s docstring — this is the
@@ -1691,7 +1739,11 @@ class MainWindow(QMainWindow):
             return  # already running
 
         if clear_first:
-            self.library_view.show_status("NAS path changed — clearing library…")
+            # No built-in caller requests this any more (a path change now
+            # reconciles instead), but if one does, snapshot the DB first so
+            # it is always recoverable from <config>/backups.
+            dbsafety.backup_now("before_clear")
+            self.library_view.show_status("Clearing library…")
             db.clear_all_games()
             self._load_library()
 
@@ -1711,10 +1763,14 @@ class MainWindow(QMainWindow):
         new    = result.get("new", 0)
         total  = result.get("total", 0)
         errors = result.get("errors", [])
+        recon  = result.get("reconcile") or {}
+        flagged = recon.get("flagged", 0)
 
         msg = f"Scan complete — {total} games found"
         if new:
             msg += f", {new} new"
+        if flagged:
+            msg += f", {flagged} missing from NAS"
         if errors:
             msg += f", {len(errors)} error(s)"
 
@@ -1752,8 +1808,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        if new and not (self._meta_worker and self._meta_worker.isRunning()):
-            from PyQt6.QtCore import QTimer
+        # Orphaned installs whose game row only just got (re)created by this
+        # scan can be adopted now.
+        QTimer.singleShot(500, self._heal_orphan_installs)
+
+        # Fetch metadata when the scan found new games OR any game is still
+        # missing metadata (otherwise a library re-created after a DB
+        # problem would never get its art back, since "new" would be 0).
+        needs_meta = bool(new)
+        if not needs_meta:
+            try:
+                needs_meta = bool(db.get_games_missing_metadata())
+            except Exception:
+                needs_meta = False
+        if needs_meta and not (self._meta_worker and self._meta_worker.isRunning()):
             QTimer.singleShot(2000, self._start_metadata_fetch)
 
         # Fire auto-track pass for new games, independent of the metadata chain.
@@ -1762,7 +1830,6 @@ class MainWindow(QMainWindow):
         new_game_ids = result.get("new_game_ids", [])
         if new_game_ids:
             self._pending_new_game_ids = new_game_ids
-            from PyQt6.QtCore import QTimer
             QTimer.singleShot(1000, self._start_auto_track)
             # Wishlist — Acquired-Game Auto-Match: independent of the
             # version-tracking auto-track pass above (both are separate
@@ -1965,11 +2032,12 @@ class MainWindow(QMainWindow):
 
     def _check_wishlist_matches(self, new_game_ids: list):
         """
-        Fires after every scan that found new games — fuzzy-matches each
+        Fires after every scan that found new games — matches each
         newly-scanned game's title against the wishlist (see
-        wishlist_store.find_acquired_matches()) and asks about each
-        un-ignored match in turn. No-ops immediately if the wishlist isn't
-        configured, since there's nothing to match against.
+        wishlist_store.find_acquired_matches(), which is word-based and
+        deliberately strict) and asks about each un-ignored match in turn.
+        No-ops immediately if the wishlist isn't configured, since there's
+        nothing to match against.
         """
         if not wishlist_store.is_configured() or not new_game_ids:
             return
@@ -1998,10 +2066,12 @@ class MainWindow(QMainWindow):
 
     def _confirm_wishlist_match(self, match: dict):
         """
-        One-at-a-time confirmation for a single fuzzy wishlist match.
+        One-at-a-time confirmation for a single wishlist match.
         Three outcomes:
           Remove from Wishlist        — the game was acquired; delete the
-                                         wishlist item.
+                                         wishlist item (a backup of the
+                                         wishlist is taken automatically,
+                                         so it can be restored later).
           Not This Time               — no change; this exact pair will be
                                          offered again on a future scan
                                          (e.g. if it was a false positive
@@ -2015,14 +2085,18 @@ class MainWindow(QMainWindow):
         """
         msg = QMessageBox(self)
         msg.setWindowTitle("Wishlist Match Found")
+        kind = match.get("confidence", "exact")
+        verb = "looks like" if kind == "exact" else "might be"
         msg.setText(
-            f"'{match['scanned_title']}' looks like it might be "
+            f"'{match['scanned_title']}' {verb} "
             f"'{match['wishlist_title']}' from your wishlist.")
         msg.setInformativeText("Remove it from your wishlist?")
         remove_btn = msg.addButton("Remove from Wishlist", QMessageBox.ButtonRole.AcceptRole)
         msg.addButton("Not This Time", QMessageBox.ButtonRole.RejectRole)
         ignore_btn = msg.addButton("Keep — Don't Ask Again", QMessageBox.ButtonRole.DestructiveRole)
-        msg.setDefaultButton(remove_btn)
+        # "close" matches are plausible-but-uncertain (e.g. "Metro Exodus"
+        # vs "Exodus"): default to the safe choice, not removal.
+        msg.setDefaultButton(remove_btn if kind == "exact" else ignore_btn)
         msg.setStyleSheet(
             f"QMessageBox {{ background: {COLORS['surface']}; color: {COLORS['text']}; }}")
         msg.exec()
@@ -2649,17 +2723,38 @@ class MainWindow(QMainWindow):
         try:
             canonical = save_backup.move_and_link(chosen_folder, save_root, folder_name)
         except save_backup.SaveMoveConflict as e:
-            reply = QMessageBox.question(
-                self, "Save Backup",
-                f"A backed-up save already exists at:\n{e.canonical_path}\n\n"
-                "Continuing will overwrite it with the save you just picked. "
-                "Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                log.info("[SAVE BACKUP] User declined overwrite for game_id=%d — skipped",
-                         game_id)
+            # A backup already exists (typical after a fresh install). The
+            # default is to KEEP it and restore it into this folder — never
+            # to overwrite it with the brand-new save.
+            box = QMessageBox(self)
+            box.setWindowTitle("Save Backup")
+            box.setText("You already have a backed-up save for this game.")
+            box.setInformativeText(
+                f"Backup: {e.canonical_path}\n\n"
+                "Use your existing backup to continue your progress, or "
+                "replace it with the save you just created? Whichever you "
+                "don't choose is kept in a “_replaced” folder, not deleted.")
+            use_btn = box.addButton("Use My Existing Backup",
+                                    QMessageBox.ButtonRole.AcceptRole)
+            rep_btn = box.addButton("Replace Backup With New Save",
+                                    QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(use_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == use_btn:
+                import save_restore
+                r = save_restore.adopt_existing_backup(
+                    game_id, folder_name, chosen_folder, save_root)
+                if r.get("ok"):
+                    self.library_view.show_status(
+                        "✓ Restored your existing save backup", timeout=5000)
+                else:
+                    self.library_view.show_status(
+                        f"⚠ Restore failed: {r.get('error')}", timeout=6000)
+                return
+            if clicked != rep_btn:
+                log.info("[SAVE BACKUP] User cancelled conflict prompt for game_id=%d", game_id)
                 return
             try:
                 canonical = save_backup.move_and_link(
@@ -2751,6 +2846,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_controller()
+        # Stop every worker/watcher BEFORE widgets are destroyed — destroying a
+        # running QThread aborts the process. Games keep running; their
+        # playtime watchers re-attach on next start.
+        for w in list(self._playtime_watchers.values()):
+            try:
+                w.request_abort()
+            except Exception:
+                pass
+        try:
+            import thread_guard
+            thread_guard.shutdown_all()
+        except Exception as e:
+            log.warning("Thread shutdown failed: %s", e)
         super().closeEvent(event)
 
     # ── Signal slots (all funnel into _on_ctrl_action) ───────────────────

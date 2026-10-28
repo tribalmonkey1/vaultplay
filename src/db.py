@@ -458,6 +458,9 @@ def _migrate_db():
         ]:
             if col not in game_cols:
                 conn.execute(sql)
+        # The install-type override is retired: a chosen type must never be
+        # permanent, so every rescan re-detects it. Clear any stale flags.
+        conn.execute("UPDATE games SET install_tag_override=0 WHERE install_tag_override=1")
         # installs table migrations
         install_cols = {row[1] for row in conn.execute("PRAGMA table_info(installs)").fetchall()}
         for col, sql in [
@@ -483,6 +486,9 @@ def _migrate_db():
             # prefix, so the Cogwheel's "Edit Redistributables" dialog has something
             # to pre-check instead of starting from steamdb's auto-detect every time.
             ("redists", "ALTER TABLE installs ADD COLUMN redists TEXT DEFAULT '[]'"),
+            # redists_failed — JSON list of verbs that were requested but
+            # failed to install, so Manage Install can flag them.
+            ("redists_failed", "ALTER TABLE installs ADD COLUMN redists_failed TEXT DEFAULT '[]'"),
         ]:
             if col not in install_cols:
                 conn.execute(sql)
@@ -1026,9 +1032,7 @@ def upsert_game(folder_name: str, nas_path: str, display_name: str,
                 file_type    = excluded.file_type,
                 archive_name = excluded.archive_name,
                 size_bytes   = excluded.size_bytes,
-                install_tag  = CASE WHEN install_tag_override=1
-                                    THEN games.install_tag
-                                    ELSE excluded.install_tag END,
+                install_tag  = excluded.install_tag,
                 category     = excluded.category,
                 last_scanned = datetime('now')
         """, (folder_name, nas_path, display_name, file_type,
@@ -1128,7 +1132,7 @@ def get_game(game_id: int) -> Optional[sqlite3.Row]:
                    i.install_path, i.wine_prefix, i.install_method, i.exe_path,
                    i.game_path, i.launcher_type, i.desktop_path, i.script_path,
                    i.launch_cmd, i.launch_cwd, i.launch_icon,
-                   i.proton_version, i.redists,
+                   i.proton_version, i.redists, i.redists_failed,
                    (i.id IS NOT NULL) AS is_installed,
                    COALESCE(gs.is_favorite,       0)          AS is_favorite,
                    COALESCE(gs.is_hidden,         0)          AS is_hidden,
@@ -1272,7 +1276,7 @@ def remove_install(game_id: int):
 _INSTALL_UPDATABLE_COLS = frozenset({
     "install_path", "wine_prefix", "install_method", "exe_path", "game_path",
     "launcher_type", "desktop_path", "script_path", "launch_cmd", "launch_cwd",
-    "launch_icon", "proton_version", "redists",
+    "launch_icon", "proton_version", "redists", "redists_failed",
 })
 
 
@@ -1295,7 +1299,7 @@ def update_install_fields(game_id: int, **fields):
     for key, value in fields.items():
         if key not in _INSTALL_UPDATABLE_COLS:
             continue
-        if key == "redists" and isinstance(value, (list, tuple)):
+        if key in ("redists", "redists_failed") and isinstance(value, (list, tuple)):
             value = json.dumps(list(value))
         updates.append(f"{key}=?")
         params.append(value)

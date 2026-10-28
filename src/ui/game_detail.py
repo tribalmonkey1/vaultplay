@@ -373,6 +373,11 @@ class _GalleryPreview(QWidget):
         self._is_video = False
         self._scaled: QPixmap | None = None
         self._scaled_key = None
+        self._ring = False   # Controller Support focus ring
+
+    def set_ring(self, on: bool):
+        self._ring = on
+        self.update()
 
     def set_content(self, pix, is_video: bool):
         self._pix = pix
@@ -429,8 +434,12 @@ class _GalleryPreview(QWidget):
 
         p.setClipping(False)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 20), 1))
-        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 10, 10)
+        if self._ring:
+            p.setPen(QPen(QColor(COLORS["accent"]), 3))
+            p.drawRoundedRect(QRectF(1.5, 1.5, w - 3, h - 3), 10, 10)
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+            p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 10, 10)
         p.end()
 
     def mousePressEvent(self, event):
@@ -605,6 +614,23 @@ class MediaGalleryWidget(QWidget):
 
     def has_items(self) -> bool:
         return bool(self._items)
+
+    # ── Controller Support ────────────────────────────────────────────────
+
+    def controller_step(self, delta: int) -> bool:
+        """Select the previous/next gallery item. False at either end."""
+        i = self._current + delta
+        if not (0 <= i < len(self._items)):
+            return False
+        self._select(i)
+        return True
+
+    def controller_activate(self):
+        """A button — plays the selected item if it's a video."""
+        self._on_preview_clicked()
+
+    def set_controller_focused(self, on: bool):
+        self.preview.set_ring(on)
 
     def clear(self):
         for t in self._thumbs:
@@ -848,6 +874,15 @@ class GameDetailView(QWidget):
         self._ctrl_focused_widget = None
         self._ctrl_focus_visible = False
         self._ctrl_orig_style: dict = {}   # id(widget) -> its original styleSheet
+
+        # Stale-art guards: the URL each async art load is currently allowed
+        # to paint. A loader finishing for any other URL (e.g. the previous
+        # game's) is ignored, and load_game()/load_wishlist_item() reset the
+        # hero + cover up front so a game with no art shows none.
+        self._hero_url_expected = ""
+        self._cover_url_expected = ""
+        self._trailer_thumb_expected = ""
+        self._wishlist_art_token = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1246,6 +1281,27 @@ class GameDetailView(QWidget):
         self.install_btn.clicked.connect(self._on_install_clicked)
         install_card_layout.addWidget(self.install_btn)
 
+        # Already have it set up outside VaultPlay (or lost the DB entry)?
+        # Re-create the install record from an existing install folder,
+        # wine prefix and/or .desktop file. Only visible when not installed.
+        self.locate_btn = QPushButton("📂  Already installed? Locate Game…")
+        self.locate_btn.setFont(QFont("DM Sans", 11))
+        self.locate_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {COLORS['surface2']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                color: {COLORS['text_muted']};
+                padding: 8px 14px;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['text']};
+                background: {COLORS['surface3']};
+            }}
+        """)
+        self.locate_btn.clicked.connect(self._on_locate_clicked)
+        install_card_layout.addWidget(self.locate_btn)
+
         # Launch button + Cogwheel Menu button, side by side (Blizzard-style —
         # see Cogwheel Menu spec). Cogwheel only ever shows for installed
         # games, launch-detected or not (the warning state still needs it,
@@ -1445,11 +1501,39 @@ class GameDetailView(QWidget):
         if not is_game:
             self.media_gallery.clear()
 
+    def _reset_art(self):
+        """Clear hero + cover back to the empty placeholder. Called on every
+        load so a game with no art never inherits the previous page's art."""
+        self.hero._bg_pix = None
+        self.hero.update()
+        self.cover_img.setPixmap(QPixmap())
+        self.cover_img.setStyleSheet(f"""
+            background: {COLORS['surface2']};
+            border: 2px solid rgba(255,255,255,0.12);
+            border-radius: 8px;
+        """)
+
+    def _reset_art_cover_only(self):
+        self.cover_img.setPixmap(QPixmap())
+        self.cover_img.setStyleSheet(f"""
+            background: {COLORS['surface2']};
+            border: 2px solid rgba(255,255,255,0.12);
+            border-radius: 8px;
+        """)
+
     # ── Load game ─────────────────────────────────────────────────────────────
 
     def load_game(self, game_id: int):
+        # Reset art only when switching to a different game/mode; a reload of
+        # the same game (favorite toggle etc.) keeps its art without flicker.
+        _switching = (self._mode != "game" or self._game_id != game_id)
         self._mode = "game"
         self._wishlist_item_id = None
+        self._wishlist_art_token = None
+        if _switching:
+            self._reset_art()
+            self._hero_url_expected = ""
+            self._cover_url_expected = ""
         self._apply_mode_visibility()
         self._ctrl_focused_widget = None
 
@@ -1747,6 +1831,7 @@ class GameDetailView(QWidget):
 
         if game["is_installed"]:
             self.install_btn.hide()
+            self.locate_btn.hide()
             self.cogwheel_btn.set_game(game_id)
             self.cogwheel_btn.show()
             exe = (game["exe_path"] or "").strip()
@@ -1767,6 +1852,7 @@ class GameDetailView(QWidget):
             self.uninstall_btn.show()
         else:
             self.install_btn.show()
+            self.locate_btn.show()
             self.launch_btn.hide()
             self.cogwheel_btn.hide()
             self._launch_btn_available = False
@@ -1788,13 +1874,24 @@ class GameDetailView(QWidget):
         self._screenshots_title.setVisible(self.media_gallery.has_items())
 
         # Async load hero + cover
-        if game["hero_url"]:
-            loader = ImageLoader(game["hero_url"])
+        new_hero = game["hero_url"] or ""
+        new_cover = game["cover_url"] or ""
+        if new_hero != self._hero_url_expected:
+            # URL changed (e.g. edited metadata) — drop the old hero.
+            self.hero._bg_pix = None
+            self.hero.update()
+        if new_cover != self._cover_url_expected:
+            self._reset_art_cover_only()
+        self._hero_url_expected = new_hero
+        self._cover_url_expected = new_cover
+
+        if new_hero:
+            loader = ImageLoader(new_hero)
             loader.signals.loaded.connect(self._on_hero_loaded)
             self._pool.start(loader)
 
-        if game["cover_url"]:
-            loader = ImageLoader(game["cover_url"])
+        if new_cover:
+            loader = ImageLoader(new_cover)
             loader.signals.loaded.connect(self._on_cover_loaded)
             self._pool.start(loader)
 
@@ -1835,6 +1932,9 @@ class GameDetailView(QWidget):
         """
         self._mode = "wishlist"
         self._wishlist_item_id = item_id
+        self._hero_url_expected = ""
+        self._cover_url_expected = ""
+        self._wishlist_art_token = object()
         self._apply_mode_visibility()
         self._ctrl_focused_widget = None
 
@@ -1906,8 +2006,11 @@ class GameDetailView(QWidget):
         self.hero.update()
         cover_url = item.get("cover_url") or ""
         if cover_url:
+            _tok = self._wishlist_art_token
             loader = _WishlistArtLoader(cover_url)
-            loader.signals.loaded.connect(self._on_wishlist_art_loaded)
+            loader.signals.loaded.connect(
+                lambda path, _t=_tok: self._on_wishlist_art_loaded(path)
+                if _t is self._wishlist_art_token else None)
             self._pool.start(loader)
 
         # ── Trailer ───────────────────────────────────────────────────────────
@@ -1941,12 +2044,15 @@ class GameDetailView(QWidget):
         if not trailer_url:
             return
         thumb_url = _youtube_thumbnail_url(trailer_url)
+        self._trailer_thumb_expected = thumb_url or ""
         if thumb_url:
             loader = ImageLoader(thumb_url)
             loader.signals.loaded.connect(self._on_trailer_thumb_loaded)
             self._pool.start(loader)
 
     def _on_trailer_thumb_loaded(self, url: str, local_path: str):
+        if url != self._trailer_thumb_expected:
+            return
         pix = QPixmap(local_path)
         if not pix.isNull():
             self.trailer_thumb.set_thumbnail_pixmap(pix)
@@ -2104,9 +2210,13 @@ class GameDetailView(QWidget):
             self.launch_btn.setEnabled(True)
 
     def _on_hero_loaded(self, url: str, local_path: str):
+        if self._mode != "game" or url != self._hero_url_expected:
+            return   # stale load for a previously viewed game
         self.hero.set_image(local_path)
 
     def _on_cover_loaded(self, url: str, local_path: str):
+        if self._mode != "game" or url != self._cover_url_expected:
+            return   # stale load for a previously viewed game
         pix = QPixmap(local_path)
         if not pix.isNull():
             scaled = pix.scaled(110, 165,
@@ -2374,6 +2484,19 @@ class GameDetailView(QWidget):
         dlg.install_finished.connect(self._on_install_finished)
         dlg.exec()
 
+    def _on_locate_clicked(self):
+        """Open the Locate Game dialog (adopt an existing install)."""
+        if not self._game_id:
+            return
+        game = db.get_game(self._game_id)
+        if not game:
+            return
+        from ui.locate_game_dialog import LocateGameDialog
+        dlg = LocateGameDialog(dict(game), parent=self)
+        if dlg.exec():
+            self.load_game(self._game_id)
+            self.install_finished.emit(self._game_id)
+
     def _maybe_snapshot_before_launch(self, game, wine_bin: str, wine_prefix: str):
         """
         Save Backup pre-launch hook, covering all three flows:
@@ -2408,6 +2531,10 @@ class GameDetailView(QWidget):
         if not wine_prefix:
             return
         try:
+            # Fresh install / recreated prefix: offer to restore the backup
+            # BEFORE the game runs, so it starts from the user's progress.
+            self._offer_save_restore(game, wine_bin, wine_prefix)
+
             existing = db.get_save_paths(self._game_id)
             source_path = existing.get("save_source_path")
             save_path   = existing.get("save_path")
@@ -2416,6 +2543,16 @@ class GameDetailView(QWidget):
                       self._game_id, game["folder_name"], diag)
 
             if diag == "ok":
+                # Back-fill the restore manifest for saves linked before it
+                # existed, so a future fresh install can restore automatically.
+                try:
+                    import save_restore
+                    _root = Path(db.get_setting(
+                        "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
+                    if save_restore.read_manifest(_root, game["folder_name"]) is None:
+                        save_restore.write_manifest(_root, game["folder_name"], source_path)
+                except Exception as _e:
+                    log.debug("[SAVE RESTORE] manifest backfill skipped: %s", _e)
                 return  # linked and intact — nothing to do
 
             if diag == "canonical_missing":
@@ -2484,6 +2621,75 @@ class GameDetailView(QWidget):
                       game["folder_name"], len(snapshot))
         except Exception as e:
             log.warning("[SAVE BACKUP] Pre-launch check/snapshot failed: %s", e)
+
+    def _offer_save_restore(self, game, wine_bin: str, wine_prefix: str,
+                            manual: bool = False) -> bool:
+        """
+        Look for a backup (main save and/or achievements/stats) that exists in
+        the Save Backup folder but isn't linked into this game's prefix, and
+        offer to restore it. See save_restore.py for why this was missing.
+        manual=True (Cogwheel → Restore from Backup) ignores "don't ask again"
+        and reports when there is nothing to restore. Returns True if anything
+        was restored. Never raises.
+        """
+        try:
+            import save_restore
+            import installer as install_mod
+            gid = self._game_id
+            if not manual and db.get_setting(f"save_restore_declined_{gid}", "") == "true":
+                return False
+
+            save_root = Path(db.get_setting(
+                "save_backup_root", str(Path.home() / "Documents" / "Game Saves")))
+            actual = install_mod._resolve_actual_prefix(Path(wine_prefix), wine_bin)
+            drive_c = actual / "drive_c"
+            if not drive_c.exists():
+                return False
+            proton = Path(wine_bin or "").name == "proton"
+            linked = [e.get("canonical_path") for e in db.get_save_extra_paths(gid)
+                      if e.get("canonical_path")]
+            info = save_restore.find_restorable(
+                save_root, game["folder_name"], drive_c, proton, linked)
+
+            # The main save is only restorable when it isn't linked yet.
+            paths = db.get_save_paths(gid)
+            if save_backup.diagnose_source_path(
+                    paths.get("save_source_path"), paths.get("save_path")) == "ok":
+                info["main"] = None
+
+            if not info["main"] and not info["extras"]:
+                if manual:
+                    msg = "Nothing to restore — your backup is already linked."
+                    if info.get("legacy_main"):
+                        msg = ("A backup exists, but it was made before VaultPlay recorded "
+                               "where it belongs, so it can't be placed automatically.\n\n"
+                               "Use Save Files → Re-Link Save Location… and pick this game's "
+                               "save folder — choose “Use my existing backup” when asked.")
+                    QMessageBox.information(self, "Restore from Backup", msg)
+                return False
+
+            from ui.save_restore_dialog import SaveRestoreDialog
+            title = game["title"] or game["display_name"] or game["folder_name"]
+            dlg = SaveRestoreDialog(title, info, parent=self)
+            if dlg.exec() != SaveRestoreDialog.DialogCode.Accepted:
+                if dlg.never:
+                    db.set_setting(f"save_restore_declined_{gid}", "true")
+                return False
+
+            res = save_restore.restore_all(
+                gid, game["folder_name"], save_root, info,
+                dlg.want_main(), dlg.want_extras())
+            if res["errors"]:
+                QMessageBox.warning(self, "Restore from Backup",
+                                    "Some items could not be restored:\n\n" + "\n".join(res["errors"]))
+            did = bool(res["main"] or res["extras"])
+            if did:
+                log.info("[SAVE RESTORE] game_id=%d restored main=%s extras=%s",
+                         gid, res["main"], res["extras"])
+            return did
+        except Exception as e:
+            log.warning("[SAVE RESTORE] restore offer failed: %s", e)
+            return False
 
     def _warn_broken_save_link(self, game, source_path, save_path):
         """Shared fallback warning: shown when a broken link couldn't be
@@ -2661,12 +2867,8 @@ class GameDetailView(QWidget):
                                 f"Could not open folder:\n{e}")
 
     def _on_uninstall_clicked(self):
-        """
-        Three-step uninstall:
-          1. Remove the DB record + desktop/script files (always)
-          2. Ask: delete game files?
-          3. Ask: delete Wine prefix?
-        """
+        """Single-window uninstall: ui/uninstall_dialog.py asks what to remove
+        (record/shortcut, game files, Wine prefix) with checkboxes."""
         if not self._game_id:
             return
         game = db.get_game(self._game_id)
@@ -2679,93 +2881,47 @@ class GameDetailView(QWidget):
         desktop_path = (game["desktop_path"] or "").strip()
         script_path  = (game["script_path"]  or "").strip()
 
-        # ── Step 1: confirm and remove DB record ──────────────────────────────
-        confirm = QMessageBox(self)
-        confirm.setWindowTitle("Uninstall Game")
-        confirm.setText(f"Uninstall <b>{title}</b>?")
-        confirm.setInformativeText(
-            "This will remove the VaultPlay install record, "
-            "desktop shortcut, and launcher script.\n\n"
-            "You will be asked separately about game files and the Wine prefix."
-        )
-        confirm.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
-        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
-        confirm.setStyleSheet(
-            f"QMessageBox {{ background: {COLORS['surface']}; "
-            f"color: {COLORS['text']}; }}")
-        if confirm.exec() != QMessageBox.StandardButton.Yes:
+        from PyQt6.QtWidgets import QDialog
+        from ui.uninstall_dialog import UninstallDialog
+        dlg = UninstallDialog(title, install_path, wine_prefix, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Remove desktop shortcut and launcher script
-        for p in [desktop_path, script_path]:
-            if p and Path(p).exists():
-                try:
-                    Path(p).unlink()
-                    log.info("Deleted: %s", p)
-                except Exception as e:
-                    log.warning("Could not delete %s: %s", p, e)
+        errors = []
 
-        # Remove install record from DB
-        try:
-            db.remove_install(self._game_id)
-            log.info("Uninstalled game %d (%s) — DB record removed", self._game_id, title)
-        except Exception as e:
-            log.error("remove_install failed: %s", e)
+        if dlg.remove_record():
+            for p in [desktop_path, script_path]:
+                if p and Path(p).exists():
+                    try:
+                        Path(p).unlink()
+                        log.info("Deleted: %s", p)
+                    except Exception as e:
+                        log.warning("Could not delete %s: %s", p, e)
+            try:
+                db.remove_install(self._game_id)
+                log.info("Uninstalled game %d (%s) — DB record removed",
+                         self._game_id, title)
+            except Exception as e:
+                log.error("remove_install failed: %s", e)
+                errors.append(f"Could not remove the install record:\n{e}")
 
-        # ── Step 2: delete game files? ────────────────────────────────────────
-        if install_path and Path(install_path).exists():
-            files_msg = QMessageBox(self)
-            files_msg.setWindowTitle("Delete Game Files?")
-            files_msg.setText(f"Delete game files for <b>{title}</b>?")
-            files_msg.setInformativeText(
-                f"This will permanently delete:\n{install_path}\n\n"
-                "This cannot be undone."
-            )
-            yes_btn    = files_msg.addButton("Delete Game Files",
-                                              QMessageBox.ButtonRole.DestructiveRole)
-            keep_btn   = files_msg.addButton("Keep Files",
-                                              QMessageBox.ButtonRole.AcceptRole)
-            files_msg.setDefaultButton(keep_btn)
-            files_msg.setStyleSheet(
-                f"QMessageBox {{ background: {COLORS['surface']}; "
-                f"color: {COLORS['text']}; }}")
-            files_msg.exec()
-            if files_msg.clickedButton() == yes_btn:
-                try:
-                    shutil.rmtree(install_path)
-                    log.info("Deleted game files: %s", install_path)
-                except Exception as e:
-                    QMessageBox.warning(self, "Delete Failed",
-                                        f"Could not delete game files:\n{e}")
+        if dlg.delete_files() and install_path and Path(install_path).exists():
+            try:
+                shutil.rmtree(install_path)
+                log.info("Deleted game files: %s", install_path)
+            except Exception as e:
+                errors.append(f"Could not delete game files:\n{e}")
 
-        # ── Step 3: delete Wine prefix? ───────────────────────────────────────
-        if wine_prefix and Path(wine_prefix).exists():
-            prefix_msg = QMessageBox(self)
-            prefix_msg.setWindowTitle("Delete Wine Prefix?")
-            prefix_msg.setText(f"Delete the Wine prefix for <b>{title}</b>?")
-            prefix_msg.setInformativeText(
-                f"This will permanently delete:\n{wine_prefix}\n\n"
-                "Only do this if no other games share this prefix."
-            )
-            yes_btn2   = prefix_msg.addButton("Delete Prefix",
-                                               QMessageBox.ButtonRole.DestructiveRole)
-            keep_btn2  = prefix_msg.addButton("Keep Prefix",
-                                               QMessageBox.ButtonRole.AcceptRole)
-            prefix_msg.setDefaultButton(keep_btn2)
-            prefix_msg.setStyleSheet(
-                f"QMessageBox {{ background: {COLORS['surface']}; "
-                f"color: {COLORS['text']}; }}")
-            prefix_msg.exec()
-            if prefix_msg.clickedButton() == yes_btn2:
-                try:
-                    shutil.rmtree(wine_prefix)
-                    log.info("Deleted Wine prefix: %s", wine_prefix)
-                except Exception as e:
-                    QMessageBox.warning(self, "Delete Failed",
-                                        f"Could not delete Wine prefix:\n{e}")
+        if dlg.delete_prefix() and wine_prefix and Path(wine_prefix).exists():
+            try:
+                shutil.rmtree(wine_prefix)
+                log.info("Deleted Wine prefix: %s", wine_prefix)
+            except Exception as e:
+                errors.append(f"Could not delete Wine prefix:\n{e}")
 
-        # Reload and notify library
+        if errors:
+            QMessageBox.warning(self, "Uninstall", "\n\n".join(errors))
+
         self.load_game(self._game_id)
         self.install_finished.emit(self._game_id)
 
@@ -2799,6 +2955,8 @@ class GameDetailView(QWidget):
 
         rows = []
         if self._mode == "game":
+            if self.media_gallery.isVisibleTo(self) and self.media_gallery.has_items():
+                rows.append([self.media_gallery])
             if hasattr(self, "completion_combo"):
                 rows.append([self.completion_combo])
             row = [w for w in (self.fav_btn, self.hide_btn) if ok(w)]
@@ -2810,6 +2968,8 @@ class GameDetailView(QWidget):
                     rows.append([w])
             if ok(self.install_btn):
                 rows.append([self.install_btn])
+            if ok(self.locate_btn):
+                rows.append([self.locate_btn])
             row = [w for w in (self.launch_btn, self.cogwheel_btn) if ok(w)]
             if row:
                 rows.append(row)
@@ -2831,6 +2991,9 @@ class GameDetailView(QWidget):
         return None
 
     def _ctrl_style_widget(self, widget, focused: bool):
+        if isinstance(widget, MediaGalleryWidget):
+            widget.set_controller_focused(focused)
+            return
         key = id(widget)
         orig = self._ctrl_orig_style.get(key)
         if orig is None:
@@ -2848,6 +3011,8 @@ class GameDetailView(QWidget):
             for w in row:
                 self._ctrl_style_widget(
                     w, self._ctrl_focus_visible and w is self._ctrl_focused_widget)
+        if self._ctrl_focus_visible and self._ctrl_focused_widget is not None:
+            self.scroll.ensureWidgetVisible(self._ctrl_focused_widget, 20, 60)
 
     def controller_has_targets(self) -> bool:
         return bool(self._ctrl_rows())
@@ -2866,6 +3031,9 @@ class GameDetailView(QWidget):
         rows = self._ctrl_rows()
         if not rows:
             return False
+        if (self._ctrl_focused_widget is self.media_gallery
+                and direction in ("left", "right")):
+            return self.media_gallery.controller_step(-1 if direction == "left" else 1)
         pos = self._ctrl_find_position(rows, self._ctrl_focused_widget)
         if pos is None:
             self._ctrl_focused_widget = rows[0][0]
@@ -2895,6 +3063,9 @@ class GameDetailView(QWidget):
     def controller_activate(self):
         w = self._ctrl_focused_widget
         if w is None:
+            return
+        if w is self.media_gallery:
+            w.controller_activate()
             return
         if isinstance(w, QComboBox):
             w.showPopup()

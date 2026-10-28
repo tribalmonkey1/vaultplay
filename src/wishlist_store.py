@@ -15,6 +15,8 @@ Layout:
         wishlist.json          # the data itself
         wishlist_art/          # uploaded cover images
             <uuid>.<ext>
+        wishlist_backups/      # automatic point-in-time copies of wishlist.json
+            wishlist-<timestamp>.json
 
 wishlist.json shape:
     {
@@ -90,6 +92,15 @@ SMB/NFS either — but it keeps two near-simultaneous edits from silently
 clobbering each other in the common case, the same "good enough for two
 people" bar redists.json import/export already operates at.
 
+Backups
+-------
+Right before every write replaces wishlist.json, the file as it was is
+copied to wishlist_backups/ (skipped when identical to the newest backup).
+The newest BACKUPS_KEEP_RECENT copies are always kept; older ones are
+thinned to one per day for BACKUPS_KEEP_DAYS days. get_deleted_from_backups()
+diffs backups against the live wishlist and restore_items() puts chosen
+items back — see ui/wishlist_restore_dialog.py.
+
 WishlistView is responsible for polling get_mtime() every few seconds
 while it's the visible page and reloading if it changed, so an addition
 from another machine shows up without restarting the app — this module
@@ -116,6 +127,7 @@ import json
 import logging
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -126,7 +138,10 @@ log = logging.getLogger(__name__)
 
 WISHLIST_FILENAME = "wishlist.json"
 ART_SUBDIR         = "wishlist_art"
+BACKUP_SUBDIR      = "wishlist_backups"
 CURRENT_VERSION    = 1
+BACKUPS_KEEP_RECENT = 40
+BACKUPS_KEEP_DAYS   = 60
 
 
 # ── Path helpers ────────────────────────────────────────────────────────────
@@ -227,6 +242,22 @@ def _backfill_item_defaults(item: dict) -> dict:
     return item
 
 
+def _parse_data(data) -> dict:
+    """Normalize a decoded JSON document into the standard structure."""
+    if not isinstance(data, dict):
+        return _empty_data()
+    data.setdefault("version", CURRENT_VERSION)
+    data.setdefault("items", [])
+    data.setdefault("ignored_matches", [])
+    if not isinstance(data["items"], list):
+        data["items"] = []
+    if not isinstance(data["ignored_matches"], list):
+        data["ignored_matches"] = []
+    data["items"] = [_backfill_item_defaults(i) for i in data["items"]
+                      if isinstance(i, dict)]
+    return data
+
+
 def load() -> dict:
     """
     Load wishlist.json fresh from disk. Returns an empty structure if the
@@ -244,25 +275,161 @@ def load() -> dict:
             log.warning("wishlist_store: %s did not contain a JSON object — "
                        "treating as empty", path)
             return _empty_data()
-        data.setdefault("version", CURRENT_VERSION)
-        data.setdefault("items", [])
-        data.setdefault("ignored_matches", [])
-        if not isinstance(data["items"], list):
-            data["items"] = []
-        if not isinstance(data["ignored_matches"], list):
-            data["ignored_matches"] = []
-        data["items"] = [_backfill_item_defaults(i) for i in data["items"]
-                          if isinstance(i, dict)]
-        return data
+        return _parse_data(data)
     except Exception as e:
         log.warning("wishlist_store: could not load %s: %s", path, e)
         return _empty_data()
 
 
+# ── Backups ──────────────────────────────────────────────────────────────────
+
+def _backup_dir() -> Optional[Path]:
+    root = _wishlist_root()
+    return (root / BACKUP_SUBDIR) if root else None
+
+
+def _backup_files() -> list:
+    d = _backup_dir()
+    if not d or not d.is_dir():
+        return []
+    try:
+        return sorted(d.glob("wishlist-*.json"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def _snapshot_before_write(live: Path):
+    """Copy the current wishlist.json into the backups folder just before
+    it's replaced. Never raises — a failed backup must not block a save."""
+    try:
+        if not live.exists() or live.stat().st_size == 0:
+            return
+        d = _backup_dir()
+        if d is None:
+            return
+        d.mkdir(parents=True, exist_ok=True)
+        existing = _backup_files()
+        content = live.read_bytes()
+        if existing:
+            try:
+                if existing[0].read_bytes() == content:
+                    return
+            except OSError:
+                pass
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = d / f"wishlist-{stamp}-{int(time.time() * 1000) % 1000:03d}.json"
+        dest.write_bytes(content)
+        _rotate_backups()
+    except Exception as e:
+        log.warning("wishlist_store: backup before write failed: %s", e)
+
+
+def _rotate_backups():
+    files = _backup_files()   # newest first
+    keep = set(files[:BACKUPS_KEEP_RECENT])
+    cutoff = time.time() - BACKUPS_KEEP_DAYS * 86400
+    seen_days = set()
+    for p in files[BACKUPS_KEEP_RECENT:]:
+        try:
+            m = p.stat().st_mtime
+        except OSError:
+            continue
+        if m < cutoff:
+            continue
+        day = time.strftime("%Y%m%d", time.localtime(m))
+        if day in seen_days:
+            continue
+        seen_days.add(day)
+        keep.add(p)
+    for p in files:
+        if p not in keep:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def list_backups() -> list:
+    """Newest first: [{"path", "mtime", "count"}] (count = items in it)."""
+    out = []
+    for p in _backup_files():
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = _parse_data(json.load(f))
+            out.append({"path": str(p), "mtime": p.stat().st_mtime,
+                        "count": len(data["items"])})
+        except Exception:
+            continue
+    return out
+
+
+def load_backup(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _parse_data(json.load(f))
+    except Exception as e:
+        log.warning("wishlist_store: could not read backup %s: %s", path, e)
+        return _empty_data()
+
+
+def get_deleted_from_backups(backup_path: Optional[str] = None) -> list:
+    """
+    Diff backups against the live wishlist: items that exist in a backup but
+    not (by id) in the current wishlist. With backup_path, diff that single
+    backup; with None, combine every backup (newest copy of each item wins).
+
+    Returns [{"item": dict, "backup_mtime": float}] ordered by when the
+    containing backup was taken (newest first), then by title.
+    """
+    current_ids = {i.get("id") for i in load()["items"]}
+    found = {}
+    paths = [Path(backup_path)] if backup_path else _backup_files()
+    for p in paths:   # newest first, so the first sighting is the newest copy
+        data = load_backup(str(p))
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        for item in data["items"]:
+            iid = item.get("id")
+            if iid and iid not in current_ids and iid not in found:
+                found[iid] = {"item": item, "backup_mtime": mtime}
+    return sorted(found.values(),
+                  key=lambda r: (-r["backup_mtime"], r["item"].get("title", "").lower()))
+
+
+def restore_items(items: list) -> int:
+    """Put items (dicts from get_deleted_from_backups) back, keeping their
+    original ids and details, appended to the bottom of the priority list.
+    Items whose id is already present are skipped. Returns the number
+    restored."""
+    restored = {"n": 0}
+
+    def _apply(data):
+        existing_ids = {i.get("id") for i in data["items"]}
+        order = max((i.get("sort_order", 0) for i in data["items"]), default=-1)
+        for item in items:
+            if not item.get("id") or item["id"] in existing_ids:
+                continue
+            order += 1
+            new_item = dict(item)
+            new_item["sort_order"] = order
+            data["items"].append(new_item)
+            existing_ids.add(item["id"])
+            restored["n"] += 1
+
+    if not items:
+        return 0
+    result = _read_modify_write(_apply)
+    return restored["n"] if result is not None else 0
+
+
 def _save(data: dict) -> bool:
     """Atomic write: temp file + os.replace(). Returns True on success,
     False if wishlist_path isn't configured or the write failed for any
-    reason (never raises)."""
+    reason (never raises). The previous file is snapshotted into
+    wishlist_backups/ first."""
     root = _wishlist_root()
     if not root:
         log.warning("wishlist_store: wishlist_path not configured — cannot save")
@@ -275,6 +442,7 @@ def _save(data: dict) -> bool:
 
     path = root / WISHLIST_FILENAME
     tmp  = path.with_suffix(".tmp")
+    _snapshot_before_write(path)
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -445,7 +613,8 @@ def remove_item(item_id: str) -> bool:
     """Delete an item. Does NOT touch ignored_matches rows referencing it
     — a harmless orphan (never looked up again once the item is gone) is
     simpler and safer than trying to prune in lockstep across a shared
-    file two machines might be editing."""
+    file two machines might be editing. The previous file state is kept in
+    wishlist_backups/, so the item can be brought back via restore_items()."""
     removed = {"ok": False}
 
     def _apply(data):
@@ -565,30 +734,98 @@ def resolve_cover_path(cover_url: str) -> Optional[str]:
 # auto-track pass — both are independent consumers of scan_nas()'s
 # new_game_ids list. See MainWindow._start_auto_track() for the sibling
 # pattern this hooks next to.
+#
+# Matching is WORD-based, never raw character-substring. The old rule
+# (squash to alphanumerics, then substring either way) matched "Ys I" with
+# "Physint" ("ysi" appears inside "physint") and "Rage" with "Spyro the
+# Dragon: Ripto's Rage". Now:
+#   exact  — same words after dropping edition noise ("Deluxe Edition",
+#            "GOTY", "Remastered", release-group junk, "the"…).
+#   close  — one title is the START or END of the other on whole-word
+#            boundaries, the shorter side is distinctive (2+ words, or a
+#            single word of 6+ letters — "Exodus" in "Metro Exodus"), and
+#            the leftover words contain no number/roman numeral (so "Doom"
+#            never matches "Doom 3", "Ys" never matches "Ys II").
+#   short single words ("Rage", "Ys") only ever match an exact title.
+
+_NOISE_WORDS = frozenset({
+    "the", "a", "an", "of", "and",
+    "edition", "goty", "remastered", "remaster", "remake", "deluxe",
+    "definitive", "complete", "ultimate", "enhanced", "directors", "cut",
+    "anniversary", "collectors", "premium", "standard", "gold", "hd",
+    "multi", "repack", "proper", "dlc", "dlcs", "all", "update", "build",
+    "win", "pc", "gog", "codex", "plaza", "rune", "cpy", "empress", "flt",
+    "elamigos", "dodi", "fitgirl", "goldberg", "tenoke", "skidrow",
+})
+_ROMAN = frozenset({"ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+                    "xi", "xii", "xiii", "xiv", "xv", "xx"})
+_MIN_SINGLE_WORD_LEN = 6
+_MAX_EXTRA_WORDS = 3
+
+
+def _title_words(text: str) -> list:
+    """Lowercased alphanumeric words with apostrophes folded away
+    ("Ripto's" -> "riptos") and edition/release noise removed."""
+    t = (text or "").lower().replace("'", "").replace("’", "")
+    t = re.sub(r"\(\d{3,}\)", " ", t)                      # store ids: (12345)
+    t = re.sub(r"\bv\s?\d+(?:[ ._]\d+)*[a-z]?\b", " ", t)  # v1.2 / v1 12 3
+    t = re.sub(r"\bmulti\d*\b", " ", t)                    # MULTi10
+    t = re.sub(r"\bbuild\s*\d+\b", " ", t)
+    words = re.findall(r"[a-z0-9]+", t)
+    return [w for w in words if w not in _NOISE_WORDS]
+
+
+def _is_numeral(word: str) -> bool:
+    return word.isdigit() or word in _ROMAN
+
 
 def _normalize_title_key(text: str) -> str:
-    """Lowercase, strip everything except alphanumerics — same
-    normalization idea save_backup.scan_known_locations() already uses
-    for its name_key matching. Not a new algorithm, per spec."""
-    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+    """Kept for any other callers: words joined, no separators."""
+    return "".join(_title_words(text))
+
+
+def match_confidence(wishlist_title: str, scanned_title: str) -> Optional[str]:
+    """'exact' | 'close' | None for a pair of titles (see block comment)."""
+    w = _title_words(wishlist_title)
+    s = _title_words(scanned_title)
+    if not w or not s:
+        return None
+    if w == s:
+        return "exact"
+    if len(w) == len(s):
+        return None
+    short, long_ = (w, s) if len(w) < len(s) else (s, w)
+    # the shorter title must be distinctive enough to count at all
+    if len(short) < 2 and len(short[0]) < _MIN_SINGLE_WORD_LEN:
+        return None
+    extra = len(long_) - len(short)
+    if extra > _MAX_EXTRA_WORDS:
+        return None
+    if long_[:len(short)] == short:
+        leftover = long_[len(short):]
+    elif long_[-len(short):] == short:
+        leftover = long_[:-len(short)]
+    else:
+        return None
+    if any(_is_numeral(x) for x in leftover):
+        return None   # a sequel / different entry, not the same game
+    return "close"
 
 
 def find_acquired_matches(scanned_titles: dict) -> list:
     """
     scanned_titles: {folder_name: display_title} for newly-scanned games.
 
-    Match rule: normalized title keys are equal, OR one is a substring of
-    the other — identical containment rule to save_backup.py's
-    known-location matching, deliberately reused rather than inventing a
-    new one. Skips any (wishlist_id, folder_name) pair already recorded
-    in ignored_matches.
+    Uses match_confidence() — word-based, see the block comment above.
+    Skips any (wishlist_id, folder_name) pair already recorded in
+    ignored_matches.
 
     Returns a list of dicts, one per un-ignored match found, each:
-        {"wishlist_id", "wishlist_title", "folder_name", "scanned_title"}
-    A single wishlist item or a single scanned game may appear in more
-    than one result if it fuzzy-matches multiple counterparts — the
-    caller (the one-at-a-time confirmation flow) handles that the same
-    way it handles any other queued match.
+        {"wishlist_id", "wishlist_title", "folder_name", "scanned_title",
+         "confidence"}            # confidence: "exact" | "close"
+    Exact matches come first. A single wishlist item or scanned game may
+    appear more than once if it matches multiple counterparts — the
+    caller (the one-at-a-time confirmation flow) queues them all.
     """
     items = get_items()
     if not items or not scanned_titles:
@@ -603,20 +840,16 @@ def find_acquired_matches(scanned_titles: dict) -> list:
 
     results = []
     for item in items:
-        wkey = _normalize_title_key(item.get("title", ""))
-        if not wkey:
-            continue
         for folder_name, scanned_title in scanned_titles.items():
-            skey = _normalize_title_key(scanned_title)
-            if not skey:
+            conf = match_confidence(item.get("title", ""), scanned_title)
+            if not conf or _ignored(item["id"], folder_name):
                 continue
-            if wkey == skey or wkey in skey or skey in wkey:
-                if _ignored(item["id"], folder_name):
-                    continue
-                results.append({
-                    "wishlist_id":    item["id"],
-                    "wishlist_title": item.get("title", ""),
-                    "folder_name":    folder_name,
-                    "scanned_title":  scanned_title,
-                })
+            results.append({
+                "wishlist_id":    item["id"],
+                "wishlist_title": item.get("title", ""),
+                "folder_name":    folder_name,
+                "scanned_title":  scanned_title,
+                "confidence":     conf,
+            })
+    results.sort(key=lambda r: 0 if r["confidence"] == "exact" else 1)
     return results

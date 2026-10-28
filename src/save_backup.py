@@ -875,8 +875,15 @@ def move_and_link(source_folder: Path, save_root: Path, game_folder_name: str,
 
     if canonical.exists():
         # Only reached with overwrite_confirmed=True — the caller already
-        # obtained explicit user confirmation before this point.
-        shutil.rmtree(canonical)
+        # obtained explicit user confirmation before this point. The old
+        # backup is MOVED to <save_root>/_replaced/ rather than deleted, so
+        # even a confirmed overwrite is recoverable.
+        import datetime as _dt
+        aside = (Path(save_root) / "_replaced" / "PC" / game_folder_name
+                 / _dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        aside.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(canonical), str(aside))
+        log.info("[SAVE BACKUP] Previous backup moved aside to %s", aside)
 
     shutil.move(str(source_folder), str(canonical))
 
@@ -890,6 +897,14 @@ def move_and_link(source_folder: Path, save_root: Path, game_folder_name: str,
 
     log.info("[SAVE BACKUP] Moved %s → %s (symlink left behind)",
              source_folder, canonical)
+
+    # Remember WHERE in the prefix this save lives so a fresh install can
+    # restore it automatically (see save_restore.py).
+    try:
+        import save_restore
+        save_restore.write_manifest(save_root, game_folder_name, source_folder)
+    except Exception as e:
+        log.warning("[SAVE BACKUP] Could not write restore manifest: %s", e)
     return canonical
 
 

@@ -93,6 +93,7 @@ def _print_system_info():
 
 # ── Now safe to import local modules ─────────────────────────────────────────
 import db
+import dbsafety
 from ui.main_window import MainWindow
 
 def main():
@@ -112,12 +113,22 @@ def main():
     # VaultPlay to other Python apps instead of the VaultPlay .desktop entry).
     sys.argv[0] = "vaultplay"
 
+    import thread_guard
+    thread_guard.install()   # track every QThread so shutdown can stop them all
+
     app = QApplication(sys.argv)
+    app.aboutToQuit.connect(thread_guard.shutdown_all)
     app.setApplicationDisplayName("VaultPlay")
     # setDesktopFileName links this process to the .desktop file so KDE
     # can match the taskbar entry, pinning, and StartupWMClass correctly.
     app.setDesktopFileName("VaultPlay")
     app.setFont(QFont("DM Sans", 11))
+
+    # Snapshot the DB BEFORE anything can touch it this session. Skipped if
+    # a backup was already taken within the last 6 hours so rapid restarts
+    # don't rotate good backups out. Never raises.
+    _log_phase("DB backup")
+    dbsafety.backup_now("startup", min_interval_s=6 * 3600)
 
     _log_phase("DB init")
     db.init_db()
@@ -127,7 +138,9 @@ def main():
     window.show()
     _log_phase("Window shown — entering event loop")
 
-    sys.exit(app.exec())
+    code = app.exec()
+    thread_guard.shutdown_all()
+    sys.exit(code)
 
 
 if __name__ == "__main__":

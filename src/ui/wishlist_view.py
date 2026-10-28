@@ -31,6 +31,9 @@ form — the edit form is still one right-click ("Edit…") away, or the
 "✏️ Edit Wishlist Item…" button on the detail page itself. This tile no
 longer shows its own on-cover trailer badge — the trailer, if any, is
 now surfaced on the Game Detail page instead (see TrailerThumbnail there).
+
+Backups: wishlist_store keeps automatic backups; the "↩ Restore…" header
+button opens ui/wishlist_restore_dialog.py to bring back removed items.
 """
 
 # ── AppImage path fix ─────────────────────────────────────────────────────────
@@ -66,6 +69,7 @@ import metadata as meta_mod
 import wishlist_store
 from ui.style import COLORS, accent_button_style
 from ui.wishlist_dialog import WishlistItemDialog
+from ui.wishlist_restore_dialog import WishlistRestoreDialog
 
 log = logging.getLogger(__name__)
 
@@ -392,6 +396,24 @@ class WishlistView(QWidget):
         header_l.addWidget(title_lbl)
         header_l.addStretch()
 
+        self.restore_btn = QPushButton("↩  Restore…")
+        self.restore_btn.setFont(QFont("DM Sans", 11))
+        self.restore_btn.setToolTip(
+            "Bring back wishlist items that were removed — picks from automatic backups")
+        self.restore_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                color: {COLORS['text_muted']};
+                padding: 7px 14px;
+            }}
+            QPushButton:hover {{ background: {COLORS['surface2']}; color: {COLORS['text']}; }}
+            QPushButton:disabled {{ color: {COLORS['text_muted']}; opacity: 0.5; }}
+        """)
+        self.restore_btn.clicked.connect(self._on_restore_clicked)
+        header_l.addWidget(self.restore_btn)
+
         self.add_btn = QPushButton("➕  Add to Wishlist")
         self.add_btn.setFont(QFont("DM Sans", 11, QFont.Weight.Medium))
         self.add_btn.setStyleSheet(accent_button_style())
@@ -461,6 +483,7 @@ class WishlistView(QWidget):
             self._clear_tiles()
             self.scroll.hide()
             self.add_btn.setEnabled(False)
+            self.restore_btn.setEnabled(False)
             if status == "unconfigured":
                 self.status_label.setText(
                     "Set a Wishlist location in Settings → Paths to get started.")
@@ -476,6 +499,7 @@ class WishlistView(QWidget):
         self.status_label.hide()
         self.scroll.show()
         self.add_btn.setEnabled(True)
+        self.restore_btn.setEnabled(True)
 
         self._items = wishlist_store.get_items()
         self._clear_tiles()
@@ -551,12 +575,22 @@ class WishlistView(QWidget):
         if tile is not None:
             tile.set_cover_pixmap(cropped)
 
-    # ── Add / Select / Edit / Remove ──────────────────────────────────────
+    # ── Add / Select / Edit / Remove / Restore ────────────────────────────
 
     def _on_add_clicked(self):
         dlg = WishlistItemDialog(item=None, parent=self)
         dlg.saved.connect(self._on_item_saved)
         dlg.exec()
+
+    def _on_restore_clicked(self):
+        """Diff the automatic backups against the live wishlist and let the
+        user pick which removed items to bring back."""
+        dlg = WishlistRestoreDialog(parent=self)
+        dlg.exec()
+        if dlg.restored_count():
+            self._last_mtime = wishlist_store.get_mtime()
+            self._rebuild()
+            self.changed.emit()
 
     def _on_tile_selected(self, item_id: str):
         """Plain left-click on a tile — hand off to MainWindow to open the
@@ -585,7 +619,8 @@ class WishlistView(QWidget):
         title = item.get("title") if item else "this item"
         reply = QMessageBox.question(
             self, "Remove from Wishlist",
-            f"Remove '{title}' from your wishlist?",
+            f"Remove '{title}' from your wishlist?\n\n"
+            "You can bring it back later with Restore….",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
         if reply != QMessageBox.StandardButton.Yes:

@@ -84,11 +84,11 @@ REDIST_TEXT_PATTERNS = [
     # DirectX — handles both "DirectX 11" and "DirectX: Version 11"
     (re.compile(r"directx[\s:]*(?:version\s*)?9|dx\s*9|d3d\s*9",    re.I), ["d3dx9"]),
     (re.compile(r"directx[\s:]*(?:version\s*)?10|dx\s*10|d3d\s*10", re.I), ["d3dx10", "d3dcompiler_47"]),
-    (re.compile(r"directx[\s:]*(?:version\s*)?11|dx\s*11|d3d\s*11", re.I), ["d3dx11", "d3dcompiler_47"]),
+    (re.compile(r"directx[\s:]*(?:version\s*)?11|dx\s*11|d3d\s*11", re.I), ["d3dx11_43", "d3dcompiler_47"]),
     (re.compile(r"directx[\s:]*(?:version\s*)?12|dx\s*12|d3d\s*12", re.I), ["d3dcompiler_47"]),
     # Generic DirectX — only when no version info follows
     (re.compile(r"directx(?![\s:]*(?:version\s*)?\d)", re.I),
-     ["d3dx9", "d3dx11", "d3dcompiler_47"]),
+     ["d3dx9", "d3dx11_43", "d3dcompiler_47"]),
     (re.compile(r"d3dcompiler", re.I),               ["d3dcompiler_47"]),
     (re.compile(r"xna\b|xna game studio", re.I),     ["xact"]),
     (re.compile(r"\bxact\b", re.I),                  ["xact"]),
@@ -105,7 +105,7 @@ ENGINE_HINTS = [
     (re.compile(r"unity\b|unity engine", re.I),
      ["vcrun2019", "vcrun2022"]),
     (re.compile(r"cryengine|cry engine", re.I),
-     ["vcrun2019", "d3dx11", "d3dcompiler_47"]),
+     ["vcrun2019", "d3dx11_43", "d3dcompiler_47"]),
     (re.compile(r"source engine|source 2", re.I),
      ["vcrun2019", "d3dcompiler_47"]),
     (re.compile(r"gamemaker|game maker studio", re.I),

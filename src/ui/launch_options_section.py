@@ -81,6 +81,7 @@ class _MiniGroup(QFrame):
         if title:
             lbl = QLabel(title.upper())
             lbl.setFont(QFont("DM Mono", 8))
+            lbl.setWordWrap(True)
             lbl.setStyleSheet(
                 f"color: {COLORS['text_muted']}; letter-spacing: 1.5px; {_LABEL_BASE}")
             self._layout.addWidget(lbl)
@@ -315,8 +316,15 @@ class LaunchOptionsSection(QWidget):
         # ── Reset to Defaults ────────────────────────────────────────────────
         reset_row = QHBoxLayout()
         reset_row.setContentsMargins(0, 4, 0, 0)
-        reset_row.addStretch()
-        self.reset_btn = QPushButton("Reset to Defaults")
+        reset_hint = _label(
+            "Clears every launch option above for this game (renderer, overlay, "
+            "env vars, arguments…). Click Apply afterwards to rebuild the launcher.",
+            muted=True, wrap=True)
+        reset_row.addWidget(reset_hint, 1)
+        self.reset_btn = QPushButton("Reset Launch Options")
+        self.reset_btn.setToolTip(
+            "Reset all launch options for this game back to the defaults. "
+            "You'll be asked to confirm.")
         self.reset_btn.setFont(QFont("DM Sans", 10))
         self.reset_btn.setStyleSheet(f"""
             QPushButton {{

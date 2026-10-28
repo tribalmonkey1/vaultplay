@@ -37,6 +37,7 @@ from PyQt6.QtGui import QFont, QColor
 
 import json
 import db
+import dbsafety
 import protondb as protondb_mod
 import scanner
 import update_check
@@ -165,14 +166,6 @@ class SettingsToggle(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         x = 23 if self._checked else 3
         p.drawEllipse(x, 3, 18, 18)
-        # Controller Support — this widget fully self-paints (no QStyle
-        # involvement), so the app-wide QPushButton/QComboBox :focus CSS
-        # rule in style.py has nothing to attach to here; draw the ring
-        # directly instead, keyed off Qt's own native hasFocus().
-        if self.hasFocus():
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor(COLORS["accent"]), 2))
-            p.drawRoundedRect(1, 1, 42, 22, 12, 12)
         p.end()
 
     def toggle(self):
@@ -473,6 +466,8 @@ class SettingsView(QWidget):
         # controls, navigated via Qt's native focus chain. See
         # controller_move()/_focus_first_in_page() below.
         self._ctrl_in_content = False
+        # One FocusRing overlay per page's QScrollArea (see ui/focus_ring.py)
+        self._rings = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -635,6 +630,8 @@ class SettingsView(QWidget):
             self._ctrl_in_content = False
         self._current_page = idx
         self._pages_stack.setCurrentIndex(idx)
+        if not self._ctrl_in_content:
+            self._ctrl_hide_rings()
         for i, btn in enumerate(self._nav_items):
             nav_focused = (self._ctrl_focus_visible
                           and not self._ctrl_in_content and i == idx)
@@ -833,12 +830,13 @@ class SettingsView(QWidget):
         status_row.add_control(test_btn)
         layout.addWidget(status_row)
 
-        # Apply NAS path change on focus lost / enter
-        def _apply_nas():
-            path = nas_edit.text().strip()
-            if path:
-                self.nas_path_changed.emit(path)
-        nas_edit.editingFinished.connect(_apply_nas)
+        # NOTE: the NAS path is applied ONLY by the Apply button (or Enter in
+        # the field, below). It used to also apply on editingFinished, which
+        # Qt fires whenever the field merely LOSES FOCUS — even with the text
+        # unchanged — so just tabbing/controller-navigating past this field
+        # re-emitted nas_path_changed and triggered a library rescan. That
+        # was the root cause of the library being wiped.
+        nas_edit.returnPressed.connect(_apply_nas_path)
 
         layout.addStretch()
         return scroll
@@ -1080,7 +1078,8 @@ class SettingsView(QWidget):
         name_edit.setStyleSheet(f"color: {COLORS['text']}; min-width: 160px;")
         name_edit.setPlaceholderText("Display name…")
         name_edit.editingFinished.connect(
-            lambda f=folder, e=name_edit: db.rename_category(f, e.text().strip() or f)
+            lambda f=folder, e=name_edit, d=display:
+                self._on_rename_category(f, e.text().strip() or f, d)
         )
         row_l.addWidget(name_edit, 1)
 
@@ -1119,6 +1118,13 @@ class SettingsView(QWidget):
         row_l.addWidget(bl_btn)
 
         return row
+
+    def _on_rename_category(self, folder: str, new_name: str, old_display: str):
+        """editingFinished fires on every focus loss, changed or not — only
+        write when the display name was actually edited."""
+        if new_name == (old_display or folder):
+            return
+        db.rename_category(folder, new_name)
 
     def _toggle_blacklist(self, folder_name: str, blacklist: bool):
         db.set_category_blacklisted(folder_name, blacklist)
@@ -1230,7 +1236,8 @@ class SettingsView(QWidget):
         name_edit.setFont(QFont("DM Sans", 11))
         name_edit.setStyleSheet(f"color: {COLORS['text']}; min-width: 160px;")
         name_edit.editingFinished.connect(
-            lambda tid=tag["id"], e=name_edit: self._on_rename_tag(tid, e.text().strip())
+            lambda tid=tag["id"], e=name_edit, old=tag["name"]:
+                self._on_rename_tag(tid, e.text().strip(), old)
         )
         row_l.addWidget(name_edit, 1)
 
@@ -1302,7 +1309,12 @@ class SettingsView(QWidget):
 
         return row
 
-    def _on_rename_tag(self, tag_id: int, new_name: str):
+    def _on_rename_tag(self, tag_id: int, new_name: str, old_name: str = None):
+        # editingFinished fires on every focus loss, even with no edit — and
+        # this handler rebuilds the whole tag list, which destroys the very
+        # widget being navigated (and kicked the controller focus out).
+        if old_name is not None and new_name == old_name:
+            return
         if not new_name:
             self._refresh_tags_list()   # revert the blanked edit back to its old name
             return
@@ -2838,6 +2850,9 @@ class SettingsView(QWidget):
             QMessageBox.StandardButton.Cancel
         )
         if reply == QMessageBox.StandardButton.Yes:
+            # Last-resort safety net: keep a restorable snapshot even for an
+            # explicit wipe (see <config>/backups/).
+            dbsafety.backup_now("before_clear_database")
             db.clear_database()
             # Reload settings UI to reflect cleared state
             self.load_settings()
@@ -3895,6 +3910,76 @@ class SettingsView(QWidget):
         return [w for _cy, row in rows
                 for _x, w in sorted(row, key=lambda t: t[0])]
 
+    # Controls whose vertical centers are within this many px share a row.
+    _CTRL_ROW_TOL = 12
+
+    @staticmethod
+    def _pick_neighbor(rects: dict, cur, direction: str, row_tol: int = 12):
+        """
+        Pure geometry: given {key: (x, y, w, h)} for every focusable control
+        and the key of the current one, return the key to move to (or None).
+
+          left / right : stay on the SAME row, nearest control on that side.
+          up / down    : go to the nearest row above/below, and within that
+                         row pick the control that best lines up with the
+                         current one (largest horizontal overlap, else the
+                         nearest centre). So a name field moves to the next
+                         name field, and a button column stays a button
+                         column, instead of walking across each row.
+        """
+        if cur not in rects:
+            return None
+        x, y, w, h = rects[cur]
+        cx, cy = x + w / 2.0, y + h / 2.0
+
+        def cen(k):
+            kx, ky, kw, kh = rects[k]
+            return kx + kw / 2.0, ky + kh / 2.0
+
+        others = [k for k in rects if k != cur]
+        if direction in ("left", "right"):
+            same = [k for k in others if abs(cen(k)[1] - cy) <= row_tol]
+            if direction == "right":
+                side = [k for k in same if cen(k)[0] > cx]
+                return min(side, key=lambda k: cen(k)[0]) if side else None
+            side = [k for k in same if cen(k)[0] < cx]
+            return max(side, key=lambda k: cen(k)[0]) if side else None
+
+        if direction == "down":
+            below = [k for k in others if cen(k)[1] > cy + row_tol]
+            if not below:
+                return None
+            row_y = min(cen(k)[1] for k in below)
+            row = [k for k in below if abs(cen(k)[1] - row_y) <= row_tol]
+        elif direction == "up":
+            above = [k for k in others if cen(k)[1] < cy - row_tol]
+            if not above:
+                return None
+            row_y = max(cen(k)[1] for k in above)
+            row = [k for k in above if abs(cen(k)[1] - row_y) <= row_tol]
+        else:
+            return None
+
+        def score(k):
+            kx, ky, kw, kh = rects[k]
+            overlap = max(0.0, min(x + w, kx + kw) - max(x, kx))
+            return (-overlap, abs(cen(k)[0] - cx))
+        return min(row, key=score)
+
+    def _ctrl_neighbor(self, fw, cands: list, direction: str, body):
+        """Map the focused widget (or the candidate that contains it, e.g.
+        a spin box's inner line edit) onto _pick_neighbor() geometry."""
+        cur = fw
+        while cur is not None and cur not in cands:
+            cur = cur.parentWidget()
+        if cur is None:
+            return None
+        rects = {}
+        for w in cands:
+            p = w.mapTo(body, QPoint(0, 0))
+            rects[w] = (p.x(), p.y(), w.width(), w.height())
+        return self._pick_neighbor(rects, cur, direction, self._CTRL_ROW_TOL)
+
     def _focus_first_in_page(self) -> bool:
         body = self._current_page_container()
         if body is None:
@@ -3902,9 +3987,29 @@ class SettingsView(QWidget):
         cands = self._focusable_descendants(body)
         if not cands:
             return False
-        cands[0].setFocus(Qt.FocusReason.OtherFocusReason)
-        self._ctrl_scroll_into_view(cands[0])
+        self._ctrl_focus(cands[0])
         return True
+
+    def _ctrl_ring(self):
+        page = self._pages_stack.currentWidget()
+        if not isinstance(page, QScrollArea):
+            return None
+        ring = self._rings.get(page)
+        if ring is None:
+            from ui.focus_ring import FocusRing
+            ring = self._rings[page] = FocusRing(page)
+        return ring
+
+    def _ctrl_focus(self, widget):
+        widget.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._ctrl_scroll_into_view(widget)
+        ring = self._ctrl_ring()
+        if ring is not None:
+            ring.show_for(widget)
+
+    def _ctrl_hide_rings(self):
+        for ring in getattr(self, "_rings", {}).values():
+            ring.clear()
 
     def _ctrl_scroll_into_view(self, widget):
         page = self._pages_stack.currentWidget()
@@ -3952,23 +4057,21 @@ class SettingsView(QWidget):
             self._show_page(self._current_page)
             return self.controller_move(direction)
 
+        if direction not in ("left", "right", "up", "down"):
+            return False
+        cands = self._focusable_descendants(body)
+        target = self._ctrl_neighbor(fw, cands, direction, body)
+        if target is not None:
+            self._ctrl_focus(target)
+            return True
         if direction == "left":
+            # Nothing further left on this row — step back out to the
+            # settings page list.
             fw.clearFocus()
             self._ctrl_in_content = False
             self._show_page(self._current_page)
             return True
-
-        if direction not in ("up", "down", "right"):
-            return False
-        cands = self._focusable_descendants(body)
-        if fw not in cands:
-            return False
-        i = cands.index(fw) + (-1 if direction == "up" else 1)
-        if not (0 <= i < len(cands)):
-            return False
-        cands[i].setFocus(Qt.FocusReason.OtherFocusReason)
-        self._ctrl_scroll_into_view(cands[i])
-        return True
+        return False
 
     def controller_activate(self):
         if not self._ctrl_in_content:

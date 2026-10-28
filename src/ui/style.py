@@ -109,18 +109,6 @@ QPushButton:pressed {{
     background: {COLORS['bg']};
 }}
 
-# Controller Support — gamepad-driven keyboard focus (Tab order /
-# focusNextChild) renders as a ring via Qt's dedicated `outline` paint
-# layer rather than `border`, since many buttons in this app set a full
-# custom per-instance stylesheet (hover states, danger styling, etc.)
-# that would otherwise win over an app-wide `border` override. `outline`
-# is a separate Qt stylesheet primitive not used anywhere else in this
-# app, so it layers on top instead of competing with those.
-QPushButton:focus, QComboBox:focus {{
-    outline: 2px solid {COLORS['accent']};
-    outline-offset: 1px;
-}}
-
 QCheckBox {{
     spacing: 8px;
     color: {COLORS['text_dim']};
