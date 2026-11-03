@@ -733,33 +733,95 @@ def create_wine_prefix(prefix_path: Path, progress_cb=None,
 
 def get_installed_redists(prefix_path: Path) -> set:
     """
-    Return the set of winetricks verbs already installed in this prefix,
-    by reading the winetricks.log file it maintains automatically.
-    Returns an empty set if the log doesn't exist or can't be read.
+    Return the set of winetricks verbs recorded as installed in this prefix
+    (winetricks only appends a verb to winetricks.log on success).
+    vcrun2022 is the same 14.x redistributable vcrun2019 installs, so it
+    counts as satisfying vcrun2019 too.
     """
     log_path = _winetricks_prefix(Path(prefix_path)) / "winetricks.log"
+    found = set()
     try:
         if log_path.exists():
-            return {line.strip() for line in log_path.read_text().splitlines()
-                    if line.strip()}
+            found = {line.strip() for line in log_path.read_text(errors="replace").splitlines()
+                     if line.strip()}
     except Exception:
         pass
-    return set()
+    if "vcrun2022" in found:
+        found.add("vcrun2019")
+    return found
+
+
+def _clean_subprocess_env() -> dict:
+    """os.environ without the AppImage's bundled Python/libs leaking into
+    the user's own winetricks/wine."""
+    env = dict(os.environ)
+    if env.get("APPDIR"):
+        for k in ("PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH", "LD_PRELOAD"):
+            env.pop(k, None)
+    return env
+
+
+def _winetricks_env(prefix_path: Path, wine_bin: str) -> dict:
+    """
+    Environment for running winetricks against a prefix. For a Proton prefix
+    this points winetricks at Proton's OWN wine (like protontricks does) --
+    system wine against a Proton-created prefix makes installers die
+    (e.g. vc_redist exiting with status 131).
+    """
+    env = _clean_subprocess_env()
+    env["WINEPREFIX"] = str(_winetricks_prefix(prefix_path))
+    env["WINEDEBUG"] = "-all"
+    env["WINEDLLOVERRIDES"] = "mscoree,mshtml="      # no mono/gecko prompts
+    env["WINETRICKS_LATEST_VERSION_CHECK"] = "disabled"
+
+    if Path(wine_bin).name != "proton":
+        return env
+
+    base = Path(wine_bin).parent
+    bindir = None
+    for sub in ("files", "dist"):
+        cand = base / sub / "bin"
+        if (cand / "wine64").exists() or (cand / "wine").exists():
+            bindir = cand
+            break
+    if bindir is None:
+        log.warning("No wine binary found under %s -- winetricks will use system wine",
+                    base)
+        return env
+
+    wine = bindir / "wine64" if (bindir / "wine64").exists() else bindir / "wine"
+    root = bindir.parent
+    env["WINE"] = str(wine)
+    env["WINELOADER"] = str(wine)
+    env["WINESERVER"] = str(bindir / "wineserver")
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    libs = [str(root / "lib64"), str(root / "lib")]
+    if env.get("LD_LIBRARY_PATH"):
+        libs.append(env["LD_LIBRARY_PATH"])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(libs)
+    return env
 
 
 def install_redists(prefix_path: Path, redists: list, progress_cb=None,
-                    force: bool = False) -> list:
+                    force: bool = False, wine_bin: str = "wine") -> list:
     """
-    Install winetricks verbs into the prefix.
-    Skips verbs already recorded in winetricks.log unless force=True.
-    Returns list of verbs that failed.
+    Install winetricks verbs into the prefix, using wine_bin's wine (Proton's
+    own wine for Proton prefixes). Skips verbs already recorded in
+    winetricks.log unless force=True. A verb counts as installed if winetricks
+    exited 0, OR it newly appeared in winetricks.log (covers installers that
+    return non-zero for "already up to date"). Returns the list of failed verbs.
     """
     prefix_path = Path(prefix_path)
     redists = normalize_redists(redists)
-    already_installed = get_installed_redists(prefix_path)
-    env    = {**os.environ, "WINEPREFIX": str(_winetricks_prefix(prefix_path))}
+    env = _winetricks_env(prefix_path, wine_bin)
     failed = []
 
+    # vcrun2022 is the superset of vcrun2019 (same installer) -- running both
+    # makes the second one report "newer version already installed".
+    if "vcrun2022" in redists and "vcrun2019" in redists:
+        redists = [v for v in redists if v != "vcrun2019"]
+
+    already_installed = get_installed_redists(prefix_path)
     to_install = redists if force else [
         v for v in redists if v not in already_installed
     ]
@@ -769,7 +831,7 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
         log.info("Skipping already-installed redists: %s", skipped)
 
     if not to_install:
-        log.info("All redists already installed — skipping.")
+        log.info("All redists already installed -- skipping.")
         if progress_cb:
             progress_cb("Redistributables", 100,
                         "All redistributables already installed.")
@@ -779,20 +841,37 @@ def install_redists(prefix_path: Path, redists: list, progress_cb=None,
         if progress_cb:
             progress_cb("Redistributables",
                         int(i / len(to_install) * 100),
-                        f"Installing {verb}…")
+                        f"Installing {verb}\u2026")
+        before = get_installed_redists(prefix_path)
         try:
             r = subprocess.run(["winetricks", "-q", verb], env=env,
-                               capture_output=True, text=True, timeout=300)
-            if r.returncode != 0:
-                log.warning("winetricks %s failed (rc=%d): %s", verb,
-                            r.returncode, (r.stderr or r.stdout or "")[-400:])
-                failed.append(verb)
+                               stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True,
+                               errors="replace", timeout=900)
         except subprocess.TimeoutExpired:
+            log.warning("winetricks %s timed out after 900s (prefix %s)",
+                        verb, env["WINEPREFIX"])
             failed.append(verb)
+            continue
         except FileNotFoundError:
             log.error("winetricks not found")
             failed.append(verb)
             break
+
+        after = get_installed_redists(prefix_path)
+        ok = r.returncode == 0 or (verb not in before and verb in after)
+        if ok:
+            if r.returncode != 0:
+                log.info("winetricks %s exited rc=%d but is recorded in "
+                         "winetricks.log -- treating as installed",
+                         verb, r.returncode)
+        else:
+            log.warning("winetricks %s failed (rc=%d, WINEPREFIX=%s, WINE=%s)\n"
+                        "--- stderr tail ---\n%s\n--- stdout tail ---\n%s",
+                        verb, r.returncode, env["WINEPREFIX"],
+                        env.get("WINE", "system wine"),
+                        (r.stderr or "")[-600:], (r.stdout or "")[-600:])
+            failed.append(verb)
 
     if progress_cb and to_install:
         progress_cb("Redistributables", 100, "Redistributables complete.")
@@ -1709,7 +1788,8 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
         failed_redists = []
         if options.get("redists"):
             failed_redists = install_redists(prefix_path, options["redists"], prog,
-                            force=options.get("force_redists", False))
+                            force=options.get("force_redists", False),
+                            wine_bin=wine_bin)
 
         prog("Installing", 60, f"Running {installer_exe.name} via Wine…")
         env = _build_wine_env(wine_bin, prefix_path)
@@ -1824,7 +1904,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
 
         failed_redists = []
         if options.get("redists"):
-            failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
+            failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False), wine_bin=wine_bin)
 
         prog("Installing", 50, f"Running {installer_exe.name} via Wine…")
         env = _build_wine_env(wine_bin, prefix_path)
@@ -1919,7 +1999,7 @@ def run_install(game_id: int, options: dict, progress_cb: Callable = None) -> di
 
         failed_redists = []
         if options.get("redists"):
-            failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False))
+            failed_redists = install_redists(prefix_path, options["redists"], prog, force=options.get("force_redists", False), wine_bin=wine_bin)
 
         if not portable_direct:
             prog("Copying files", 40, f"Copying to {game_dest}…")
@@ -2170,7 +2250,18 @@ def rerun_redists(game_id: int, redists: list, force: bool = True,
                 "failed": []}
 
     redists = normalize_redists(redists)
-    failed = install_redists(prefix_path, redists, progress_cb, force=force)
+    import protondb as protondb_mod
+    wine_bin = "wine"
+    pv = (game["proton_version"] or "").strip()
+    if pv:
+        vp = protondb_mod.get_version_path(pv)
+        if vp:
+            wine_bin = _resolve_wine_bin(vp)
+    if wine_bin == "wine":
+        wine_bin = parse_wine_bin_from_cmd(game["launch_cmd"] or "")
+
+    failed = install_redists(prefix_path, redists, progress_cb,
+                             force=force, wine_bin=wine_bin)
     db.update_install_fields(game_id, redists=redists, redists_failed=failed)
     log.info("rerun_redists: game %d — %d requested, %d failed",
              game_id, len(redists), len(failed))

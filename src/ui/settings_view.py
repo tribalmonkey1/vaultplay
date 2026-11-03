@@ -1005,6 +1005,17 @@ class SettingsView(QWidget):
 
         self._refresh_category_list()
 
+        layout.addSpacing(16)
+        purge_row = SettingsRow(
+            "Remove Blacklisted Entries",
+            "Deletes library entries that belong to blacklisted categories "
+            "(left over from scans before they were blacklisted). Installed "
+            "entries are kept. A database backup is taken first.")
+        purge_btn = ActionButton("Remove Now", danger=True)
+        purge_btn.clicked.connect(self._purge_blacklisted_now)
+        purge_row.add_control(purge_btn)
+        layout.addWidget(purge_row)
+
         layout.addWidget(QLabel(""))  # spacer
         note = QLabel("Rescan your library after making changes here.")
         note.setFont(QFont("DM Sans", 10))
@@ -1127,9 +1138,70 @@ class SettingsView(QWidget):
         db.rename_category(folder, new_name)
 
     def _toggle_blacklist(self, folder_name: str, blacklist: bool):
-        db.set_category_blacklisted(folder_name, blacklist)
+        if not blacklist:
+            db.set_category_blacklisted(folder_name, False)
+            self._refresh_category_list()
+            self.reload_requested.emit()
+            return
+
+        counts = db.count_games_in_category(folder_name)
+        purgeable, installed = counts["purgeable"], counts["installed"]
+
+        if purgeable or installed:
+            from PyQt6.QtWidgets import QMessageBox
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Blacklist Category")
+            msg.setText(f"Blacklist '{folder_name}'?")
+            info = (f"{purgeable} entr{'y' if purgeable == 1 else 'ies'} in this "
+                    "category will be removed from your library. A database "
+                    "backup is taken first.")
+            if installed:
+                info += (f"\n\n{installed} installed entr"
+                         f"{'y' if installed == 1 else 'ies'} will be kept — "
+                         "uninstall them normally if you want them gone.")
+            msg.setInformativeText(info)
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            msg.setStyleSheet(
+                f"QMessageBox {{ background: {COLORS['surface']}; "
+                f"color: {COLORS['text']}; }}")
+            if msg.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+        db.set_category_blacklisted(folder_name, True)
+        if purgeable:
+            dbsafety.backup_now("before_purge")
+            removed = db.purge_blacklisted_games(folder_name)
+            log.info("Blacklisted '%s' — purged %d entries", folder_name, removed)
+
         self._refresh_category_list()
-        # Tell main window to reload library display (no scan, no DB clear)
+        # Tell main window to reload library display
+        self.reload_requested.emit()
+
+    def _purge_blacklisted_now(self):
+        """Catch-up for entries left over from scans before a category was
+        blacklisted."""
+        from PyQt6.QtWidgets import QMessageBox
+        counts = db.count_blacklisted_games()
+        if not counts["purgeable"]:
+            QMessageBox.information(self, "Remove Blacklisted Entries",
+                                    "Nothing to remove.")
+            return
+        info = f"{counts['purgeable']} entries will be removed from your library."
+        if counts["installed"]:
+            info += f"\n{counts['installed']} installed entries will be kept."
+        info += "\nA database backup is taken first."
+        reply = QMessageBox.question(
+            self, "Remove Blacklisted Entries", info,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        dbsafety.backup_now("before_purge")
+        removed = db.purge_blacklisted_games()
+        QMessageBox.information(self, "Remove Blacklisted Entries",
+                                f"Removed {removed} entries.")
         self.reload_requested.emit()
 
     # ── Tags ─────────────────────────────────────────────────────────────────

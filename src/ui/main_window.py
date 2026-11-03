@@ -1629,6 +1629,15 @@ class MainWindow(QMainWindow):
                                    cat_counts, favorites=favorites, hidden=hidden,
                                    active_category=self.library_view.get_filter_state().category)
         self.sidebar.update_tags(db.get_all_tags())
+
+        # If the active category was just blacklisted its sidebar row is gone —
+        # drop the stale filter so the grid doesn't sit empty with no way back.
+        _active_cat = self.library_view.get_filter_state().category
+        if _active_cat and _active_cat not in {c["folder_name"] for c in categories}:
+            self.library_view.set_filter_state(
+                self.library_view.get_filter_state().with_category(None))
+            self.library_view.set_page_title("All Games")
+
         self.library_view.load_games(games, reset_scroll=reset_scroll)
 
     def _on_filter_changed(self, key: str):

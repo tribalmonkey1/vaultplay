@@ -627,11 +627,28 @@ def sync_extra_files(game_id: int) -> list:
                 canonical = move_and_link_file(f, save_root, game["folder_name"], drive_c)
                 db.add_save_extra_path(game_id, str(f), str(canonical))
                 linked_now.append(canonical)
-            except SaveMoveConflict:
-                log.warning(
-                    "[SAVE BACKUP] Extra file conflict at canonical path for "
-                    "%s (game_id=%d) — leaving unlinked rather than silently "
-                    "overwriting", f, game_id)
+            except SaveMoveConflict as conflict:
+                # A backup of this file already exists (typical on a fresh
+                # prefix where the game wrote a new default). Keep the backup:
+                # link the live file to it, with the live copy moved to
+                # <save_root>/_replaced/ — never deleted.
+                try:
+                    import save_restore
+                    r = save_restore.restore_extra(
+                        conflict.canonical_path, f, save_root, game["folder_name"])
+                    if r.get("ok"):
+                        db.add_save_extra_path(
+                            game_id, str(f), str(conflict.canonical_path))
+                        linked_now.append(Path(conflict.canonical_path))
+                        log.info("[SAVE BACKUP] Extra file %s adopted existing "
+                                 "backup (live copy moved aside: %s)",
+                                 f, r.get("moved_aside"))
+                    else:
+                        log.warning("[SAVE BACKUP] Extra file conflict for %s "
+                                    "(game_id=%d): %s", f, game_id, r.get("error"))
+                except Exception as e2:
+                    log.warning("[SAVE BACKUP] Extra file conflict for %s "
+                                "(game_id=%d) could not be resolved: %s", f, game_id, e2)
             except Exception as e:
                 log.warning("[SAVE BACKUP] Could not link extra file %s "
                            "(game_id=%d): %s", f, game_id, e)

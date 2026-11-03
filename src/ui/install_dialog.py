@@ -1142,6 +1142,15 @@ class InstallDialog(QDialog):
             if note:
                 self.progress_msg.setText(
                     (self.progress_msg.text() + "\n" + note).strip())
+            try:
+                from ui.save_restore_dialog import run_post_install_restore
+                save_msg = run_post_install_restore(self.game["id"], parent=self)
+            except Exception as e:
+                log.warning("Save restore after install failed: %s", e)
+                save_msg = ""
+            if save_msg:
+                self.progress_msg.setText(
+                    (self.progress_msg.text() + "\n" + save_msg).strip())
             self.install_finished.emit(self.game["id"])
             return
 

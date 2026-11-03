@@ -695,9 +695,21 @@ class LocateGameDialog(QDialog):
         self._busy = False
         self.cancel_btn.setEnabled(True)
         if res.get("success"):
-            warn = res.get("warnings") or []
-            if warn:
-                QMessageBox.information(self, "Locate Game", "Added, with notes:\n\n" + "\n".join(warn))
+            warn = list(res.get("warnings") or [])
+            try:
+                from ui.save_restore_dialog import run_post_install_restore
+                save_msg = run_post_install_restore(self.game["id"], parent=self)
+            except Exception as e:
+                log.warning("Save restore after locate failed: %s", e)
+                save_msg = ""
+            if warn or save_msg:
+                parts = []
+                if warn:
+                    parts.append("Notes:\n" + "\n".join(warn))
+                if save_msg:
+                    parts.append(save_msg)
+                QMessageBox.information(
+                    self, "Locate Game", "Added.\n\n" + "\n\n".join(parts))
             self.accept()
             return
         self.stage_label.setText("✗ Could not add the game")

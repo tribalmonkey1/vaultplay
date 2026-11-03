@@ -116,3 +116,32 @@ class SaveRestoreDialog(QDialog):
 
     def want_extras(self) -> bool:
         return bool(self.extras_cb and self.extras_cb.isChecked())
+
+
+def run_post_install_restore(game_id: int, parent=None) -> str:
+    """
+    Called by the Install and Locate Game dialogs once the install record
+    exists. Restores the backed-up save + _extras automatically when nothing
+    is in the way; asks (SaveRestoreDialog) when real data already sits at a
+    destination. Returns a short summary string ('' = nothing to report).
+    Runs on the UI thread.
+    """
+    import db
+    import save_restore
+    res = save_restore.auto_restore_after_install(game_id)
+    if res["status"] == "needs_confirm":
+        game = db.get_game(game_id)
+        title = (game["title"] or game["display_name"] or game["folder_name"]) if game else "this game"
+        dlg = SaveRestoreDialog(title, res["info"], parent=parent)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            r = save_restore.restore_all(
+                game_id, res["folder_name"], res["save_root"], res["info"],
+                dlg.want_main(), dlg.want_extras())
+            res.update(main=r["main"], extras=r["extras"],
+                       errors=r["errors"], moved_aside=r["moved_aside"])
+            res["status"] = "restored"
+        else:
+            if dlg.never:
+                db.set_setting(f"save_restore_declined_{game_id}", "true")
+            res["status"] = "declined"
+    return save_restore.describe_result(res)

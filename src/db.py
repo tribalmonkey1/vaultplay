@@ -990,6 +990,74 @@ def set_category_blacklisted(folder_name: str, blacklisted: bool):
         )
 
 
+def count_blacklisted_games(folder_name: Optional[str] = None) -> dict:
+    """
+    Count games in blacklisted categories (or in one specific blacklisted
+    category). Returns {"purgeable": int, "installed": int}. Installed
+    entries are never purged (see purge_blacklisted_games()).
+    """
+    where = "c.blacklisted = 1"
+    params = []
+    if folder_name is not None:
+        where += " AND g.category = ?"
+        params.append(folder_name)
+    with get_connection() as conn:
+        row = conn.execute(f"""
+            SELECT
+                COUNT(CASE WHEN i.id IS NULL     THEN 1 END) AS purgeable,
+                COUNT(CASE WHEN i.id IS NOT NULL THEN 1 END) AS installed
+            FROM games g
+            JOIN categories c ON c.folder_name = g.category
+            LEFT JOIN installs i ON i.game_id = g.id
+            WHERE {where}
+        """, params).fetchone()
+    return {"purgeable": row["purgeable"] or 0, "installed": row["installed"] or 0}
+
+
+def count_games_in_category(folder_name: str) -> dict:
+    """Same shape as count_blacklisted_games(), but for a category that
+    isn't flagged blacklisted yet (used for the pre-blacklist confirmation)."""
+    with get_connection() as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(CASE WHEN i.id IS NULL     THEN 1 END) AS purgeable,
+                COUNT(CASE WHEN i.id IS NOT NULL THEN 1 END) AS installed
+            FROM games g
+            LEFT JOIN installs i ON i.game_id = g.id
+            WHERE g.category = ?
+        """, (folder_name,)).fetchone()
+    return {"purgeable": row["purgeable"] or 0, "installed": row["installed"] or 0}
+
+
+def purge_blacklisted_games(folder_name: Optional[str] = None) -> int:
+    """
+    Delete games in blacklisted categories (or one specific blacklisted
+    category). Foreign keys cascade to metadata, game_state, game_addons,
+    game_tags, collection_games, version_trackers and notifications.
+
+    Games with an installs row are SKIPPED — deleting them would orphan the
+    .desktop file / Wine prefix on disk. Returns rows deleted. The caller is
+    responsible for dbsafety.backup_now() first.
+    """
+    where = "c.blacklisted = 1"
+    params = []
+    if folder_name is not None:
+        where += " AND g.category = ?"
+        params.append(folder_name)
+    with get_connection() as conn:
+        cur = conn.execute(f"""
+            DELETE FROM games
+            WHERE id IN (
+                SELECT g.id
+                FROM games g
+                JOIN categories c ON c.folder_name = g.category
+                WHERE {where}
+                  AND NOT EXISTS (SELECT 1 FROM installs i WHERE i.game_id = g.id)
+            )
+        """, params)
+        return cur.rowcount
+
+
 def get_blacklisted_categories() -> set:
     with get_connection() as conn:
         rows = conn.execute(
@@ -1579,6 +1647,42 @@ def set_save_paths(game_id: int, save_path: Optional[str] = None,
             f"UPDATE game_state SET {', '.join(updates)} WHERE game_id=?",
             params
         )
+
+
+# ── Save extras (achievements/stats/leaderboards) helpers ─────────────────────
+
+def _ensure_save_extras_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS game_save_extras (
+            game_id        INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+            source_path    TEXT NOT NULL,
+            canonical_path TEXT NOT NULL,
+            PRIMARY KEY (game_id, source_path)
+        )
+    """)
+
+
+def get_save_extra_paths(game_id: int) -> list:
+    """[{'source_path', 'canonical_path'}, ...] for a game's linked extra files."""
+    with get_connection() as conn:
+        _ensure_save_extras_table(conn)
+        rows = conn.execute(
+            "SELECT source_path, canonical_path FROM game_save_extras WHERE game_id=?",
+            (game_id,)).fetchall()
+    return [{"source_path": r["source_path"], "canonical_path": r["canonical_path"]}
+            for r in rows]
+
+
+def add_save_extra_path(game_id: int, source_path: str, canonical_path: str):
+    """Record (or update) one linked extra file."""
+    with get_connection() as conn:
+        _ensure_save_extras_table(conn)
+        conn.execute("""
+            INSERT INTO game_save_extras (game_id, source_path, canonical_path)
+            VALUES (?, ?, ?)
+            ON CONFLICT(game_id, source_path) DO UPDATE SET
+                canonical_path = excluded.canonical_path
+        """, (game_id, source_path, canonical_path))
 
 
 def cache_art(url: str, local_path: str):

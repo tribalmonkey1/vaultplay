@@ -288,7 +288,8 @@ def adopt(game_id: int, plan: dict, progress_cb: Optional[Callable] = None) -> d
         prog("Redistributables", 32, f"Installing {len(redists)} redistributable(s)…")
         failed = installer.install_redists(
             prefix_path, redists,
-            lambda s, p, m: prog(s, 32 + int(p * 0.45), m)) or []
+            lambda s, p, m: prog(s, 32 + int(p * 0.45), m),
+            wine_bin=wine_bin) or []
         if failed:
             warnings.append("Some redistributables failed: " + ", ".join(failed))
     else:
